@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9.2 is the real floor: cryptography>=46 declares
+        # !=3.9.0,!=3.9.1, and ML-KEM does not exist before 46.
+        python-version: ["3.9", "3.11", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Report the crypto backend
+        # ML-KEM needs cryptography >= 46 on OpenSSL >= 3.5. The wheels bundle
+        # their own OpenSSL, so this records what the run actually tested
+        # against -- and fails loudly instead of skipping if it is missing.
+        run: |
+          python -c "import cryptography; print('cryptography', cryptography.__version__)"
+          python -c "from cryptography.hazmat.backends.openssl.backend import backend; print(backend.openssl_version_text())"
+          python -c "from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey; print('ML-KEM-768: available')"
+
+      - name: Test
+        run: pytest -q
+
+      - name: Smoke-test the installed CLI
+        # The unit tests drive click in-process, so they would still pass with
+        # a broken console-script entry point. This runs the real binary.
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cd "$work"
+          hpqc keygen -o ci
+          hpqc keygen -o stranger
+          printf 'ci smoke test\n' > msg.txt
+          hpqc encrypt -r ci.pub msg.txt -o msg.hpqc
+          hpqc info msg.hpqc
+          hpqc decrypt -k ci.key msg.hpqc -o out.txt
+          cmp msg.txt out.txt
+          echo "round trip: ok"
+          test "$(stat -c '%a' ci.key)" = "600"
+          echo "private key mode 0600: ok"
+          if hpqc decrypt -k stranger.key msg.hpqc -o /dev/null 2>/dev/null; then
+            echo "FAIL: decrypted with the wrong identity"; exit 1
+          fi
+          echo "wrong identity rejected: ok"
+          printf 'piped\n' | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key | grep -qx piped
+          echo "stdin/stdout pipeline: ok"

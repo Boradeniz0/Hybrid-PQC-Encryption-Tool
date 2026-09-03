@@ -1,5 +1,7 @@
 # hpqc — hybrid post-quantum file encryption
 
+[![CI](https://github.com/Boradeniz0/Hybrid-PQC-Encryption-Tool/actions/workflows/ci.yml/badge.svg)](https://github.com/Boradeniz0/Hybrid-PQC-Encryption-Tool/actions/workflows/ci.yml)
+
 A small command-line tool that encrypts files and messages to a public key
 using **X25519 + ML-KEM-768** together, derives one key from both with
 **HKDF-SHA256**, and seals the payload with an **AEAD**
@@ -37,13 +39,27 @@ derivation, and the file stays secret unless **both** are broken:
 
 ## Install
 
-Requires Python 3.9+ and `cryptography` 46 or newer **built against OpenSSL
+Requires Python 3.9.2+ and `cryptography` 46 or newer **built against OpenSSL
 3.5+** — that is where ML-KEM lives. See [Backend requirements](#backend-requirements).
+
+To use the tool:
+
+```console
+pipx install git+https://github.com/Boradeniz0/Hybrid-PQC-Encryption-Tool
+hpqc --help
+```
+
+To work on it:
 
 ```console
 python -m venv .venv && . .venv/bin/activate
-pip install -e .
+pip install -e '.[dev]'
+pytest
 ```
+
+The floor is 3.9.**2**, not 3.9.0: `cryptography>=46` declares
+`!=3.9.0,!=3.9.1`, so on those two patch releases the dependency cannot
+resolve at all.
 
 ## Usage
 
@@ -222,8 +238,14 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-98 passed
+124 passed
 ```
+
+CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
+version and ML-KEM availability it actually tested against, and then drives the
+*installed* `hpqc` binary through a keygen/encrypt/decrypt round trip — the
+unit tests call click in-process, so they would still pass with a broken
+console-script entry point.
 
 The suite is mostly negative tests, because that is where a crypto tool
 actually fails. Among them:
@@ -250,6 +272,43 @@ actually fails. Among them:
   passes every hand-written test while turning a malformed file into a crash.
 - **Nothing is written on failure** — a rejected file leaves no partial
   plaintext behind.
+- **Frozen known-answer vectors.** `tests/vectors/v1.json` holds containers
+  produced by an earlier build together with the identity that opens them.
+  Every other test checks that hpqc agrees with *itself*, which cannot catch
+  the one change that matters most to anyone who already has encrypted files: a
+  refactor that alters the header layout or the derivation in a way both sides
+  agree on. Reverse the combiner to `ss_x ‖ ss_m` and every self-consistency
+  test still passes — only the vectors notice. Encryption is not reproducible
+  (nothing random in it is injectable), so the vectors are verified on the
+  deterministic decryption side.
+
+## What building this turned up
+
+Three bugs the tests and the packaging found. None is visible from reading the
+happy path, which is the point.
+
+**A private key file could stay world-readable.** The mode argument to
+`os.open(path, ..., 0o600)` applies only to files it *creates*. So
+`hpqc keygen --force` over a key that already existed as mode 0644 left it at
+0644 — the new secret inherited the old file's permissions. The fix is an
+explicit `os.fchmod` on the descriptor. The test that caught it creates a
+world-readable file first and *then* overwrites it; a test that only checked a
+fresh keygen would have passed forever.
+
+**A crafted header could produce a traceback instead of an error.** X25519 has
+low-order points — values that force an all-zero shared secret whatever the
+private key is. OpenSSL refuses them, but it does so with a bare
+`ValueError: Error computing shared key.`, and the ephemeral public key in a
+`.hpqc` header is entirely attacker-controlled. 32 zero bytes at offset 46 was
+enough to crash `hpqc decrypt` with a stack trace. That is not a break of
+confidentiality, but a parser that crashes on chosen input is the wrong shape,
+and a hostile `.pub` file reached the same code from the other direction. Both
+now go through one `_exchange` helper that converts it to a `FormatError`.
+
+**The declared Python floor was wrong.** `requires-python = ">=3.9"` looked
+fine and was not: `cryptography>=46` declares `!=3.9.0,!=3.9.1`, so on those
+releases `pip install` fails in the resolver rather than with a useful message.
+Setting up the CI matrix is what surfaced it.
 
 ## Scope and limitations
 
@@ -277,7 +336,7 @@ What it does **not** do, by design in v1:
 - [ ] Passphrase-wrapped private keys (scrypt + AEAD)
 - [ ] Multiple recipients per file
 - [ ] ML-KEM-1024 suite
-- [ ] Known-answer test vectors checked into the repo
+- [x] Known-answer test vectors checked into the repo
 
 ## References
 
