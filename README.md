@@ -41,8 +41,8 @@ Requires Python 3.9+ and `cryptography` 46 or newer **built against OpenSSL
 3.5+** — that is where ML-KEM lives. See [Backend requirements](#backend-requirements).
 
 ```console
-$ python -m venv .venv && . .venv/bin/activate
-$ pip install -e .
+python -m venv .venv && . .venv/bin/activate
+pip install -e .
 ```
 
 ## Usage
