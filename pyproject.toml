@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpqc"
+version = "0.1.0"
+description = "Hybrid post-quantum file encryption: X25519 + ML-KEM-768 -> HKDF -> AEAD"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Boradeniz0" }]
+keywords = ["cryptography", "post-quantum", "ml-kem", "kyber", "x25519", "hybrid", "aead"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    # ML-KEM lives in cryptography.hazmat.primitives.asymmetric.mlkem and needs
+    # an OpenSSL 3.5+ backend underneath. See "Backend requirements" in README.
+    "cryptography>=46.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+hpqc = "hpqc.cli:run"
+
+[project.urls]
+Homepage = "https://github.com/Boradeniz0/Hybrid-PQC-Encryption-Tool"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
