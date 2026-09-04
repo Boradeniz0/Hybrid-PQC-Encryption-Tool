@@ -9,7 +9,15 @@ still pass.
 
 tests/vectors/v1.json pins that down. It holds containers produced by an
 earlier build, together with the identity that opens them, so the current code
-has to reproduce yesterday's answers. Encryption is not reproducible (fresh
+has to reproduce yesterday's answers. tests/vectors/v1-signed.json does the same
+for sender authentication, and records two extra things: the digest of the exact
+byte string the signatures cover, which pins the construction, and one container
+that must never verify -- a signature made for a different recipient, re-sealed.
+
+The digests matter because a recorded *signature* cannot pin a construction. Drop
+the recipient from the signed message and the recorded signature stops verifying
+-- but it would have stopped verifying under any change, so the failure says
+nothing about which one. The digest names it exactly. Encryption is not reproducible (fresh
 ephemeral key, fresh encapsulation, fresh salt and nonce, none of them
 injectable), so the vectors are verified on the decryption side, which is
 deterministic.
@@ -21,19 +29,31 @@ hybrid.HKDF_LABEL.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from hpqc import hybrid, suites
-from hpqc.container import FORMAT_VERSION, decrypt, parse_header
-from hpqc.errors import HpqcError
-from hpqc.keys import PrivateKey, PublicKey
-
-VECTORS = json.loads(
-    (Path(__file__).parent / "vectors" / "v1.json").read_text(encoding="ascii")
+from hpqc import hybrid, signing, suites
+from hpqc.container import (
+    FLAG_SIGNED,
+    FORMAT_VERSION,
+    decrypt,
+    open_container,
+    parse_header,
 )
+from hpqc.errors import HpqcError, SignatureError
+from hpqc.keys import PrivateKey, PublicKey, SigningPublicKey
+
+
+def _load(name: str) -> dict:
+    path = Path(__file__).parent / "vectors" / name
+    return json.loads(path.read_text(encoding="ascii"))
+
+
+VECTORS = _load("v1.json")
+SIGNED = _load("v1-signed.json")
 
 
 @pytest.fixture(scope="module")
@@ -129,3 +149,142 @@ def test_the_derivation_reproduces_the_recorded_key(vector) -> None:
         recipient=PublicKey.decode(VECTORS["public"]),
     )
     assert key.hex() == vector["key"]
+
+
+# --------------------------------------------------------------------------
+# Sender authentication
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def signed_identity() -> PrivateKey:
+    return PrivateKey.decode(SIGNED["identity"])
+
+
+@pytest.fixture(scope="module")
+def recorded_signer() -> SigningPublicKey:
+    return SigningPublicKey.decode(SIGNED["signer"])
+
+
+def test_the_signed_vectors_target_this_format(recorded_signer) -> None:
+    assert SIGNED["format_version"] == FORMAT_VERSION
+    assert SIGNED["flag_signed"] == FLAG_SIGNED
+    assert SIGNED["signature_block_len"] == signing.SIGNATURE_BLOCK_LEN
+    assert recorded_signer.key_id_hex == SIGNED["signer_key_id"]
+    assert recorded_signer.to_bytes().hex() == SIGNED["signer_blob"]
+
+
+def test_the_signature_label_has_not_changed() -> None:
+    """A changed label invalidates every signature ever produced."""
+    assert signing.SIG_LABEL.decode("ascii") == SIGNED["sig_label"]
+
+
+@pytest.mark.parametrize(
+    "vector", SIGNED["containers"], ids=_ids(SIGNED["containers"])
+)
+class TestSignedContainers:
+    def test_it_verifies_against_the_recorded_signer(
+        self, vector, signed_identity, recorded_signer
+    ) -> None:
+        opened = open_container(
+            bytes.fromhex(vector["container"]), signed_identity, recorded_signer
+        )
+        assert opened.plaintext == bytes.fromhex(vector["plaintext"])
+        assert opened.signer == recorded_signer
+        assert opened.verified is True
+
+    def test_its_header_still_advertises_the_signed_flag(self, vector) -> None:
+        header, header_bytes, _ = parse_header(bytes.fromhex(vector["container"]))
+        assert header.signed is True
+        assert header.flags == FLAG_SIGNED
+        assert header.suite.id == vector["suite_id"]
+        # The flag lives in the header, which is the AAD; its length must not
+        # have moved just because the payload grew.
+        assert len(header_bytes) == 1168
+
+    def test_the_overhead_is_still_the_documented_constant(self, vector) -> None:
+        plaintext_len = len(bytes.fromhex(vector["plaintext"]))
+        container_len = len(bytes.fromhex(vector["container"]))
+        assert container_len - plaintext_len == 1168 + signing.SIGNATURE_BLOCK_LEN + 16
+
+    def test_it_reports_the_signer_without_a_pinned_key(
+        self, vector, signed_identity
+    ) -> None:
+        """Reporting who signed is fine; claiming it was verified is not."""
+        opened = open_container(bytes.fromhex(vector["container"]), signed_identity)
+        assert opened.signer.key_id_hex == SIGNED["signer_key_id"]
+        assert opened.verified is False
+
+
+@pytest.mark.parametrize(
+    "vector",
+    SIGNED["signed_messages"],
+    ids=[f"{v['suite']}-{len(v['plaintext']) // 2}B" for v in SIGNED["signed_messages"]],
+)
+def test_the_signed_message_construction_is_unchanged(vector, recorded_signer) -> None:
+    """Pins every field of what gets signed, and their order.
+
+    This is the signature counterpart to the HKDF derivation vectors: drop the
+    recipient (and surreptitious forwarding works again), reorder two fields,
+    change the label, or slip in a length prefix, and this digest moves. None of
+    those changes can be caught by a recorded signature, which fails under any
+    modification and so cannot say which one happened.
+    """
+    message = signing.signed_message(
+        bytes.fromhex(vector["plaintext"]),
+        recorded_signer,
+        PublicKey.decode(SIGNED["public"]),
+        suites.by_id(vector["suite_id"]),
+    )
+
+    assert len(message) == vector["length"]
+    assert hashlib.sha256(message).hexdigest() == vector["sha256"]
+
+
+class TestFrozenForwardingRejection:
+    """A signature made for one recipient, re-sealed to another.
+
+    What this guards is a build that accepts forwarded containers outright --
+    verification skipped, or the sender-supplied key inside the file trusted
+    without checking what it was bound to. It does *not* by itself catch a
+    change to the signed-message construction: a signature recorded under the
+    old construction fails under a new one too, so the rejection would be
+    right for the wrong reason. That job belongs to the digest vectors above.
+    """
+
+    def test_it_never_verifies_with_a_pinned_signer(
+        self, signed_identity, recorded_signer
+    ) -> None:
+        with pytest.raises(SignatureError, match="does not verify"):
+            open_container(
+                bytes.fromhex(SIGNED["forwarded"]["container"]),
+                signed_identity,
+                recorded_signer,
+            )
+
+    def test_it_never_verifies_without_one_either(self, signed_identity) -> None:
+        with pytest.raises(SignatureError, match="does not verify"):
+            open_container(
+                bytes.fromhex(SIGNED["forwarded"]["container"]), signed_identity
+            )
+
+    def test_it_fails_for_the_right_reason(self, signed_identity) -> None:
+        """The rejection must come from the binding, not from a broken file.
+
+        SignatureError rather than DecryptionError is itself the proof that the
+        AEAD verified: the tag check runs first and would have raised the other
+        error. These assertions add the rest of it -- the container really is
+        addressed to this identity and really is marked signed, so the tests
+        above are not passing because the vector is merely corrupt.
+        """
+        from hpqc.errors import DecryptionError
+
+        blob = bytes.fromhex(SIGNED["forwarded"]["container"])
+        header, _, _ = parse_header(blob)
+
+        assert header.signed is True
+        assert header.key_id == signed_identity.public_key().key_id
+
+        with pytest.raises(SignatureError) as caught:
+            open_container(blob, signed_identity)
+        assert not isinstance(caught.value, DecryptionError)

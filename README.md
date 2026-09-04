@@ -5,7 +5,8 @@
 A small command-line tool that encrypts files and messages to a public key
 using **X25519 + ML-KEM-768** together, derives one key from both with
 **HKDF-SHA256**, and seals the payload with an **AEAD**
-(ChaCha20-Poly1305 or AES-256-GCM).
+(ChaCha20-Poly1305 or AES-256-GCM). Sender authentication is optional and
+hybrid in the same way: **Ed25519 + ML-DSA-65**, both required.
 
 ```console
 $ hpqc keygen -o alice
@@ -15,6 +16,19 @@ key id:      dc367bffcdf81019
 
 $ hpqc encrypt -r alice.pub report.pdf -o report.pdf.hpqc
 $ hpqc decrypt -k alice.key report.pdf.hpqc -o report.pdf
+```
+
+Signing, if you want to answer "who sent this" as well:
+
+```console
+$ hpqc signgen -o bob-sign
+signing private key: bob-sign.key  (mode 0600 -- keep it secret)
+signing public key:  bob-sign.pub   (give this to recipients)
+key id:              1322446e7dc517ec
+
+$ hpqc encrypt -r alice.pub report.pdf -o report.pdf.hpqc -s bob-sign.key
+$ hpqc decrypt -k alice.key report.pdf.hpqc -o report.pdf --sender bob-sign.pub
+signature ok: signed by key id 1322446e7dc517ec
 ```
 
 ## Why hybrid
@@ -65,10 +79,16 @@ resolve at all.
 
 ```
 hpqc keygen  [-o BASENAME] [--force]     write BASENAME.key + BASENAME.pub
+hpqc signgen [-o BASENAME] [--force]     the same, for a signing key pair
 hpqc encrypt -r RECIPIENT.pub [INPUT] [-o OUT] [--aead chacha20|aes]
-hpqc decrypt -k IDENTITY.key  [INPUT] [-o OUT]
+                                         [-s SIGNING.key]
+hpqc decrypt -k IDENTITY.key  [INPUT] [-o OUT] [--sender SIGNER.pub]
 hpqc info    [INPUT]                     describe a container or a key file
 ```
+
+Everything about a signature goes to **stderr**, never stdout: stdout may be
+the plaintext, and a status line mixed into it would corrupt
+`hpqc decrypt file > out`.
 
 `INPUT` defaults to stdin and `-o` to stdout, so everything pipes:
 
@@ -88,6 +108,7 @@ recipient:   key id dc367bffcdf81019
 header:      1168 bytes (authenticated as AAD)
 kem ct:      1088 bytes
 payload:     100016 bytes (ciphertext + 16-byte tag)
+signed:      no
 ```
 
 ## How it works
@@ -163,6 +184,86 @@ rather than an error. That is deliberate — an explicit failure would hand the
 attacker a decryption oracle. The AEAD tag is what actually rejects a bad
 file, and it does so without revealing *which* part was wrong.
 
+## Sender authentication
+
+By default a `.hpqc` file proves nothing about who wrote it: anybody holding
+your public key can produce one. Pass `-s SIGNING.key` and the payload is
+signed; pass `--sender SIGNER.pub` when decrypting and the signature is
+checked. Three choices in that design have a wrong version that looks fine.
+
+### Hybrid again, but for one reason instead of two
+
+The KEM is hybrid because of harvest-now-decrypt-later. That argument does not
+apply to signatures — a forgery in 2040 cannot retroactively change what a
+recipient verified today. The *other* half of the hybrid argument does apply:
+ML-DSA is young, and if lattice signatures fall to cryptanalysis a PQ-only
+signature becomes forgeable **now**. So Ed25519 and ML-DSA-65 both sign the
+same message and both must verify. Either one failing rejects the file.
+
+### Sign, then encrypt
+
+The signature and the sender's public keys live *inside* the AEAD payload.
+Signing the ciphertext instead would prove only who transmitted the bytes, and
+would publish the sender's identity to anyone holding the file. This way the
+signer is confidential — `hpqc info` genuinely cannot say who signed, and
+neither can an eavesdropper:
+
+```console
+$ hpqc info report.pdf.hpqc | tail -1
+signed:      yes (signer is encrypted; decrypt to see who)
+```
+
+### The recipient is bound into the signed message
+
+Sign only the plaintext and you get **surreptitious forwarding**
+(Davis, 2001): Bob receives a signed file from Alice, decrypts it, re-encrypts
+the same plaintext *and the same signature* to Carol, and Carol sees a file
+that verifies as "Alice wrote this to me". The AEAD cannot help — Bob builds a
+fresh, perfectly valid one. So the recipient's public keys go inside what gets
+signed:
+
+```
+signed message = "hpqc-v1 sender authentication" || suite
+              || sender_ed25519_pk   || sender_mldsa_pk
+              || recipient_x25519_pk || recipient_mlkem_pk
+              || plaintext
+```
+
+Carol recomputes that with her own keys, gets a different message, and
+verification fails. The sender's own keys are in there too, so a signature
+cannot be lifted onto a different claimed identity.
+
+### What a valid signature actually proves
+
+**Nothing about identity, unless you supplied the sender's public key.** The
+file carries the signer's keys, so a signature that verifies against *those*
+proves only that whoever encrypted the file also held some signing key — which
+they could have generated a second earlier. That is why `hpqc decrypt` says so
+out loud:
+
+```console
+$ hpqc decrypt -k alice.key report.pdf.hpqc -o report.pdf
+warning: signed by key id 1322446e7dc517ec; pass --sender to verify the signer's identity
+```
+
+With `--sender` the embedded keys are compared against the ones you pinned, and
+a mismatch is an error. Getting that key to you is out of scope — hpqc has no
+key distribution, no web of trust, no TOFU store. Asking for verification of an
+unsigned file is also an error rather than a shrug: authentication requested and
+not delivered fails closed.
+
+### Cost
+
+| | Unsigned | Signed |
+| --- | ---: | ---: |
+| Header | 1168 | 1168 |
+| Signature block | — | 5365 |
+| AEAD tag | 16 | 16 |
+| **Total overhead** | **1184** | **6549** |
+
+Post-quantum signatures are simply large: ML-DSA-65 alone is 3309 bytes of
+that, and its verifying key another 1952.
+
 ## File format
 
 `.hpqc` containers are `header || AEAD ciphertext || 16-byte tag`. All
@@ -173,7 +274,7 @@ integers are big-endian.
 | 0 | 4 | magic, `HPQC` |
 | 4 | 1 | format version, `1` |
 | 5 | 1 | cipher suite id |
-| 6 | 2 | flags, reserved, must be 0 |
+| 6 | 2 | flags; bit 0 = payload is signed, other bits reserved |
 | 8 | 8 | recipient key id (truncated SHA-256) |
 | 16 | 16 | HKDF salt |
 | 32 | 12 | AEAD nonce |
@@ -183,7 +284,31 @@ integers are big-endian.
 | 80 | 1088 | ML-KEM-768 ciphertext |
 | 1168 | … | AEAD ciphertext, then a 16-byte tag |
 
-Fixed overhead is **1184 bytes** per file, whatever its size.
+Fixed overhead is **1184 bytes** per file, whatever its size — 6549 if it is
+signed.
+
+Sender authentication claimed bit 0 of the reserved `flags` field, which is what
+it was there for, so the format version did not have to move. An older build
+meets a signed file, sees a flag bit it does not implement, and refuses it by
+name rather than decrypting something it only half understands; this build still
+reads every unsigned file written before signing existed. Unknown flag *bits*
+are refused; known ones are not a free pass, because the whole header is
+associated data — setting bit 0 on an unsigned file gets past the flag check and
+straight into a tag failure.
+
+When bit 0 is set, the decrypted payload begins with a signature block:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | length of the sender Ed25519 verifying key (32) |
+| 2 | 32 | sender Ed25519 verifying key |
+| 34 | 2 | length of the sender ML-DSA-65 verifying key (1952) |
+| 36 | 1952 | sender ML-DSA-65 verifying key |
+| 1988 | 2 | length of the Ed25519 signature (64) |
+| 1990 | 64 | Ed25519 signature |
+| 2054 | 2 | length of the ML-DSA-65 signature (3309) |
+| 2056 | 3309 | ML-DSA-65 signature |
+| 5365 | … | plaintext |
 
 Suite ids: `0x01` = X25519+ML-KEM-768/ChaCha20-Poly1305,
 `0x02` = X25519+ML-KEM-768/AES-256-GCM.
@@ -215,9 +340,19 @@ An identity is always *both* algorithms. They are generated, stored, and
 fingerprinted as one unit, because letting them travel separately is exactly
 how you end up shipping a "hybrid" scheme an attacker can downgrade.
 
+Signing keys are a separate pair of types with their own prefixes,
+`hpqc-ssk1` and `hpqc-spk1`. They are deliberately not folded into the
+encryption identity: a key should do one job, signing stays opt-in, and
+existing encryption keys keep working untouched. Within a signing identity the
+same all-or-nothing rule applies — Ed25519 and ML-DSA-65 travel together. The
+private file holds the 32-byte ML-DSA seed and is 217 bytes; the public file is
+2773. Both key ids are truncated SHA-256, under **different** domain strings,
+so an encryption identity and a signing identity can never print the same one
+and be mistaken for each other.
+
 ## Backend requirements
 
-ML-KEM comes from `cryptography.hazmat.primitives.asymmetric.mlkem`, which
+ML-KEM and ML-DSA come from `cryptography.hazmat.primitives.asymmetric`, which
 needs `cryptography` ≥ 46 built against OpenSSL ≥ 3.5. To check:
 
 ```console
@@ -225,11 +360,14 @@ $ python -c "from cryptography.hazmat.backends.openssl.backend import backend; p
 OpenSSL 4.0.2 25 Aug 2026
 $ python -c "from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey; print('ok')"
 ok
+$ python -c "from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey; print('ok')"
+ok
 ```
 
-If either fails, `hpqc` says so with an actionable message rather than an
+If any of these fails, `hpqc` says so with an actionable message rather than an
 ImportError from deep inside a key operation. Upgrade with
-`pip install --upgrade 'cryptography>=46'`.
+`pip install --upgrade 'cryptography>=46'`. The two are probed separately, so a
+stack that can encrypt but not sign is refused only when you ask it to sign.
 
 No `liboqs` build is required.
 
@@ -238,7 +376,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-124 passed
+222 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -281,6 +419,21 @@ actually fails. Among them:
   test still passes — only the vectors notice. Encryption is not reproducible
   (nothing random in it is injectable), so the vectors are verified on the
   deterministic decryption side.
+- **Both signatures are required.** Break the ML-DSA half of a payload and the
+  file must still be refused; break the Ed25519 half and the same. Without both
+  halves of this pair the scheme is hybrid-shaped rather than hybrid — the
+  signature counterpart of the shared-secret test above.
+- **Surreptitious forwarding is blocked.** A signature made for Bob, re-sealed
+  to Alice byte for byte, must not verify — with or without a pinned sender
+  key. Paired with a test that the original recipient *can* verify the same
+  bytes, so it cannot pass because something is merely broken.
+- **The signature block is fuzzed separately.** Corrupting a finished signed
+  container trips the AEAD tag first, so those mutations never reach the
+  signature parser. Mutating the payload *before* sealing it does — and that is
+  also the realistic threat, since the sender chooses the payload.
+- **The signed-message construction is pinned by digest.** Recorded signatures
+  cannot do this; see below.
+- **The signature notice never lands on stdout.** stdout is the plaintext.
 
 ## What building this turned up
 
@@ -305,6 +458,19 @@ confidentiality, but a parser that crashes on chosen input is the wrong shape,
 and a hostile `.pub` file reached the same code from the other direction. Both
 now go through one `_exchange` helper that converts it to a `FormatError`.
 
+**A frozen negative vector proved less than it looked.** Adding sender
+authentication, I recorded a container whose signature was made for a different
+recipient, expecting it to guard against surreptitious forwarding for good. It
+does not. Deleting the recipient from the signed message — the exact regression
+it was supposed to catch — left that vector still failing, because a signature
+recorded under the old construction does not verify under a new one either. It
+was rejecting the file for the wrong reason, and would have gone on "passing"
+while the property it guarded was gone. A recorded *signature* cannot pin a
+construction; only a recorded *digest of the signed message* can. So the vectors
+now carry both, and the negative one is documented as guarding something
+narrower: a build that accepts forwarded containers outright. Checking that a
+test fails when you break the thing it tests is the only way to find this.
+
 **The declared Python floor was wrong.** `requires-python = ">=3.9"` looked
 fine and was not: `cryptography>=46` declares `!=3.9.0,!=3.9.1`, so on those
 releases `pip install` fails in the resolver rather than with a useful message.
@@ -313,16 +479,17 @@ Setting up the CI matrix is what surfaced it.
 ## Scope and limitations
 
 What this does: confidentiality and integrity of a file, to a recipient's
-public key, against an attacker who records now and decrypts later.
+public key, against an attacker who records now and decrypts later — and,
+optionally, authentication of who sent it.
 
 What it does **not** do, by design in v1:
 
-- **No sender authentication.** Anyone with your public key can produce a
-  valid file. There is no signature, so "who sent this" is unanswered. Signing
-  with ML-DSA is the natural v2.
+- **No key distribution.** Verifying a sender means already having their
+  signing public key, obtained some other way. There is no web of trust, no
+  TOFU store, no directory. A signature checked only against the key inside the
+  file proves consistency, not identity, and the tool says so.
 - **No streaming.** The whole plaintext is held in memory. Chunked AEAD with a
-  counter nonce and an explicit final-chunk marker is what the reserved
-  `flags` field is for.
+  counter nonce and an explicit final-chunk marker is the next flag bit.
 - **No passphrase on private keys.** They sit on disk protected only by file
   permissions, like `age` identity files.
 - **Single recipient per file.**
@@ -331,7 +498,7 @@ What it does **not** do, by design in v1:
 
 ## Roadmap
 
-- [ ] ML-DSA-65 signatures for sender authentication
+- [x] ML-DSA-65 signatures for sender authentication
 - [ ] Streaming / chunked AEAD for large files
 - [ ] Passphrase-wrapped private keys (scrypt + AEAD)
 - [ ] Multiple recipients per file
@@ -341,11 +508,14 @@ What it does **not** do, by design in v1:
 ## References
 
 - [NIST FIPS 203](https://csrc.nist.gov/pubs/fips/203/final) — Module-Lattice-Based Key-Encapsulation Mechanism (ML-KEM)
+- [NIST FIPS 204](https://csrc.nist.gov/pubs/fips/204/final) — Module-Lattice-Based Digital Signature Standard (ML-DSA)
 - [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748) — Elliptic Curves for Security (X25519)
+- [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) — EdDSA (Ed25519)
 - [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869) — HKDF
 - [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439) — ChaCha20 and Poly1305
 - [X-Wing](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/) — a hybrid KEM combiner; `hpqc` uses the same `ss_m ‖ ss_x` ordering
 - [draft-ietf-tls-hybrid-design](https://datatracker.ietf.org/doc/draft-ietf-tls-hybrid-design/) — hybrid key exchange in TLS 1.3
+- Don Davis, *Defective Sign & Encrypt in S/MIME, PKCS#7, MOSS, PEM, PGP, and XML* (USENIX Annual Technical Conference, 2001) — where surreptitious forwarding comes from
 
 ## License
 

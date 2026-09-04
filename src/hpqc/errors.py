@@ -29,3 +29,7 @@ class DecryptionError(HpqcError):
 
 class BackendError(HpqcError):
     """The installed cryptography/OpenSSL stack cannot do ML-KEM."""
+
+
+class SignatureError(HpqcError):
+    """Sender authentication failed, or was asked for and is not present."""

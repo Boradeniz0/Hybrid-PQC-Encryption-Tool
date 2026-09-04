@@ -4,15 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpqc"
-version = "0.1.0"
-description = "Hybrid post-quantum file encryption: X25519 + ML-KEM-768 -> HKDF -> AEAD"
+version = "0.2.0"
+description = "Hybrid post-quantum file encryption: X25519 + ML-KEM-768, with optional Ed25519 + ML-DSA-65 sender authentication"
 readme = "README.md"
 # 3.9.2, not 3.9: cryptography>=46 declares !=3.9.0,!=3.9.1, so the
 # dependency cannot resolve at all on those two patch releases.
 requires-python = ">=3.9.2"
 license = "MIT"
 authors = [{ name = "Boradeniz0" }]
-keywords = ["cryptography", "post-quantum", "ml-kem", "kyber", "x25519", "hybrid", "aead"]
+keywords = [
+    "cryptography", "post-quantum", "ml-kem", "ml-dsa", "kyber", "dilithium",
+    "x25519", "ed25519", "hybrid", "aead", "signatures",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -21,8 +24,9 @@ classifiers = [
     "Topic :: Security :: Cryptography",
 ]
 dependencies = [
-    # ML-KEM lives in cryptography.hazmat.primitives.asymmetric.mlkem and needs
-    # an OpenSSL 3.5+ backend underneath. See "Backend requirements" in README.
+    # ML-KEM and ML-DSA live in cryptography.hazmat.primitives.asymmetric and
+    # need an OpenSSL 3.5+ backend underneath. See "Backend requirements" in
+    # the README.
     "cryptography>=46.0",
     "click>=8.1",
 ]

@@ -29,13 +29,15 @@ jobs:
           pip install -e '.[dev]'
 
       - name: Report the crypto backend
-        # ML-KEM needs cryptography >= 46 on OpenSSL >= 3.5. The wheels bundle
-        # their own OpenSSL, so this records what the run actually tested
-        # against -- and fails loudly instead of skipping if it is missing.
+        # ML-KEM and ML-DSA need cryptography >= 46 on OpenSSL >= 3.5. The
+        # wheels bundle their own OpenSSL, so this records what the run actually
+        # tested against -- and fails loudly instead of skipping if it is
+        # missing.
         run: |
           python -c "import cryptography; print('cryptography', cryptography.__version__)"
           python -c "from cryptography.hazmat.backends.openssl.backend import backend; print(backend.openssl_version_text())"
           python -c "from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey; print('ML-KEM-768: available')"
+          python -c "from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey; print('ML-DSA-65: available')"
 
       - name: Test
         run: pytest -q
@@ -63,3 +65,26 @@ jobs:
           echo "wrong identity rejected: ok"
           printf 'piped\n' | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key | grep -qx piped
           echo "stdin/stdout pipeline: ok"
+
+          hpqc signgen -o signer
+          hpqc signgen -o impostor
+          hpqc encrypt -r ci.pub msg.txt -o signed.hpqc -s signer.key
+          hpqc decrypt -k ci.key signed.hpqc -o signed-out.txt --sender signer.pub
+          cmp msg.txt signed-out.txt
+          echo "signed round trip: ok"
+          hpqc info signed.hpqc | grep -q '^signed:      yes'
+          hpqc info msg.hpqc    | grep -q '^signed:      no'
+          echo "info reports the signed flag: ok"
+          if hpqc decrypt -k ci.key signed.hpqc -o /dev/null --sender impostor.pub 2>/dev/null; then
+            echo "FAIL: verified against the wrong sender"; exit 1
+          fi
+          echo "wrong sender rejected: ok"
+          if hpqc decrypt -k ci.key msg.hpqc -o /dev/null --sender signer.pub 2>/dev/null; then
+            echo "FAIL: an unsigned file passed verification"; exit 1
+          fi
+          echo "unsigned file fails closed: ok"
+          # stdout is the plaintext; the signature notice must go to stderr, or
+          # `hpqc decrypt > file` silently gains a status line.
+          hpqc decrypt -k ci.key signed.hpqc --sender signer.pub 2>/dev/null > piped-out.txt
+          cmp msg.txt piped-out.txt
+          echo "signature notice stays off stdout: ok"

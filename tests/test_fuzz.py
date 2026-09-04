@@ -10,6 +10,12 @@ matters, so two properties have to hold for *any* input:
 The second is the one that rots quietly: a new header field parsed without a
 bounds check still passes every hand-written test while turning a malformed
 file into a traceback. The seed is fixed so a failure is reproducible.
+
+The signature block gets its own pass. Corrupting a finished signed container
+almost always trips the AEAD tag first, so those mutations never reach
+signing.py's parser at all. To actually fuzz it the payload has to be mutated
+*before* it is sealed -- which is also the realistic threat, since the sender
+is who chooses the payload.
 """
 
 from __future__ import annotations
@@ -18,8 +24,12 @@ import random
 
 import pytest
 
-from hpqc.container import decrypt, encrypt
+from hpqc.container import decrypt, encrypt, open_container
 from hpqc.errors import HpqcError
+from hpqc.signing import sign_payload
+from hpqc.suites import DEFAULT_SUITE
+
+from helpers import seal
 
 SEED = 1337
 ITERATIONS = 400
@@ -76,3 +86,55 @@ def test_garbage_carrying_a_valid_magic_is_still_rejected(alice) -> None:
         body = bytes(rng.randrange(256) for _ in range(rng.randrange(0, 2500)))
         with pytest.raises(HpqcError):
             decrypt(MAGIC + body, alice)
+
+
+def test_random_corruption_of_a_signed_container_never_escapes(
+    alice, alice_pub, carol
+) -> None:
+    container = encrypt(b"signed and sealed" * 20, alice_pub, sender=carol)
+    rng = random.Random(SEED + 3)
+
+    for _ in range(ITERATIONS):
+        corrupted = _mutate(rng, container)
+        if corrupted == container:
+            continue
+        try:
+            decrypt(corrupted, alice)
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - that is the point of the test
+            pytest.fail(
+                f"{type(exc).__name__} escaped: {exc}\n"
+                f"input prefix: {corrupted[:48].hex()}"
+            )
+        else:
+            pytest.fail("a corrupted signed container decrypted successfully")
+
+
+def test_a_mutated_signature_block_never_escapes_and_never_verifies(
+    alice, alice_pub, carol, carol_pub
+) -> None:
+    """Fuzz signing.py's parser, sealing each mutation so the AEAD passes.
+
+    This is the test that catches a signature field parsed without a bounds
+    check, and a verification path that accepts a block it should not.
+    """
+    payload = sign_payload(b"pay 100", carol, alice_pub, DEFAULT_SUITE)
+    rng = random.Random(SEED + 4)
+
+    for _ in range(ITERATIONS):
+        mutated = _mutate(rng, payload)
+        if mutated == payload:
+            continue
+        blob = seal(mutated, alice_pub)
+        try:
+            open_container(blob, alice, carol_pub)
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"{type(exc).__name__} escaped the signature parser: {exc}\n"
+                f"payload prefix: {mutated[:48].hex()}"
+            )
+        else:
+            pytest.fail("a mutated signature block verified successfully")

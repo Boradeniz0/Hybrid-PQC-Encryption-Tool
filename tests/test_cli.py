@@ -8,7 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from hpqc.cli import cli
-from hpqc.keys import PrivateKey, PublicKey
+from hpqc.keys import PrivateKey, PublicKey, SigningPrivateKey, SigningPublicKey
 
 
 @pytest.fixture
@@ -161,5 +161,153 @@ def test_encrypting_to_a_private_key_file_is_refused(workspace, runner) -> None:
 def test_help_lists_every_command(runner) -> None:
     output = run(runner, "--help").output
 
-    for command in ("keygen", "encrypt", "decrypt", "info"):
+    for command in ("keygen", "signgen", "encrypt", "decrypt", "info"):
         assert command in output
+
+
+# --------------------------------------------------------------------------
+# Sender authentication
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def signed_workspace(workspace, runner):
+    """alice's identity plus two signing identities, carol's and eve's."""
+    for name in ("carol", "eve"):
+        result = run(runner, "signgen", "-o", f"{name}-sign")
+        assert result.exit_code == 0, result.output
+    return workspace
+
+
+def test_signgen_writes_both_files(signed_workspace, runner) -> None:
+    private_path = signed_workspace / "carol-sign.key"
+    public_path = signed_workspace / "carol-sign.pub"
+
+    assert private_path.exists() and public_path.exists()
+    assert oct(private_path.stat().st_mode)[-3:] == "600"
+
+    sender = SigningPrivateKey.read(private_path)
+    assert sender.public_key() == SigningPublicKey.read(public_path)
+
+
+def test_signgen_refuses_to_clobber_an_existing_key(signed_workspace, runner) -> None:
+    result = run(runner, "signgen", "-o", "carol-sign")
+
+    assert result.exit_code != 0
+    assert "already exists" in result.output
+
+
+def test_sign_then_verify_round_trip(signed_workspace, runner) -> None:
+    (signed_workspace / "m.txt").write_bytes(b"pay 100")
+
+    result = run(
+        runner, "encrypt", "-r", "alice.pub", "m.txt",
+        "-o", "m.hpqc", "-s", "carol-sign.key",
+    )
+    assert result.exit_code == 0, result.output
+
+    result = run(
+        runner, "decrypt", "-k", "alice.key", "m.hpqc",
+        "-o", "out.txt", "--sender", "carol-sign.pub",
+    )
+    assert result.exit_code == 0, result.output
+    assert (signed_workspace / "out.txt").read_bytes() == b"pay 100"
+    assert "signature ok" in result.stderr
+
+
+def test_decrypting_a_signed_file_without_a_sender_key_warns(
+    signed_workspace, runner
+) -> None:
+    run(
+        runner, "encrypt", "-r", "alice.pub", "-o", "m.hpqc",
+        "-s", "carol-sign.key", stdin=b"hello",
+    )
+    result = run(runner, "decrypt", "-k", "alice.key", "m.hpqc", "-o", "out.txt")
+
+    assert result.exit_code == 0, result.output
+    assert (signed_workspace / "out.txt").read_bytes() == b"hello"
+    assert "warning" in result.stderr
+    assert "pass --sender" in result.stderr
+
+
+def test_the_signature_notice_never_lands_on_stdout(signed_workspace, runner) -> None:
+    """`hpqc decrypt file > out` must not have a status line mixed into it.
+
+    stdout is the plaintext. Anything chatty belongs on stderr, or piping the
+    tool silently corrupts what it writes.
+    """
+    run(
+        runner, "encrypt", "-r", "alice.pub", "-o", "m.hpqc",
+        "-s", "carol-sign.key", stdin=b"exact bytes",
+    )
+    result = run(
+        runner, "decrypt", "-k", "alice.key", "m.hpqc",
+        "--sender", "carol-sign.pub",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout_bytes == b"exact bytes"
+
+
+def test_verifying_against_the_wrong_sender_fails_and_writes_nothing(
+    signed_workspace, runner
+) -> None:
+    run(
+        runner, "encrypt", "-r", "alice.pub", "-o", "m.hpqc",
+        "-s", "carol-sign.key", stdin=b"hello",
+    )
+    result = runner.invoke(
+        cli,
+        ["decrypt", "-k", "alice.key", "m.hpqc", "-o", "out.txt",
+         "--sender", "eve-sign.pub"],
+    )
+
+    assert result.exit_code != 0
+    assert "was signed by key id" in str(result.exception)
+    assert not (signed_workspace / "out.txt").exists()
+
+
+def test_verifying_an_unsigned_file_fails_closed(signed_workspace, runner) -> None:
+    run(runner, "encrypt", "-r", "alice.pub", "-o", "m.hpqc", stdin=b"hello")
+    result = runner.invoke(
+        cli,
+        ["decrypt", "-k", "alice.key", "m.hpqc", "-o", "out.txt",
+         "--sender", "carol-sign.pub"],
+    )
+
+    assert result.exit_code != 0
+    assert "not signed" in str(result.exception)
+    assert not (signed_workspace / "out.txt").exists()
+
+
+def test_info_reports_whether_a_file_is_signed(signed_workspace, runner) -> None:
+    run(
+        runner, "encrypt", "-r", "alice.pub", "-o", "signed.hpqc",
+        "-s", "carol-sign.key", stdin=b"x",
+    )
+    run(runner, "encrypt", "-r", "alice.pub", "-o", "plain.hpqc", stdin=b"x")
+
+    assert "signed:      yes" in run(runner, "info", "signed.hpqc").output
+    assert "signed:      no" in run(runner, "info", "plain.hpqc").output
+
+
+def test_info_recognises_signing_key_files(signed_workspace, runner) -> None:
+    public = run(runner, "info", "carol-sign.pub").output
+    private = run(runner, "info", "carol-sign.key").output
+
+    assert "signing public key" in public
+    assert "signing private key" in private
+    assert "Ed25519 + ML-DSA-65" in public
+
+
+def test_signing_with_an_encryption_key_is_refused(signed_workspace, runner) -> None:
+    """The four key kinds have distinct prefixes; the error must say so."""
+    result = runner.invoke(
+        cli,
+        ["encrypt", "-r", "alice.pub", "-o", "m.hpqc", "-s", "alice.key"],
+        input=b"x",
+    )
+
+    assert result.exit_code != 0
+    assert "signing private" in str(result.exception)
+    assert not (signed_workspace / "m.hpqc").exists()

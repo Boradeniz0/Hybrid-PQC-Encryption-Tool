@@ -6,7 +6,7 @@ Byte layout (all integers big-endian):
     0       4      magic, b"HPQC"
     4       1      format version, 1
     5       1      cipher suite id  -> suites.by_id()
-    6       2      flags, reserved, must be 0
+    6       2      flags; bit 0 = the payload is signed, other bits reserved
     8       8      recipient key id (truncated SHA-256, a UX hint only)
     16      16     HKDF salt
     32      12     AEAD nonce  (suite.nonce_len)
@@ -26,9 +26,16 @@ Two properties matter more than the exact offsets:
 * **Variable-size fields are length-prefixed.** v1 only ever emits 32 and 1088,
   but a future ML-KEM-1024 suite drops in without a parser change.
 
-v1 encrypts in one shot, so the whole plaintext is held in memory. Streaming
-(chunked AEAD with a per-chunk counter nonce and an explicit final-chunk flag)
-is the natural v2 -- the `flags` field is reserved for exactly that.
+* **Unknown flag bits are refused, known ones are not.** Sender authentication
+  was added by claiming bit 0 of the reserved `flags` field, which is what it
+  was there for. An older build meets a signed file, sees a flag bit it does
+  not implement, and refuses it by name instead of decrypting something it only
+  half understands -- while this build still reads every unsigned file written
+  before signing existed. The format version did not have to move.
+
+Encryption is one-shot, so the whole plaintext is held in memory. Streaming
+(chunked AEAD with a per-chunk counter nonce and an explicit final-chunk
+marker) is the next flag bit.
 """
 
 from __future__ import annotations
@@ -36,59 +43,32 @@ from __future__ import annotations
 import os
 import struct
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from cryptography.exceptions import InvalidTag
 
-from . import hybrid, suites
-from .errors import DecryptionError, FormatError, WrongRecipientError
+from . import hybrid, signing, suites
+from .errors import DecryptionError, FormatError, SignatureError, WrongRecipientError
 from .hybrid import MLKEM768_CIPHERTEXT_LEN, SALT_LEN
-from .keys import KEY_ID_LEN, X25519_KEY_LEN, PrivateKey, PublicKey
+from .keys import (
+    KEY_ID_LEN,
+    X25519_KEY_LEN,
+    PrivateKey,
+    PublicKey,
+    SigningPrivateKey,
+    SigningPublicKey,
+)
 from .suites import DEFAULT_SUITE, Suite
+from .wire import U16, Reader
 
 MAGIC = b"HPQC"
 FORMAT_VERSION = 1
+
 FLAGS_NONE = 0
+FLAG_SIGNED = 0x0001  # the AEAD payload starts with a signature block
+_KNOWN_FLAGS = FLAG_SIGNED
 
 _PREAMBLE = struct.Struct(">4sBBH8s16s")  # magic, version, suite, flags, key id, salt
-_U16 = struct.Struct(">H")
-
-
-class _Reader:
-    """Bounds-checked forward cursor with error messages worth reading."""
-
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-        self._pos = 0
-
-    def take(self, n: int, what: str) -> bytes:
-        end = self._pos + n
-        if end > len(self._data):
-            raise FormatError(
-                f"truncated container: need {n} bytes for {what} at offset "
-                f"{self._pos}, only {len(self._data) - self._pos} remain"
-            )
-        chunk = self._data[self._pos : end]
-        self._pos = end
-        return chunk
-
-    def take_u16(self, what: str) -> int:
-        return _U16.unpack(self.take(_U16.size, what))[0]
-
-    def take_prefixed(self, what: str, expected: int) -> bytes:
-        length = self.take_u16(f"{what} length")
-        if length != expected:
-            raise FormatError(
-                f"{what} is {length} bytes, expected {expected} for this suite"
-            )
-        return self.take(length, what)
-
-    @property
-    def pos(self) -> int:
-        return self._pos
-
-    def rest(self) -> bytes:
-        return self._data[self._pos :]
 
 
 @dataclass(frozen=True)
@@ -116,9 +96,9 @@ class Header:
                     self.salt,
                 ),
                 self.nonce,
-                _U16.pack(len(self.ephemeral_public)),
+                U16.pack(len(self.ephemeral_public)),
                 self.ephemeral_public,
-                _U16.pack(len(self.kem_ciphertext)),
+                U16.pack(len(self.kem_ciphertext)),
                 self.kem_ciphertext,
             )
         )
@@ -126,6 +106,16 @@ class Header:
     @property
     def key_id_hex(self) -> str:
         return self.key_id.hex()
+
+    @property
+    def signed(self) -> bool:
+        """True if the payload begins with a signature block.
+
+        Whether the signature *verifies* -- and who signed -- cannot be known
+        from the header: the signature lives inside the AEAD, so it takes the
+        recipient's private key to find out. That is deliberate; see signing.py.
+        """
+        return bool(self.flags & FLAG_SIGNED)
 
 
 def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
@@ -135,7 +125,7 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
     associated data, and re-serialising could paper over a byte we did not
     round-trip faithfully.
     """
-    reader = _Reader(data)
+    reader = Reader(data)
     preamble = reader.take(_PREAMBLE.size, "header preamble")
     magic, version, suite_id, flags, key_id, salt = _PREAMBLE.unpack(preamble)
 
@@ -151,10 +141,14 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
 
     suite = suites.by_id(suite_id)
 
-    if flags != FLAGS_NONE:
+    unknown = flags & ~_KNOWN_FLAGS
+    if unknown:
+        # Refuse by name rather than ignoring the bit: an unknown flag means
+        # the writer used a feature this build does not implement, and
+        # decrypting half of what the file says would be worse than failing.
         raise FormatError(
-            f"unknown header flags 0x{flags:04x}; the file likely uses a "
-            "feature this build does not implement"
+            f"unknown header flags 0x{unknown:04x}; the file uses a feature "
+            f"this build does not implement (known flags: 0x{_KNOWN_FLAGS:04x})"
         )
 
     nonce = reader.take(suite.nonce_len, "AEAD nonce")
@@ -179,14 +173,29 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
 
 
 def encrypt(
-    plaintext: bytes, recipient: PublicKey, suite: Suite = DEFAULT_SUITE
+    plaintext: bytes,
+    recipient: PublicKey,
+    suite: Suite = DEFAULT_SUITE,
+    sender: Optional[SigningPrivateKey] = None,
 ) -> bytes:
-    """Encrypt to a recipient. Returns the full container."""
+    """Encrypt to a recipient, optionally signing as `sender`.
+
+    Signing happens *before* encryption: the signature block is prepended to
+    the plaintext and the whole thing is sealed, so the signer's identity is
+    confidential and the signature covers what was actually written rather
+    than the ciphertext. See signing.py for why that ordering matters.
+    """
     ephemeral_public, kem_ciphertext, ikm = hybrid.encapsulate(recipient)
+
+    payload = plaintext
+    flags = FLAGS_NONE
+    if sender is not None:
+        payload = signing.sign_payload(plaintext, sender, recipient, suite)
+        flags = FLAG_SIGNED
 
     header = Header(
         suite=suite,
-        flags=FLAGS_NONE,
+        flags=flags,
         key_id=recipient.key_id,
         salt=os.urandom(SALT_LEN),
         # The AEAD key is unique per file (fresh ephemeral X25519 key, fresh
@@ -207,12 +216,38 @@ def encrypt(
         kem_ciphertext=kem_ciphertext,
         recipient=recipient,
     )
-    ciphertext = suite.aead(key).encrypt(header.nonce, plaintext, header_bytes)
+    ciphertext = suite.aead(key).encrypt(header.nonce, payload, header_bytes)
     return header_bytes + ciphertext
 
 
-def decrypt(container: bytes, identity: PrivateKey) -> bytes:
-    """Decrypt a container with our identity. Raises on any tampering."""
+@dataclass(frozen=True)
+class Opened:
+    """The result of opening a container.
+
+    `signer` is the signing key the file carries, or None if it is unsigned.
+    `verified` says whether that key was checked against one the caller
+    supplied: a signature that verifies against the key embedded in the file
+    proves the file is internally consistent, not who wrote it. Only a caller
+    who pinned the sender's public key gets `verified=True`, and only that
+    caller has learned an identity.
+    """
+
+    plaintext: bytes
+    signer: Optional[SigningPublicKey] = None
+    verified: bool = False
+
+
+def open_container(
+    container: bytes,
+    identity: PrivateKey,
+    sender: Optional[SigningPublicKey] = None,
+) -> Opened:
+    """Decrypt a container and, if it is signed, check the signatures.
+
+    Passing `sender` demands authentication: an unsigned file, a file signed by
+    a different key, or a signature that does not verify all raise
+    SignatureError rather than returning plaintext.
+    """
     header, header_bytes, ciphertext = parse_header(container)
 
     recipient = identity.public_key()
@@ -235,9 +270,42 @@ def decrypt(container: bytes, identity: PrivateKey) -> bytes:
     )
 
     try:
-        return header.suite.aead(key).decrypt(header.nonce, ciphertext, header_bytes)
+        payload = header.suite.aead(key).decrypt(
+            header.nonce, ciphertext, header_bytes
+        )
     except InvalidTag:
         raise DecryptionError(
             "authentication failed: the file was modified, or it was not "
             "encrypted for this key"
         ) from None
+
+    if not header.signed:
+        if sender is not None:
+            # Fail closed: the caller asked for authentication and this file
+            # cannot provide it. Returning the plaintext with a shrug is how
+            # "verified" quietly comes to mean nothing.
+            raise SignatureError(
+                "sender verification was requested, but this file is not signed"
+            )
+        return Opened(plaintext=payload)
+
+    plaintext, signer = signing.open_payload(
+        payload, recipient, header.suite, expected_sender=sender
+    )
+    return Opened(
+        plaintext=plaintext, signer=signer, verified=sender is not None
+    )
+
+
+def decrypt(
+    container: bytes,
+    identity: PrivateKey,
+    sender: Optional[SigningPublicKey] = None,
+) -> bytes:
+    """Decrypt a container and return just the plaintext.
+
+    A thin wrapper over open_container for callers that do not care who signed.
+    Note that it still *checks* a signature if one is present -- it only
+    discards the answer about who produced it.
+    """
+    return open_container(container, identity, sender).plaintext

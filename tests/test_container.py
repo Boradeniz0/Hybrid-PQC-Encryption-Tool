@@ -219,12 +219,41 @@ def test_an_unknown_suite_is_refused(alice, alice_pub) -> None:
         decrypt(bytes(blob), alice)
 
 
-def test_unknown_flags_are_refused(alice, alice_pub) -> None:
-    """Reserved bits are a forward-compatibility hook, not something to ignore."""
+@pytest.mark.parametrize("value", [0x02, 0x04, 0x80, 0xFF])
+def test_unknown_flag_bits_are_refused(value, alice, alice_pub) -> None:
+    """Reserved bits are a forward-compatibility hook, not something to ignore.
+
+    Bit 0 is taken (FLAG_SIGNED); every other bit still has to be refused by
+    name, so a file written by a newer build fails loudly here instead of being
+    half understood.
+    """
     blob = bytearray(encrypt(b"secret", alice_pub))
-    blob[OFF_FLAGS + 1] = 0x01
+    blob[OFF_FLAGS + 1] = value
 
     with pytest.raises(FormatError, match="unknown header flags"):
+        decrypt(bytes(blob), alice)
+
+
+def test_high_byte_flag_bits_are_refused(alice, alice_pub) -> None:
+    """The flags field is 16 bits; the top half must be checked too."""
+    blob = bytearray(encrypt(b"secret", alice_pub))
+    blob[OFF_FLAGS] = 0x01
+
+    with pytest.raises(FormatError, match="unknown header flags"):
+        decrypt(bytes(blob), alice)
+
+
+def test_claiming_the_signed_flag_on_an_unsigned_file_fails(alice, alice_pub) -> None:
+    """A known flag bit is not a free pass -- the AAD still covers it.
+
+    Setting FLAG_SIGNED gets past the flag check, so this is the case that
+    proves the header's integrity protection is what stops it rather than the
+    parser's allow-list.
+    """
+    blob = bytearray(encrypt(b"secret", alice_pub))
+    blob[OFF_FLAGS + 1] = container.FLAG_SIGNED
+
+    with pytest.raises(DecryptionError, match="authentication failed"):
         decrypt(bytes(blob), alice)
 
 
