@@ -9,6 +9,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The suite runs in seconds. A job still going after this is stuck, not
+    # slow -- and that has happened: a prompt test that ran out of input looped
+    # forever on click 8.1, which is what Python 3.9 resolves. Better to fail
+    # in ten minutes than hold a runner for six hours.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:

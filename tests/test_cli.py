@@ -9,12 +9,38 @@ from click.testing import CliRunner
 
 from hpqc.cli import cli
 from hpqc import wrapping
+from hpqc.errors import HpqcError
 from hpqc.keys import PrivateKey, PublicKey, SigningPrivateKey, SigningPublicKey
+
+
+def separated_runner() -> CliRunner:
+    """A runner that keeps stderr out of stdout, on every click version.
+
+    click 8.2 always separates the two. Before that -- and Python 3.9 pins click
+    to 8.1, because 8.2 requires 3.10 -- the default folded stderr into stdout
+    and `result.stderr` raised `ValueError: stderr not separately captured`
+    outright. Three assertions here used it, so the 3.9 job could not have been
+    passing.
+    """
+    try:
+        return CliRunner(mix_stderr=False)
+    except TypeError:  # click >= 8.2, where it is the only behaviour
+        return CliRunner()
+
+
+def shown(result) -> str:
+    """Everything the user would see, from both streams.
+
+    `shown(result)` is not portable: on click 8.1 with the streams separated it
+    is stdout alone, and on 8.2+ it is the two interleaved. Assertions that only
+    care whether a message appeared use this instead.
+    """
+    return result.stdout + result.stderr
 
 
 @pytest.fixture
 def runner() -> CliRunner:
-    return CliRunner()
+    return separated_runner()
 
 
 def run(runner: CliRunner, *args: str, stdin: bytes = b"") -> "object":
@@ -26,7 +52,7 @@ def workspace(runner: CliRunner, tmp_path: Path, monkeypatch):
     """A temp cwd with alice's key pair already generated."""
     monkeypatch.chdir(tmp_path)
     result = run(runner, "keygen", "-o", "alice")
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     return tmp_path
 
 
@@ -41,15 +67,15 @@ def test_keygen_writes_both_files_and_prints_the_key_id(workspace, runner) -> No
     assert identity.public_key() == public
 
     result = run(runner, "info", str(public_path))
-    assert public.key_id_hex in result.output
+    assert public.key_id_hex in shown(result)
 
 
 def test_keygen_refuses_to_clobber_an_existing_key(workspace, runner) -> None:
     result = runner.invoke(cli, ["keygen", "-o", "alice"])
 
     assert result.exit_code != 0
-    assert "already exists" in result.output
-    assert "--force" in result.output
+    assert "already exists" in shown(result)
+    assert "--force" in shown(result)
 
 
 def test_keygen_force_overwrites(workspace, runner) -> None:
@@ -125,14 +151,14 @@ def test_info_describes_a_container_without_the_private_key(workspace, runner) -
     result = run(runner, "info", "c.hpqc")
 
     assert result.exit_code == 0
-    assert "hpqc container" in result.output
-    assert "ML-KEM-768" in result.output
-    assert PublicKey.read(workspace / "alice.pub").key_id_hex in result.output
+    assert "hpqc container" in shown(result)
+    assert "ML-KEM-768" in shown(result)
+    assert PublicKey.read(workspace / "alice.pub").key_id_hex in shown(result)
 
 
 def test_info_recognises_key_files(workspace, runner) -> None:
-    assert "public key" in run(runner, "info", "alice.pub").output
-    assert "private key" in run(runner, "info", "alice.key").output
+    assert "public key" in shown(run(runner, "info", "alice.pub"))
+    assert "private key" in shown(run(runner, "info", "alice.key"))
 
 
 def test_info_rejects_unrelated_input(workspace, runner) -> None:
@@ -141,14 +167,14 @@ def test_info_rejects_unrelated_input(workspace, runner) -> None:
     result = runner.invoke(cli, ["info", "junk.bin"])
 
     assert result.exit_code != 0
-    assert "unrecognised input" in result.output
+    assert "unrecognised input" in shown(result)
 
 
 def test_a_missing_recipient_file_is_reported_by_click(workspace, runner) -> None:
     result = runner.invoke(cli, ["encrypt", "-r", "nope.pub", "-o", "c.hpqc"], input=b"x")
 
     assert result.exit_code != 0
-    assert "nope.pub" in result.output
+    assert "nope.pub" in shown(result)
 
 
 def test_encrypting_to_a_private_key_file_is_refused(workspace, runner) -> None:
@@ -160,7 +186,7 @@ def test_encrypting_to_a_private_key_file_is_refused(workspace, runner) -> None:
 
 
 def test_help_lists_every_command(runner) -> None:
-    output = run(runner, "--help").output
+    output = shown(run(runner, "--help"))
 
     for command in ("keygen", "signgen", "encrypt", "decrypt", "info"):
         assert command in output
@@ -176,7 +202,7 @@ def signed_workspace(workspace, runner):
     """alice's identity plus two signing identities, carol's and eve's."""
     for name in ("carol", "eve"):
         result = run(runner, "signgen", "-o", f"{name}-sign")
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 0, shown(result)
     return workspace
 
 
@@ -195,7 +221,7 @@ def test_signgen_refuses_to_clobber_an_existing_key(signed_workspace, runner) ->
     result = run(runner, "signgen", "-o", "carol-sign")
 
     assert result.exit_code != 0
-    assert "already exists" in result.output
+    assert "already exists" in shown(result)
 
 
 def test_sign_then_verify_round_trip(signed_workspace, runner) -> None:
@@ -205,13 +231,13 @@ def test_sign_then_verify_round_trip(signed_workspace, runner) -> None:
         runner, "encrypt", "-r", "alice.pub", "m.txt",
         "-o", "m.hpqc", "-s", "carol-sign.key",
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
 
     result = run(
         runner, "decrypt", "-k", "alice.key", "m.hpqc",
         "-o", "out.txt", "--sender", "carol-sign.pub",
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert (signed_workspace / "out.txt").read_bytes() == b"pay 100"
     assert "signature ok" in result.stderr
 
@@ -225,7 +251,7 @@ def test_decrypting_a_signed_file_without_a_sender_key_warns(
     )
     result = run(runner, "decrypt", "-k", "alice.key", "m.hpqc", "-o", "out.txt")
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert (signed_workspace / "out.txt").read_bytes() == b"hello"
     assert "warning" in result.stderr
     assert "pass --sender" in result.stderr
@@ -246,7 +272,7 @@ def test_the_signature_notice_never_lands_on_stdout(signed_workspace, runner) ->
         "--sender", "carol-sign.pub",
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert result.stdout_bytes == b"exact bytes"
 
 
@@ -288,13 +314,13 @@ def test_info_reports_whether_a_file_is_signed(signed_workspace, runner) -> None
     )
     run(runner, "encrypt", "-r", "alice.pub", "-o", "plain.hpqc", stdin=b"x")
 
-    assert "signed:      yes" in run(runner, "info", "signed.hpqc").output
-    assert "signed:      no" in run(runner, "info", "plain.hpqc").output
+    assert "signed:      yes" in shown(run(runner, "info", "signed.hpqc"))
+    assert "signed:      no" in shown(run(runner, "info", "plain.hpqc"))
 
 
 def test_info_recognises_signing_key_files(signed_workspace, runner) -> None:
-    public = run(runner, "info", "carol-sign.pub").output
-    private = run(runner, "info", "carol-sign.key").output
+    public = shown(run(runner, "info", "carol-sign.pub"))
+    private = shown(run(runner, "info", "carol-sign.key"))
 
     assert "signing public key" in public
     assert "signing private key" in private
@@ -354,7 +380,7 @@ def protected(workspace, runner, pwfile):
     """A workspace whose `secret` identity is passphrase-protected."""
     pw = pwfile(PASSPHRASE)
     result = run(runner, "keygen", "-o", "secret", "--passphrase-file", pw, *FAST)
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     return workspace
 
 
@@ -368,7 +394,7 @@ def test_keygen_can_protect_the_private_key(protected, runner) -> None:
 
 
 def test_info_describes_a_wrapped_key_without_the_passphrase(protected, runner) -> None:
-    output = run(runner, "info", "secret.key").output
+    output = shown(run(runner, "info", "secret.key"))
 
     assert "wrapped private key" in output
     assert "X25519 + ML-KEM-768" in output
@@ -384,7 +410,7 @@ def test_a_protected_key_round_trips(protected, runner, pwfile) -> None:
         "--passphrase-file", pwfile(PASSPHRASE),
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert (protected / "out.txt").read_bytes() == b"under a passphrase"
 
 
@@ -411,8 +437,8 @@ def test_without_a_terminal_the_missing_passphrase_is_explained(
     result = run(runner, "decrypt", "-k", "secret.key", "m.hpqc", "-o", "out.txt")
 
     assert result.exit_code != 0
-    assert "no terminal" in result.output
-    assert "--passphrase-file" in result.output
+    assert "no terminal" in shown(result)
+    assert "--passphrase-file" in shown(result)
 
 
 def test_the_passphrase_can_be_typed_at_a_prompt(
@@ -422,7 +448,7 @@ def test_the_passphrase_can_be_typed_at_a_prompt(
         runner, "keygen", "-o", "typed", "-p", *FAST,
         stdin=f"{PASSPHRASE}\n{PASSPHRASE}\n".encode(),
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert wrapping.is_wrapped((workspace / "typed.key").read_text())
 
     run(runner, "encrypt", "-r", "typed.pub", "-o", "m.hpqc", stdin=b"typed")
@@ -430,18 +456,38 @@ def test_the_passphrase_can_be_typed_at_a_prompt(
         runner, "decrypt", "-k", "typed.key", "m.hpqc", "-o", "out.txt",
         stdin=f"{PASSPHRASE}\n".encode(),
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert (workspace / "out.txt").read_bytes() == b"typed"
 
 
-def test_a_mistyped_confirmation_is_rejected(workspace, runner, faketty) -> None:
+def test_a_mistyped_confirmation_is_not_accepted(workspace, runner, faketty) -> None:
+    """A mismatch is reported and re-asked; the first value is never taken.
+
+    The retry is supplied rather than letting the input run out, and that is
+    deliberate. click 8.2 turns exhausted input into an abort, but click 8.1 --
+    which is what Python 3.9 resolves, so this is not hypothetical -- hands the
+    prompt an empty string instead, and an empty value does not end its retry
+    loop. The version that asserted "the input runs out, so the command fails"
+    looped forever there, writing prompts, at 100% CPU and four gigabytes of
+    resident memory. What both versions agree on is the part actually worth
+    testing: the mismatch is refused out loud, and the key that gets written is
+    the retyped one.
+    """
     result = runner.invoke(
-        cli, ["keygen", "-o", "typed", "-p", *FAST], input=b"one\ntwo\n"
+        cli,
+        ["keygen", "-o", "typed", "-p", *FAST],
+        input=f"one\ntwo\n{PASSPHRASE}\n{PASSPHRASE}\n".encode(),
     )
 
-    assert result.exit_code != 0
-    assert "do not match" in result.output
-    assert not (workspace / "typed.key").exists()
+    assert result.exit_code == 0, shown(result)
+    assert "do not match" in shown(result)
+
+    text = (workspace / "typed.key").read_text()
+    assert wrapping.is_wrapped(text)
+    PrivateKey.decode(text, PASSPHRASE)  # the retyped one, not "one"
+    for rejected in ("one", "two"):
+        with pytest.raises(HpqcError):
+            PrivateKey.decode(text, rejected)
 
 
 def test_the_two_passphrase_sources_cannot_be_combined(
@@ -453,7 +499,7 @@ def test_the_two_passphrase_sources_cannot_be_combined(
     )
 
     assert result.exit_code != 0
-    assert "pick one" in result.output
+    assert "pick one" in shown(result)
 
 
 def test_an_empty_passphrase_file_is_refused(workspace, runner, pwfile) -> None:
@@ -462,7 +508,7 @@ def test_an_empty_passphrase_file_is_refused(workspace, runner, pwfile) -> None:
     )
 
     assert result.exit_code != 0
-    assert "empty" in result.output
+    assert "empty" in shown(result)
     assert not (workspace / "k.key").exists()
 
 
@@ -478,7 +524,7 @@ def test_exactly_one_trailing_newline_is_stripped(workspace, runner, pwfile) -> 
         runner, "decrypt", "-k", "k.key", "m.hpqc", "-o", "ok.txt",
         "--passphrase-file", pwfile("pass phrase ", "kept.txt"),
     )
-    assert kept.exit_code == 0, kept.output
+    assert kept.exit_code == 0, shown(kept)
 
     trimmed = runner.invoke(
         cli,
@@ -511,13 +557,13 @@ def test_a_protected_signing_key_can_still_sign(workspace, runner, pwfile) -> No
         runner, "encrypt", "-r", "alice.pub", "m.txt", "-o", "m.hpqc",
         "-s", "signer.key", "--passphrase-file", pw,
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
 
     result = run(
         runner, "decrypt", "-k", "alice.key", "m.hpqc", "-o", "out.txt",
         "--sender", "signer.pub",
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert (workspace / "out.txt").read_bytes() == b"signed under a passphrase"
 
 
@@ -530,7 +576,7 @@ def test_a_passphrase_file_without_a_key_to_open_is_refused(
     )
 
     assert result.exit_code != 0
-    assert "only makes sense with --sign" in result.output
+    assert "only makes sense with --sign" in shown(result)
 
 
 # --------------------------------------------------------------------------
@@ -558,9 +604,9 @@ def test_passwd_changes_the_passphrase_without_changing_the_key(
         runner, "passwd", "secret.key",
         "--passphrase-file", old, "--new-passphrase-file", new, *FAST,
     )
-    assert result.exit_code == 0, result.output
-    assert "passphrase changed" in result.output
-    assert _key_id(result.output) == before.key_id_hex
+    assert result.exit_code == 0, shown(result)
+    assert "passphrase changed" in shown(result)
+    assert _key_id(shown(result)) == before.key_id_hex
 
     assert PrivateKey.read(protected / "secret.key",
                            "a different passphrase").public_key() == before
@@ -575,8 +621,8 @@ def test_passwd_can_remove_the_passphrase(protected, runner, pwfile) -> None:
         "--passphrase-file", pwfile(PASSPHRASE),
     )
 
-    assert result.exit_code == 0, result.output
-    assert "passphrase removed" in result.output
+    assert result.exit_code == 0, shown(result)
+    assert "passphrase removed" in shown(result)
     assert not wrapping.is_wrapped((protected / "secret.key").read_text())
     assert PrivateKey.read(protected / "secret.key")
     assert oct((protected / "secret.key").stat().st_mode)[-3:] == "600"
@@ -591,8 +637,8 @@ def test_passwd_can_add_a_passphrase_to_an_unprotected_key(
         "--new-passphrase-file", pwfile(PASSPHRASE), *FAST,
     )
 
-    assert result.exit_code == 0, result.output
-    assert "passphrase added" in result.output
+    assert result.exit_code == 0, shown(result)
+    assert "passphrase added" in shown(result)
     assert wrapping.is_wrapped((workspace / "alice.key").read_text())
     assert PrivateKey.read(workspace / "alice.key", PASSPHRASE).public_key() == before
 
@@ -606,7 +652,7 @@ def test_passwd_works_on_signing_keys_too(workspace, runner, pwfile) -> None:
         "--new-passphrase-file", pwfile(PASSPHRASE), *FAST,
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 0, shown(result)
     assert SigningPrivateKey.read(
         workspace / "signer.key", PASSPHRASE
     ).public_key() == before
@@ -618,7 +664,7 @@ def test_passwd_refuses_to_remove_a_passphrase_that_is_not_there(
     result = run(runner, "passwd", "alice.key", "--remove")
 
     assert result.exit_code != 0
-    assert "no passphrase to remove" in result.output
+    assert "no passphrase to remove" in shown(result)
 
 
 def test_passwd_rejects_contradictory_options(protected, runner, pwfile) -> None:
@@ -629,14 +675,14 @@ def test_passwd_rejects_contradictory_options(protected, runner, pwfile) -> None
     )
 
     assert result.exit_code != 0
-    assert "contradict" in result.output
+    assert "contradict" in shown(result)
 
 
 def test_passwd_refuses_a_public_key_file(workspace, runner) -> None:
     result = run(runner, "passwd", "alice.pub")
 
     assert result.exit_code != 0
-    assert "not an hpqc private key" in result.output
+    assert "not an hpqc private key" in shown(result)
 
 
 def test_passwd_leaves_the_key_intact_when_it_fails(protected, runner, pwfile) -> None:
