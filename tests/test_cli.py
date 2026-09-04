@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
-from hpqc.cli import cli
-from hpqc import wrapping
+from hpqc.cli import ONE_SHOT_LIMIT, cli
+from hpqc import streaming, wrapping
+from hpqc.container import parse_header
 from hpqc.errors import HpqcError
 from hpqc.keys import PrivateKey, PublicKey, SigningPrivateKey, SigningPublicKey
 
@@ -16,11 +18,11 @@ from hpqc.keys import PrivateKey, PublicKey, SigningPrivateKey, SigningPublicKey
 def separated_runner() -> CliRunner:
     """A runner that keeps stderr out of stdout, on every click version.
 
-    click 8.2 always separates the two. Before that -- and Python 3.9 pins click
-    to 8.1, because 8.2 requires 3.10 -- the default folded stderr into stdout
-    and `result.stderr` raised `ValueError: stderr not separately captured`
-    outright. Three assertions here used it, so the 3.9 job could not have been
-    passing.
+    click 8.2 always separates the two. Before that -- and Python 3.9 pins
+    click to 8.1, so this is not hypothetical -- the default folded stderr into
+    stdout and `result.stderr` raised outright. Separating everywhere means the
+    pipe tests check what they claim to check: that a status line never lands
+    in the plaintext.
     """
     try:
         return CliRunner(mix_stderr=False)
@@ -31,9 +33,9 @@ def separated_runner() -> CliRunner:
 def shown(result) -> str:
     """Everything the user would see, from both streams.
 
-    `shown(result)` is not portable: on click 8.1 with the streams separated it
-    is stdout alone, and on 8.2+ it is the two interleaved. Assertions that only
-    care whether a message appeared use this instead.
+    `result.output` is not portable: on click 8.1 with the streams separated it
+    is stdout alone, and on 8.2+ it is the two interleaved. Assertions that
+    only care whether a message appeared use this instead.
     """
     return result.stdout + result.stderr
 
@@ -45,6 +47,8 @@ def runner() -> CliRunner:
 
 def run(runner: CliRunner, *args: str, stdin: bytes = b"") -> "object":
     return runner.invoke(cli, list(args), input=stdin, catch_exceptions=False)
+
+
 
 
 @pytest.fixture
@@ -467,11 +471,10 @@ def test_a_mistyped_confirmation_is_not_accepted(workspace, runner, faketty) -> 
     deliberate. click 8.2 turns exhausted input into an abort, but click 8.1 --
     which is what Python 3.9 resolves, so this is not hypothetical -- hands the
     prompt an empty string instead, and an empty value does not end its retry
-    loop. The version that asserted "the input runs out, so the command fails"
-    looped forever there, writing prompts, at 100% CPU and four gigabytes of
-    resident memory. What both versions agree on is the part actually worth
-    testing: the mismatch is refused out loud, and the key that gets written is
-    the retyped one.
+    loop. The version that asserted "input runs out, so the command fails" hung
+    forever there, writing prompts until the process was killed. What both
+    versions agree on is the part actually worth testing: the mismatch is
+    refused out loud, and the key that gets written is the retyped one.
     """
     result = runner.invoke(
         cli,
@@ -697,3 +700,171 @@ def test_passwd_leaves_the_key_intact_when_it_fails(protected, runner, pwfile) -
     assert result.exit_code != 0
     assert (protected / "secret.key").read_text() == before
     assert [p.name for p in protected.iterdir() if p.name.startswith(".")] == []
+
+
+class TestStreaming:
+    """Large inputs: the format switch, and what a failed stream leaves behind."""
+
+    def _big(self, workspace: Path, extra: int = 1) -> bytes:
+        data = os.urandom(ONE_SHOT_LIMIT + extra)
+        (workspace / "big.bin").write_bytes(data)
+        return data
+
+    def test_a_large_file_is_chunked_and_round_trips(self, workspace, runner) -> None:
+        data = self._big(workspace)
+        assert run(runner, "encrypt", "-r", "alice.pub", "big.bin", "-o", "big.hpqc").exit_code == 0
+        assert run(runner, "decrypt", "-k", "alice.key", "big.hpqc", "-o", "out.bin").exit_code == 0
+
+        assert (workspace / "out.bin").read_bytes() == data
+        header, _, _ = parse_header((workspace / "big.hpqc").read_bytes())
+        assert header.chunked
+
+    def test_a_small_file_stays_one_shot(self, workspace, runner) -> None:
+        """The default has to leave ordinary messages exactly as they were."""
+        (workspace / "small.bin").write_bytes(b"x" * 100)
+        run(runner, "encrypt", "-r", "alice.pub", "small.bin", "-o", "small.hpqc")
+
+        header, _, _ = parse_header((workspace / "small.hpqc").read_bytes())
+        assert not header.chunked
+
+    def test_chunked_can_be_forced_on_a_small_file(self, workspace, runner) -> None:
+        (workspace / "small.bin").write_bytes(b"x" * 100)
+        run(runner, "encrypt", "-r", "alice.pub", "small.bin", "-o", "c.hpqc", "--chunked")
+
+        header, _, _ = parse_header((workspace / "c.hpqc").read_bytes())
+        assert header.chunked
+        assert run(runner, "decrypt", "-k", "alice.key", "c.hpqc", "-o", "o.bin").exit_code == 0
+        assert (workspace / "o.bin").read_bytes() == b"x" * 100
+
+    def test_one_shot_can_be_forced_on_a_large_file(self, workspace, runner) -> None:
+        data = self._big(workspace)
+        run(runner, "encrypt", "-r", "alice.pub", "big.bin", "-o", "big.hpqc", "--one-shot")
+
+        header, _, _ = parse_header((workspace / "big.hpqc").read_bytes())
+        assert not header.chunked
+        run(runner, "decrypt", "-k", "alice.key", "big.hpqc", "-o", "out.bin")
+        assert (workspace / "out.bin").read_bytes() == data
+
+    def test_a_large_input_streams_through_a_pipe(self, workspace, runner) -> None:
+        """Both status lines go to stderr, so the pipeline carries only data."""
+        data = os.urandom(ONE_SHOT_LIMIT + 1)
+
+        sealed = run(runner, "encrypt", "-r", "alice.pub", stdin=data)
+        assert sealed.exit_code == 0
+        assert "streamed in" in sealed.stderr
+        opened = run(runner, "decrypt", "-k", "alice.key", stdin=sealed.stdout_bytes)
+
+        assert opened.stdout_bytes == data
+        assert parse_header(sealed.stdout_bytes)[0].chunked
+
+    def test_info_reports_the_chunking_without_the_key(self, workspace, runner) -> None:
+        data = self._big(workspace)
+        run(runner, "encrypt", "-r", "alice.pub", "big.bin", "-o", "big.hpqc")
+
+        output = shown(run(runner, "info", "big.hpqc"))
+        assert "chunked:     yes" in output
+        assert "17 chunk(s)" in output
+        assert f"plaintext:   {len(data)} bytes" in output
+
+    def test_info_says_so_when_a_file_is_not_chunked(self, workspace, runner) -> None:
+        (workspace / "small.bin").write_bytes(b"x" * 100)
+        run(runner, "encrypt", "-r", "alice.pub", "small.bin", "-o", "small.hpqc")
+        assert "chunked:     no" in shown(run(runner, "info", "small.hpqc"))
+
+    def test_chunked_and_sign_are_refused_together(self, workspace, runner) -> None:
+        run(runner, "signgen", "-o", "signer")
+        (workspace / "small.bin").write_bytes(b"x" * 100)
+
+        result = runner.invoke(
+            cli,
+            ["encrypt", "-r", "alice.pub", "small.bin", "-o", "x.hpqc",
+             "--chunked", "-s", "signer.key"],
+        )
+        assert result.exit_code != 0
+        assert "cannot be combined" in shown(result)
+
+    def test_signing_a_large_file_falls_back_to_one_shot(self, workspace, runner) -> None:
+        """Signing wins over streaming, and says so rather than doing it quietly."""
+        run(runner, "signgen", "-o", "signer")
+        self._big(workspace)
+
+        result = run(
+            runner, "encrypt", "-r", "alice.pub", "big.bin", "-o", "big.hpqc",
+            "-s", "signer.key",
+        )
+        assert result.exit_code == 0
+        assert "one-shot container instead of streaming" in shown(result)
+
+        header, _, _ = parse_header((workspace / "big.hpqc").read_bytes())
+        assert header.signed and not header.chunked
+
+    def test_a_truncated_stream_leaves_no_output_file(self, workspace, runner) -> None:
+        """The reason decryption goes through a temporary file and a rename.
+
+        A chunked decrypt writes chunk 3 before it knows chunk 4 verifies, so
+        without the rename a truncated file would leave a plausible, silently
+        incomplete plaintext sitting under the name the user asked for.
+        """
+        self._big(workspace)
+        run(runner, "encrypt", "-r", "alice.pub", "big.bin", "-o", "big.hpqc")
+        blob = (workspace / "big.hpqc").read_bytes()
+        (workspace / "cut.hpqc").write_bytes(blob[: -streaming.WIRE_CHUNK_SIZE])
+
+        result = runner.invoke(cli, ["decrypt", "-k", "alice.key", "cut.hpqc", "-o", "out.bin"])
+        assert result.exit_code != 0
+        assert not (workspace / "out.bin").exists()
+        assert not list(workspace.glob(".*.tmp"))
+
+    def test_decrypted_output_is_not_world_readable(self, workspace, runner) -> None:
+        """The plaintext is the secret; the ciphertext is meant to be passed around."""
+        (workspace / "small.bin").write_bytes(b"x" * 100)
+        run(runner, "encrypt", "-r", "alice.pub", "small.bin", "-o", "small.hpqc")
+        run(runner, "decrypt", "-k", "alice.key", "small.hpqc", "-o", "out.bin")
+
+        assert (workspace / "out.bin").stat().st_mode & 0o777 == 0o600
+
+    def test_an_interrupted_encrypt_leaves_no_half_written_container(
+        self, workspace, runner, monkeypatch
+    ) -> None:
+        """A rename is either done or not; a partial .hpqc would look decryptable."""
+        self._big(workspace)
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("disk went away")
+
+        monkeypatch.setattr(streaming, "seal", explode)
+        with pytest.raises(RuntimeError):
+            run(runner, "encrypt", "-r", "alice.pub", "big.bin", "-o", "big.hpqc")
+
+        assert not (workspace / "big.hpqc").exists()
+        assert not list(workspace.glob(".*.tmp"))
+
+
+def test_output_can_be_a_character_device(workspace, runner) -> None:
+    """`-o /dev/null` has to keep working, and for the right reason.
+
+    Atomic output writes a temporary file beside the target and renames it,
+    which cannot be done inside /dev. Getting this wrong is quiet rather than
+    loud: every negative check written as `decrypt ... -o /dev/null` still
+    "fails", just at the wrong step, and stops testing what it says it tests.
+    """
+    (workspace / "m.bin").write_bytes(b"discard me")
+    run(runner, "encrypt", "-r", "alice.pub", "m.bin", "-o", "m.hpqc")
+
+    result = run(runner, "decrypt", "-k", "alice.key", "m.hpqc", "-o", "/dev/null")
+    assert result.exit_code == 0, shown(result)
+
+
+def test_the_wrong_identity_is_refused_when_writing_to_dev_null(
+    workspace, runner
+) -> None:
+    """The negative case the one above exists to protect."""
+    (workspace / "m.bin").write_bytes(b"secret")
+    run(runner, "encrypt", "-r", "alice.pub", "m.bin", "-o", "m.hpqc")
+    run(runner, "keygen", "-o", "stranger")
+
+    result = runner.invoke(
+        cli, ["decrypt", "-k", "stranger.key", "m.hpqc", "-o", "/dev/null"]
+    )
+    assert result.exit_code != 0
+    assert "encrypted for key id" in str(result.exception)

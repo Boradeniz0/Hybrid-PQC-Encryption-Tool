@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 329 tests). This is
+The automated suite covers all of this and more (`pytest`, 432 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -114,7 +114,72 @@ The default cost is ~128 MiB and about a third of a second. `--scrypt-log-n 14`
 turns it down; the parameters live in the file, so keys written at different
 costs all keep working.
 
-## 4. What has to fail
+## 4. Large files
+
+Nothing to turn on: past a megabyte the format switches on its own, and
+decryption is told by a flag bit in the header.
+
+```console
+head -c 5000000 /dev/urandom > big.bin
+hpqc encrypt -r alice.pub big.bin -o big.hpqc
+hpqc info big.hpqc
+hpqc decrypt -k alice.key big.hpqc -o big-out.bin
+cmp big.bin big-out.bin && echo "round trip ok"
+```
+
+`info` should report `chunked:     yes, 77 chunk(s)` and a `plaintext:` line
+that matches `big.bin` exactly. A small file still says `chunked:     no` — the
+containers you made in section 1 are byte-for-byte the shape they always were.
+
+Watch the memory, which is the whole point:
+
+```console
+/usr/bin/time -f 'streamed:  %M KB' hpqc encrypt -r alice.pub big.bin -o s.hpqc
+/usr/bin/time -f 'one-shot:  %M KB' hpqc encrypt -r alice.pub big.bin -o o.hpqc --one-shot
+```
+
+On a 200 MB file the difference is roughly 35 MB against 620 MB. On 5 MB it is
+35 MB against about 50 MB — the streamed figure does not move with the input,
+which is what "streaming" is supposed to buy.
+
+### Cut one chunk off the end
+
+The attack the format exists to stop, and it needs no key:
+
+```console
+size=$(stat -c '%s' big.hpqc)
+head -c $((size - 65552)) big.hpqc > cut.hpqc     # exactly one 64 KiB chunk
+hpqc decrypt -k alice.key cut.hpqc -o cut.bin; echo "exit=$?"
+ls cut.bin
+```
+
+Every chunk left in `cut.hpqc` is a genuine ciphertext sealed by the real
+sender — nothing in it has been altered. It fails anyway, because the chunk
+that is now last was sealed with the "not final" marker and has to be opened
+with the "final" one. And `ls` should say `cut.bin` does not exist: decryption
+writes to a temporary file and renames it only once the last chunk verifies, so
+a truncated stream leaves no plausible-looking partial plaintext behind.
+
+Try the same with a chunk *added* (`cat big.hpqc <(tail -c 65552 big.hpqc) >
+grown.hpqc`), and with two chunks swapped. All refused.
+
+### Signing a large file
+
+```console
+hpqc encrypt -r alice.pub big.bin -o big-signed.hpqc -s bob-sign.key
+hpqc info big-signed.hpqc | grep chunked
+```
+
+It prints a note on stderr and writes a one-shot container. A signature is a
+statement about a whole message, so it cannot be made until the whole message
+has been read; hpqc keeps the signature and gives up the streaming rather than
+the other way round. Asking for both explicitly is refused outright:
+
+```console
+hpqc encrypt -r alice.pub big.bin -o x.hpqc -s bob-sign.key --chunked
+```
+
+## 5. What has to fail
 
 This is the interesting part. Each of these must exit non-zero with a readable
 message — never a traceback.
@@ -159,10 +224,10 @@ what the file *claims*; nothing in it is trusted until the tag verifies. The
 suite byte is covered twice over — by the AEAD's associated data and by the HKDF
 transcript — so it cannot be used to steer a recipient onto a different cipher.
 
-## 5. The test suite
+## 6. The test suite
 
 ```console
-pytest -q                 # 329 passed
+pytest -q                 # 432 passed
 pytest -q -W error        # clean with warnings escalated to errors
 ```
 
@@ -174,10 +239,28 @@ def _combine(ss_mlkem: bytes, ss_x25519: bytes) -> bytes:
     return ss_x25519 + ss_mlkem      # was: ss_mlkem + ss_x25519
 ```
 
-`pytest -q` then fails **17 tests, every one of them in
-`tests/test_vectors.py`**. The other 312 pass, because both sides of every round
+`pytest -q` then fails **20 tests, every one of them in
+`tests/test_vectors.py`**. The other 412 pass, because both sides of every round
 trip agree with each other — only the frozen vectors know what yesterday's
 answer was. Undo it with `git checkout src/hpqc/hybrid.py`.
+
+Now the streaming one. In `src/hpqc/streaming.py`, make the final-chunk marker
+stop meaning anything:
+
+```python
+_FINAL = b"\x00"      # was: b"\x01"
+```
+
+That fails **15 tests** — four in `tests/test_streaming.py` and eleven in
+`tests/test_vectors.py`, including every recorded chunked container. One test
+does *not* fail, and it is the interesting one:
+`test_without_the_final_marker_truncation_succeeds` passes, because it asserts
+that with the marker gone a truncated file decrypts cleanly. Run it on its own
+to watch a 3-chunk file quietly turn into a 2-chunk one:
+
+```console
+pytest -q -k without_the_final_marker
+```
 
 Two more worth trying the same way, both in `src/hpqc/signing.py`:
 

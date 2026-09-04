@@ -9,10 +9,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # The suite runs in seconds. A job still going after this is stuck, not
-    # slow -- and that has happened: a prompt test that ran out of input looped
-    # forever on click 8.1, which is what Python 3.9 resolves. Better to fail
-    # in ten minutes than hold a runner for six hours.
+    # The suite runs in seconds. A job that is still going after this is stuck,
+    # not slow -- and it has happened: a prompt test that ran out of input
+    # looped forever on click 8.1, which is what Python 3.9 resolves. Better to
+    # fail in ten minutes than burn a runner for six hours.
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -64,10 +64,17 @@ jobs:
           echo "round trip: ok"
           test "$(stat -c '%a' ci.key)" = "600"
           echo "private key mode 0600: ok"
-          if hpqc decrypt -k stranger.key msg.hpqc -o /dev/null 2>/dev/null; then
+          # Every negative check below greps the error too. Without that they
+          # pass whenever the command fails for *any* reason -- and one of them
+          # silently did, when writing to /dev/null started failing before the
+          # key was ever looked at.
+          if hpqc decrypt -k stranger.key msg.hpqc -o /dev/null 2>err.txt; then
             echo "FAIL: decrypted with the wrong identity"; exit 1
           fi
+          grep -q 'encrypted for key id' err.txt
           echo "wrong identity rejected: ok"
+          hpqc decrypt -k ci.key msg.hpqc -o /dev/null
+          echo "output to a character device: ok"
           printf 'piped\n' | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key | grep -qx piped
           echo "stdin/stdout pipeline: ok"
 
@@ -80,13 +87,15 @@ jobs:
           hpqc info signed.hpqc | grep -q '^signed:      yes'
           hpqc info msg.hpqc    | grep -q '^signed:      no'
           echo "info reports the signed flag: ok"
-          if hpqc decrypt -k ci.key signed.hpqc -o /dev/null --sender impostor.pub 2>/dev/null; then
+          if hpqc decrypt -k ci.key signed.hpqc -o /dev/null --sender impostor.pub 2>err.txt; then
             echo "FAIL: verified against the wrong sender"; exit 1
           fi
+          grep -q 'but verification was requested against' err.txt
           echo "wrong sender rejected: ok"
-          if hpqc decrypt -k ci.key msg.hpqc -o /dev/null --sender signer.pub 2>/dev/null; then
+          if hpqc decrypt -k ci.key msg.hpqc -o /dev/null --sender signer.pub 2>err.txt; then
             echo "FAIL: an unsigned file passed verification"; exit 1
           fi
+          grep -q 'this file is not signed' err.txt
           echo "unsigned file fails closed: ok"
           # stdout is the plaintext; the signature notice must go to stderr, or
           # `hpqc decrypt > file` silently gains a status line.
@@ -107,13 +116,15 @@ jobs:
           hpqc decrypt -k locked.key locked.hpqc -o locked-out.txt --passphrase-file pw
           cmp msg.txt locked-out.txt
           echo "passphrase-protected round trip: ok"
-          if hpqc decrypt -k locked.key locked.hpqc -o /dev/null --passphrase-file pw2 2>/dev/null; then
+          if hpqc decrypt -k locked.key locked.hpqc -o /dev/null --passphrase-file pw2 2>err.txt; then
             echo "FAIL: opened with the wrong passphrase"; exit 1
           fi
+          grep -q 'wrong passphrase' err.txt
           echo "wrong passphrase rejected: ok"
-          if hpqc decrypt -k locked.key locked.hpqc -o /dev/null 2>/dev/null; then
+          if hpqc decrypt -k locked.key locked.hpqc -o /dev/null 2>err.txt; then
             echo "FAIL: opened a protected key with no passphrase"; exit 1
           fi
+          grep -q 'no terminal' err.txt
           echo "missing passphrase refused: ok"
           before="$(hpqc info locked.pub | grep 'key id')"
           hpqc passwd locked.key --passphrase-file pw --new-passphrase-file pw2 --scrypt-log-n 14
@@ -126,3 +137,39 @@ jobs:
           cmp msg.txt unlocked.txt
           test "$(stat -c '%a' locked.key)" = "600"
           echo "passwd --remove: ok"
+
+          # Streaming. The format switch is automatic, so this also checks that
+          # an ordinary small message is still written the way it always was.
+          head -c 3000000 /dev/urandom > big.bin
+          hpqc encrypt -r ci.pub big.bin -o big.hpqc
+          hpqc info big.hpqc | grep -q '^chunked:     yes'
+          hpqc info msg.hpqc | grep -q '^chunked:     no'
+          echo "automatic chunking above the threshold: ok"
+          hpqc decrypt -k ci.key big.hpqc -o big-out.bin
+          cmp big.bin big-out.bin
+          echo "streamed round trip: ok"
+          test "$(stat -c '%a' big-out.bin)" = "600"
+          echo "decrypted plaintext is not world-readable: ok"
+
+          # Remove one whole chunk from the end. Every remaining chunk is a
+          # genuine ciphertext, so only the final-chunk marker catches this.
+          size="$(stat -c '%s' big.hpqc)"
+          head -c "$((size - 65552))" big.hpqc > cut.hpqc
+          if hpqc decrypt -k ci.key cut.hpqc -o cut.bin 2>err.txt; then
+            echo "FAIL: a truncated stream decrypted"; exit 1
+          fi
+          grep -q 'authentication failed on chunk' err.txt
+          echo "truncation rejected: ok"
+          if [ -e cut.bin ]; then
+            echo "FAIL: a failed stream left a partial plaintext behind"; exit 1
+          fi
+          echo "no partial plaintext left behind: ok"
+
+          hpqc encrypt -r ci.pub big.bin -o big-signed.hpqc -s signer.key
+          hpqc info big-signed.hpqc | grep -q '^chunked:     no'
+          hpqc info big-signed.hpqc | grep -q '^signed:      yes'
+          echo "signing a large file falls back to one-shot: ok"
+
+          cat big.bin | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key > piped-big.bin
+          cmp big.bin piped-big.bin
+          echo "large stdin/stdout pipeline: ok"

@@ -6,7 +6,9 @@ A small command-line tool that encrypts files and messages to a public key
 using **X25519 + ML-KEM-768** together, derives one key from both with
 **HKDF-SHA256**, and seals the payload with an **AEAD**
 (ChaCha20-Poly1305 or AES-256-GCM). Sender authentication is optional and
-hybrid in the same way: **Ed25519 + ML-DSA-65**, both required.
+hybrid in the same way: **Ed25519 + ML-DSA-65**, both required. Files larger
+than a megabyte are encrypted as a chunked stream, so size is bounded by the
+disk rather than by memory.
 
 ```console
 $ hpqc keygen -o alice
@@ -93,6 +95,7 @@ hpqc keygen  [-o BASENAME] [--force] [-p | --passphrase-file F]
 hpqc signgen [-o BASENAME] [--force] [-p | --passphrase-file F]
 hpqc encrypt -r RECIPIENT.pub [INPUT] [-o OUT] [--aead chacha20|aes]
                                          [-s SIGNING.key] [--passphrase-file F]
+                                         [--chunked | --one-shot]
 hpqc decrypt -k IDENTITY.key  [INPUT] [-o OUT] [--sender SIGNER.pub]
                                          [--passphrase-file F]
 hpqc passwd  KEYFILE [--remove] [--passphrase-file F] [--new-passphrase-file F]
@@ -121,6 +124,17 @@ recipient:   key id dc367bffcdf81019
 header:      1168 bytes (authenticated as AAD)
 kem ct:      1088 bytes
 payload:     100016 bytes (ciphertext + 16-byte tag)
+chunked:     no
+signed:      no
+```
+
+For a streamed file it reports the framing instead, still without the key:
+
+```console
+$ hpqc info disk-image.hpqc
+payload:     5001232 bytes
+chunked:     yes, 77 chunk(s) of up to 64 KiB (+16-byte tag each)
+plaintext:   5000000 bytes
 signed:      no
 ```
 
@@ -188,6 +202,10 @@ encapsulation, and a fresh HKDF salt all feed every derivation. So the nonce
 is never reused under a given key — the catastrophic AEAD failure mode is
 ruled out by key freshness, not by nonce bookkeeping. The random 12-byte nonce
 in the header is defence in depth.
+
+A chunked file needs a nonce *per chunk*, and the same argument carries: the
+counter only has to be unique within one file, because the key already is. See
+[Large files](#large-files) for the construction.
 
 ### Implicit rejection
 
@@ -330,31 +348,116 @@ Defaults are N=2¹⁷, r=8, p=1 — 128 MiB and roughly a third of a second. A
 wrapped identity file is 347 bytes against 252 unwrapped; a wrapped signing key
 315 against 217.
 
+## Large files
+
+One-shot encryption has a ceiling that has nothing to do with cryptography:
+`AEAD.encrypt` takes a `bytes`, so the whole plaintext *and* the whole
+ciphertext are resident at once. Encrypting a 200 MB file that way costs
+620 MB of memory. Past a megabyte, `hpqc` splits the plaintext into 64 KiB
+chunks and seals each one separately:
+
+| | peak memory | time |
+| --- | ---: | ---: |
+| 200 MB, streamed | **35 MB** | 0.26 s |
+| 200 MB, `--one-shot` | 620 MB | 0.74 s |
+
+35 MB is the interpreter and the library; a 5 MB file measures the same, so the
+cost is flat in the size of the input. `--chunked` and `--one-shot` force
+either shape, and decryption never needs to be told — the choice is a flag bit
+in the header.
+
+Chunking naively breaks three things the one-shot version had for free, and
+each has a wrong version that looks like it works.
+
+**A nonce per chunk that cannot collide.** Reusing one nonce across chunks
+under one key is the catastrophic case for both AEADs here: it leaks the XOR of
+the plaintexts and hands over the authentication key.
+
+**Truncation has to be detectable.** Seal each chunk independently and an
+attacker deletes the last one. Every remaining chunk still verifies and the
+recipient gets a shorter file with *no error at all* — "transfer the first half
+of the bank statement" is a complete forgery built with a text editor.
+
+**Reordering and splicing have to be detectable.** Chunks are individually
+valid ciphertexts, so swapping two, repeating one, or pasting one in from
+another file encrypted to the same recipient must all fail.
+
+All three are handled by the **STREAM** construction of Hoang, Reyhanitabar,
+Rogaway and Vizár (CRYPTO 2015). The 12-byte nonce is built per chunk:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 7 | per-file nonce prefix (the header's nonce field) |
+| 7 | 4 | chunk counter, big-endian, from 0 |
+| 11 | 1 | `0x01` on the last chunk, `0x00` on every other |
+
+That last byte is the whole of the truncation defence. Delete the final chunk
+and the new last chunk was sealed as "not final" but must now be opened as
+"final" — a different nonce, so the tag fails. Append one and the old final
+chunk fails the same way in reverse. Swap two and the counters no longer match.
+And the key is derived per file, so a chunk lifted from another container fails
+regardless of what its counter says.
+
+The counter is 32 bits, giving 2³² chunks of 64 KiB — 256 TiB per file. Reaching
+it is refused rather than allowed to wrap, because wrapping means nonce reuse.
+
+Overhead is 16 bytes per chunk on top of the 1168-byte header: 0.024%
+asymptotically, and 0.025% on a 200 MB file — the header is what still
+shows at 5 MB, where it comes to 0.048%.
+
+### What streaming gives up
+
+**Decryption releases plaintext before the whole file is authenticated.** Chunk
+3 is written out before chunk 4 is known to verify. A one-shot container is
+all-or-nothing; a stream cannot be, and no amount of engineering changes that —
+it is what "streaming" means. What the tool can do is make sure the incomplete
+output is never mistaken for the real thing, so `hpqc decrypt` writes to a
+temporary file and renames it over the target only once the last chunk has
+verified. A truncated file leaves no output at all. Decrypting to a pipe is the
+case where the caveat still bites, and the tool says so on stderr.
+
+**Signing and streaming are mutually exclusive.** A signature is a statement
+about a whole message: it cannot be produced until the whole message has been
+read, and it cannot be checked until all of it has arrived. So `--sign` uses
+the one-shot payload. Asking for both explicitly is an error; signing a large
+file falls back to one shot and says so, because silently dropping the
+signature would be worse than using the memory.
+
 ## File format
 
-`.hpqc` containers are `header || AEAD ciphertext || 16-byte tag`. All
-integers are big-endian.
+`.hpqc` containers are a header followed by a payload in one of two shapes.
+All integers are big-endian.
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic, `HPQC` |
 | 4 | 1 | format version, `1` |
 | 5 | 1 | cipher suite id |
-| 6 | 2 | flags; bit 0 = payload is signed, other bits reserved |
+| 6 | 2 | flags; bit 0 = signed, bit 1 = chunked, rest reserved |
 | 8 | 8 | recipient key id (truncated SHA-256) |
 | 16 | 16 | HKDF salt |
-| 32 | 12 | AEAD nonce |
+| 32 | 12 | AEAD nonce (chunked: first 7 bytes are the STREAM prefix) |
 | 44 | 2 | length of the ephemeral X25519 public key (32) |
 | 46 | 32 | ephemeral X25519 public key |
 | 78 | 2 | length of the ML-KEM-768 ciphertext (1088) |
 | 80 | 1088 | ML-KEM-768 ciphertext |
-| 1168 | … | AEAD ciphertext, then a 16-byte tag |
+| 1168 | … | payload |
 
-Fixed overhead is **1184 bytes** per file, whatever its size — 6549 if it is
-signed.
+With bit 1 clear the payload is one AEAD ciphertext followed by its 16-byte
+tag, and fixed overhead is **1184 bytes** per file whatever its size — 6549 if
+it is signed. With bit 1 set the payload is a sequence of chunks, each
+`ChaCha20-Poly1305(64 KiB) || 16-byte tag`, every one of them full except the
+last; overhead is 1168 plus 16 per chunk. Nothing frames the chunks, because a
+length prefix would be attacker-controlled data read before authentication —
+the reader knows the boundaries by counting.
 
-Sender authentication claimed bit 0 of the reserved `flags` field, which is what
-it was there for, so the format version did not have to move. An older build
+Bits 0 and 1 together are refused as malformed rather than parsed: a signature
+covers a whole message, so this build never writes one, and letting a signature
+parser loose on chunk framing is a worse answer than saying no.
+
+Sender authentication claimed bit 0 of the reserved `flags` field, and
+streaming claimed bit 1, which is what they were there for, so the format
+version has never had to move. An older build
 meets a signed file, sees a flag bit it does not implement, and refuses it by
 name rather than decrypting something it only half understands; this build still
 reads every unsigned file written before signing existed. Unknown flag *bits*
@@ -465,7 +568,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-329 passed
+432 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -502,7 +605,21 @@ actually fails. Among them:
   future header field parsed without a bounds check — the kind of bug that
   passes every hand-written test while turning a malformed file into a crash.
 - **Nothing is written on failure** — a rejected file leaves no partial
-  plaintext behind.
+  plaintext behind, including a stream that fails on its last chunk after
+  writing everything before it.
+- **Cut, paste and reorder a chunked file.** Truncating it, extending it,
+  swapping two chunks, repeating one, and splicing in a chunk from a *different
+  file encrypted to the same recipient* — five attacks that need no key and no
+  cryptanalysis, only a text editor. Paired with a test that deliberately
+  disables the final-chunk marker and asserts the truncation then *succeeds*,
+  so the defence is named rather than assumed.
+- **A failed stream never invents bytes.** Fuzzing a chunked container checks
+  that whatever was released before the failure is a genuine prefix of the real
+  plaintext, and never all of it.
+- **Short reads are handled.** A pipe may return fewer bytes than asked for
+  without being at EOF; the tests feed the reader seven bytes at a time, because
+  a `BytesIO` would hide the bug and the symptom is a chunk split down the
+  middle, which looks exactly like corruption.
 - **Frozen known-answer vectors.** `tests/vectors/v1.json` holds containers
   produced by an earlier build together with the identity that opens them.
   Every other test checks that hpqc agrees with *itself*, which cannot catch
@@ -526,6 +643,11 @@ actually fails. Among them:
   also the realistic threat, since the sender chooses the payload.
 - **The signed-message construction is pinned by digest.** Recorded signatures
   cannot do this; see below.
+- **The STREAM nonce construction is pinned by table.** Recorded containers
+  cannot do it either, for the same reason: widen the counter or move the
+  final-chunk byte and the writer and reader move together, so the recorded
+  file stops opening either way and the failure names no cause. The frozen
+  (prefix, index, final) → nonce triples name it exactly.
 - **The signature notice never lands on stdout.** stdout is the plaintext.
 - **A key file cannot make the machine allocate 8 GiB.** Cost parameters are
   refused before scrypt runs, so a corrupt or hostile key file is an error
@@ -539,8 +661,8 @@ actually fails. Among them:
 
 ## What building this turned up
 
-Three bugs the tests and the packaging found. None is visible from reading the
-happy path, which is the point.
+Nine things the tests, the packaging and the CI matrix turned up. None is
+visible from reading the happy path, which is the point.
 
 **A private key file could stay world-readable.** The mode argument to
 `os.open(path, ..., 0o600)` applies only to files it *creates*. So
@@ -595,7 +717,33 @@ AAD to check the tests caught it — and the parameter tests kept passing. They
 always would have: changing `log2(N)` changes the derived key, so the tag fails
 whether or not the field is authenticated. The AAD is only load-bearing for the
 fields that never reach the KDF. The claim and the tests now say which is which.
-Same lesson as the vector above, from the other direction.
+Same lesson as the vector above, from the other direction. Running the same
+check over a chunked container later gave an exact answer: the only bytes whose
+sole protection is the AAD are the five in the nonce field that chunked mode
+does not feed into the nonce. Everything else is bound through HKDF or refused
+by the parser.
+
+**One byte is the whole difference between a stream and a forgery.** The
+final-chunk marker looks like bookkeeping. To check it was load-bearing I made
+every chunk claim to be final and re-ran the truncation test: deleting the last
+chunk of a 3-chunk file then returned 128 KiB of correct plaintext with no
+error whatsoever. Not a crash, not a warning — a shorter file that verifies. A
+test asserting only "the attack fails today" would have passed under both
+versions of the code and told me nothing about which byte was stopping it.
+
+**A test hung forever on a version I never run.** Python 3.9 resolves click to
+8.1, because 8.2 requires 3.10. In click 8.1's test runner, exhausted stdin
+returns an empty string rather than raising, and `click.prompt` treats an empty
+value as "ask again" — so a test that fed a mistyped passphrase confirmation and
+expected the input to run out looped forever, writing prompts, at 100% CPU and
+four gigabytes of resident memory. Locally, with click 8.5, the same test passes
+in under a millisecond. Two fixes: the test now supplies the retry instead of
+relying on what happens when input ends, which is the portable behaviour and the
+part actually worth asserting; and the CI job has a `timeout-minutes` so the
+next one of these fails in ten minutes instead of holding a runner. The same
+pass found that three assertions used `result.stderr`, which on click 8.1 raises
+`ValueError: stderr not separately captured` unless the runner is asked to
+separate the streams — so the 3.9 job could not have been passing.
 
 **The declared Python floor was wrong.** `requires-python = ">=3.9"` looked
 fine and was not: `cryptography>=46` declares `!=3.9.0,!=3.9.1`, so on those
@@ -614,8 +762,13 @@ What it does **not** do, by design in v1:
   signing public key, obtained some other way. There is no web of trust, no
   TOFU store, no directory. A signature checked only against the key inside the
   file proves consistency, not identity, and the tool says so.
-- **No streaming.** The whole plaintext is held in memory. Chunked AEAD with a
-  counter nonce and an explicit final-chunk marker is the next flag bit.
+- **Signed files are not streamed.** A signature covers a whole message, so
+  signing holds the plaintext in memory however large it is. Everything
+  unsigned streams.
+- **A stream releases plaintext before the file is fully authenticated.**
+  Inherent to streaming. Decrypting to a file is safe — the output is renamed
+  into place only on success — but decrypting to a pipe hands partial data
+  downstream before the end is checked.
 - **No memory hygiene.** Passphrases and private keys are ordinary Python
   objects: they are not pinned, not zeroed after use, and may be copied by the
   interpreter or swapped to disk. A passphrase raises the cost of a stolen key
@@ -627,9 +780,10 @@ What it does **not** do, by design in v1:
 ## Roadmap
 
 - [x] ML-DSA-65 signatures for sender authentication
-- [ ] Streaming / chunked AEAD for large files
+- [x] Streaming / chunked AEAD for large files
 - [x] Passphrase-wrapped private keys (scrypt + AEAD)
 - [ ] Multiple recipients per file
+- [ ] Signing a streamed file (a signature trailer over a rolling digest)
 - [ ] ML-KEM-1024 suite
 - [x] Known-answer test vectors checked into the repo
 
@@ -642,6 +796,7 @@ What it does **not** do, by design in v1:
 - [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869) — HKDF
 - [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439) — ChaCha20 and Poly1305
 - [RFC 7914](https://www.rfc-editor.org/rfc/rfc7914) — the scrypt password-based KDF
+- Viet Tung Hoang, Reza Reyhanitabar, Phillip Rogaway, Damian Vizár, *Online Authenticated-Encryption and its Nonce-Reuse Misuse-Resistance* (CRYPTO 2015) — the STREAM construction `hpqc` uses for chunked files
 - [X-Wing](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/) — a hybrid KEM combiner; `hpqc` uses the same `ss_m ‖ ss_x` ordering
 - [draft-ietf-tls-hybrid-design](https://datatracker.ietf.org/doc/draft-ietf-tls-hybrid-design/) — hybrid key exchange in TLS 1.3
 - Don Davis, *Defective Sign & Encrypt in S/MIME, PKCS#7, MOSS, PEM, PGP, and XML* (USENIX Annual Technical Conference, 2001) — where surreptitious forwarding comes from

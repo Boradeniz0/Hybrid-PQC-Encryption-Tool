@@ -17,13 +17,16 @@ plaintext itself, and mixing a status line into it would corrupt the output of
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Iterator, Optional
 
 import click
 
-from . import __version__, armour, backend, container, suites, wrapping
+from . import __version__, armour, backend, container, streaming, suites, wrapping
 from .errors import HpqcError
 from .keys import (
     PRIVATE_PREFIX,
@@ -169,20 +172,100 @@ def _read_input(path: str) -> bytes:
         raise click.ClickException(f"cannot read {path}: {exc.strerror}") from None
 
 
-def _write_output(path: str, data: bytes, *, binary: bool) -> None:
+#: Inputs at or below this go through the one-shot format; larger ones are
+#: chunked. The threshold exists so that ordinary messages keep producing
+#: exactly the containers they always have -- including the ones frozen in
+#: tests/vectors -- while a file nobody can hold in memory still works.
+ONE_SHOT_LIMIT = 1 << 20
+
+
+@contextmanager
+def _input_stream(path: str) -> Iterator[BinaryIO]:
+    """Open an input for reading, or hand back stdin."""
     if path == STDIO:
-        if binary and sys.stdout.isatty():
+        yield sys.stdin.buffer
+        return
+    try:
+        handle = open(path, "rb")
+    except OSError as exc:
+        raise click.ClickException(f"cannot read {path}: {exc.strerror}") from None
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def _default_file_mode() -> int:
+    """The mode a normally-created file would get under the current umask."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+@contextmanager
+def _output_stream(path: str, *, private: bool = False) -> Iterator[BinaryIO]:
+    """Open an output for writing, replacing it atomically on success.
+
+    Streaming makes atomicity matter in a way it did not before. A one-shot
+    decrypt verifies the whole payload before a byte is written, so a failure
+    leaves nothing behind. A chunked decrypt writes chunk 3 before it knows
+    chunk 4 verifies, so a truncated file would otherwise leave a plausible,
+    silently incomplete plaintext sitting under the name the user expects.
+    Writing to a temporary file and renaming only on success means the result
+    either appeared whole or never appeared.
+
+    `private` asks for mode 0600: it is set for decrypted plaintext, which is
+    the secret, and not for ciphertext, which is meant to be handed around.
+    """
+    if path == STDIO:
+        if sys.stdout.isatty():
             raise click.ClickException(
                 "refusing to write binary data to a terminal; "
                 "use -o FILE or pipe the output"
             )
-        sys.stdout.buffer.write(data)
+        yield sys.stdout.buffer
         sys.stdout.buffer.flush()
         return
+
+    target = Path(path)
+    if target.exists() and not target.is_file():
+        # /dev/null, a fifo, a device. There is no temporary file to rename
+        # over one of these, and replacing it with a regular file would be the
+        # wrong answer -- so write straight through. (A symlink to a regular
+        # file does go through the atomic path, and is replaced by one, which
+        # is the usual behaviour of anything that writes-then-renames.)
+        try:
+            handle = open(target, "wb")
+        except OSError as exc:
+            raise click.ClickException(
+                f"cannot write {path}: {exc.strerror}"
+            ) from None
+        try:
+            yield handle
+        finally:
+            handle.close()
+        return
+
+    directory = target.parent if str(target.parent) else Path(".")
     try:
-        Path(path).write_bytes(data)
+        fd, temporary = tempfile.mkstemp(
+            dir=str(directory), prefix=f".{target.name}.", suffix=".tmp"
+        )
     except OSError as exc:
-        raise click.ClickException(f"cannot write {path}: {exc.strerror}") from None
+        raise click.ClickException(
+            f"cannot write {path}: {exc.strerror}"
+        ) from None
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600 if private else _default_file_mode())
+        with os.fdopen(fd, "wb") as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        os.unlink(temporary)
+        raise
+    os.replace(temporary, target)
 
 
 def _fail_if_exists(path: Path, force: bool) -> None:
@@ -340,6 +423,16 @@ def signgen(
     help="Your signing .key file; adds sender authentication.",
 )
 @click.option(
+    "--chunked/--one-shot",
+    "chunked",
+    default=None,
+    help=(
+        "Force the payload shape. The default picks it from the input size: "
+        f"up to {ONE_SHOT_LIMIT // 1024} KiB is sealed in one piece, anything "
+        "larger is streamed in chunks so it never has to fit in memory."
+    ),
+)
+@click.option(
     "--passphrase-file",
     type=click.Path(exists=True, dir_okay=False),
     help=f"For a protected signing key. {PASSPHRASE_FILE_HELP}",
@@ -350,6 +443,7 @@ def encrypt(
     output_path: str,
     aead: str,
     signing_key_path: Optional[str],
+    chunked: Optional[bool],
     passphrase_file: Optional[str],
 ) -> None:
     """Encrypt INPUT (default stdin) to a recipient's public key."""
@@ -358,6 +452,13 @@ def encrypt(
             "--passphrase-file only makes sense with --sign; there is no "
             "private key to open otherwise"
         )
+    if chunked and signing_key_path is not None:
+        raise click.ClickException(
+            "--chunked and --sign cannot be combined: a signature is a "
+            "statement about a whole message, so it cannot be produced until "
+            "the whole message has been read"
+        )
+
     recipient = PublicKey.read(recipient_path)
     sender = (
         _open_private(signing_key_path, passphrase_file, SigningPrivateKey)
@@ -365,9 +466,44 @@ def encrypt(
         else None
     )
     suite = suites.BY_CLI_NAME[aead]
-    plaintext = _read_input(input_path)
-    blob = container.encrypt(plaintext, recipient, suite, sender=sender)
-    _write_output(output_path, blob, binary=True)
+
+    with _input_stream(input_path) as source:
+        # One byte past the limit is enough to tell "this fits" from "this does
+        # not", without reading a gigabyte to find out.
+        head = streaming.read_exactly(source, ONE_SHOT_LIMIT + 1)
+        stream_it = len(head) > ONE_SHOT_LIMIT if chunked is None else chunked
+
+        if stream_it and sender is not None:
+            # Reached only on the automatic path -- the explicit combination is
+            # refused above. Signing wins, because dropping the signature
+            # silently would be worse than using more memory than we would like.
+            stream_it = False
+            click.echo(
+                "note: signing needs the whole file at once; writing a "
+                "one-shot container instead of streaming",
+                err=True,
+            )
+
+        if stream_it:
+            with _output_stream(output_path) as sink:
+                chunks = container.encrypt_stream(
+                    streaming.PrefixedStream(head, source),
+                    sink,
+                    recipient,
+                    suite,
+                )
+            click.echo(
+                f"streamed in {chunks} chunks of "
+                f"{streaming.CHUNK_SIZE // 1024} KiB",
+                err=True,
+            )
+        else:
+            blob = container.encrypt(
+                head + source.read(), recipient, suite, sender=sender
+            )
+            with _output_stream(output_path) as sink:
+                sink.write(blob)
+
     if sender is not None:
         click.echo(
             f"signed by key id {sender.public_key().key_id_hex}", err=True
@@ -408,9 +544,25 @@ def decrypt(
     sender = (
         SigningPublicKey.read(sender_path) if sender_path is not None else None
     )
-    blob = _read_input(input_path)
-    opened = container.open_container(blob, identity, sender)
-    _write_output(output_path, opened.plaintext, binary=True)
+
+    # decrypt_stream handles both payload shapes, because which one a file uses
+    # is its own business: the flag is in the header, and the reader only finds
+    # out after parsing it.
+    with _input_stream(input_path) as source:
+        with _output_stream(output_path, private=True) as sink:
+            opened = container.decrypt_stream(source, sink, identity, sender)
+
+    if opened.chunks is not None:
+        click.echo(f"streamed {opened.chunks} chunks", err=True)
+        if output_path == STDIO:
+            # Writing to a file goes through a temporary and a rename, so a
+            # failure leaves nothing. A pipe cannot be taken back: each chunk
+            # is already gone downstream before the next one is checked.
+            click.echo(
+                "note: chunks are released as they verify, so a truncated "
+                "file will have written partial output before failing",
+                err=True,
+            )
 
     if opened.signer is None:
         return
@@ -526,12 +678,23 @@ def passwd(
 @click.argument("input_path", metavar="[INPUT]", default=STDIO)
 def info(input_path: str) -> None:
     """Describe a .hpqc container or a key file without decrypting it."""
-    data = _read_input(input_path)
+    if input_path == STDIO:
+        data = _read_input(input_path)
+        front, total = data, len(data)
+    else:
+        # Everything reported about a container lives in its header, and a
+        # container can now be larger than memory, so read the front and take
+        # the size from the filesystem rather than pulling it all in to print
+        # nine lines.
+        with _input_stream(input_path) as source:
+            front = streaming.read_exactly(source, container.MAX_HEADER_LEN)
+        total = Path(input_path).stat().st_size
 
-    if data.startswith(container.MAGIC):
-        _describe_container(data)
+    if front.startswith(container.MAGIC):
+        _describe_container(front, total)
         return
 
+    data = front if input_path == STDIO else _read_input(input_path)
     text = _as_text(data)
     if text and wrapping.is_wrapped(text):
         wrapped = wrapping.parse(text)
@@ -578,15 +741,36 @@ def _as_text(data: bytes) -> Optional[str]:
         return None
 
 
-def _describe_container(data: bytes) -> None:
-    header, header_bytes, ciphertext = container.parse_header(data)
+def _describe_container(front: bytes, total: int) -> None:
+    """Report on a container from its header plus the file's total size.
+
+    `front` need only be long enough to hold the header; the payload length is
+    arithmetic, not something that has to be read.
+    """
+    header, header_bytes, _ = container.parse_header(front)
+    payload = total - len(header_bytes)
     click.echo("type:        hpqc container")
     click.echo(f"version:     {header.version}")
     click.echo(f"suite:       {header.suite.name} (0x{header.suite.id:02x})")
     click.echo(f"recipient:   key id {header.key_id_hex}")
     click.echo(f"header:      {len(header_bytes)} bytes (authenticated as AAD)")
     click.echo(f"kem ct:      {len(header.kem_ciphertext)} bytes")
-    click.echo(f"payload:     {len(ciphertext)} bytes (ciphertext + 16-byte tag)")
+    if header.chunked:
+        chunks = streaming.chunk_count(payload)
+        click.echo(f"payload:     {payload} bytes")
+        click.echo(
+            f"chunked:     yes, {chunks} chunk(s) of up to "
+            f"{streaming.CHUNK_SIZE // 1024} KiB "
+            f"(+{streaming.TAG_LEN}-byte tag each)"
+        )
+        # Exact, because every chunk but the last is full: the tags are the
+        # only overhead, and there are exactly as many as there are chunks.
+        click.echo(f"plaintext:   {payload - chunks * streaming.TAG_LEN} bytes")
+    else:
+        click.echo(
+            f"payload:     {payload} bytes (ciphertext + 16-byte tag)"
+        )
+        click.echo("chunked:     no")
     if header.signed:
         # The signature block is inside the AEAD, so info genuinely cannot say
         # who signed -- that is the point of signing before encrypting.

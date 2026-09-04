@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import sys
 from pathlib import Path
@@ -35,8 +36,13 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from helpers import seal  # noqa: E402
 
-from hpqc import hybrid, signing, suites, wrapping  # noqa: E402
-from hpqc.container import FLAG_SIGNED, encrypt  # noqa: E402
+from hpqc import hybrid, signing, streaming, suites, wrapping  # noqa: E402
+from hpqc.container import (  # noqa: E402
+    FLAG_CHUNKED,
+    FLAG_SIGNED,
+    encrypt,
+    encrypt_stream,
+)
 from hpqc.keys import PrivateKey, SigningPrivateKey  # noqa: E402
 
 import unicodedata  # noqa: E402
@@ -266,10 +272,97 @@ def build_v1_wrapped() -> dict:
     }
 
 
+def build_v1_chunked() -> dict:
+    """Chunked containers, and the nonce construction that holds them together.
+
+    Two things are recorded, for the same reason the signed vectors record two:
+
+    * `nonces` -- the STREAM nonce for fixed (prefix, index, final) triples.
+      This is what pins the construction. A recorded *container* cannot: move
+      the counter, widen it, swap the final-chunk byte, and the writer and the
+      reader move together, so the recorded container fails -- but it fails
+      because the key no longer matches, not because the layout changed. The
+      vector would go on "passing" while the property it guarded was gone.
+
+    * `containers` -- recorded chunked containers, checked by the digest of
+      what they decrypt to. These prove the whole path end to end, including
+      that a file written before a change is still readable after it.
+
+    The multi-chunk plaintext is recorded as a length and a SHA-256 rather than
+    inline: it is 64 KiB of filler whose only job is to cross a chunk boundary,
+    and a known-answer test does not need it spelled out.
+    """
+    identity = PrivateKey.generate()
+    public = identity.public_key()
+
+    def sealed(plaintext: bytes, suite) -> bytes:
+        sink = io.BytesIO()
+        encrypt_stream(io.BytesIO(plaintext), sink, public, suite)
+        return sink.getvalue()
+
+    data = {
+        "note": (
+            "Frozen known-answer vectors for hpqc chunked (streamed) "
+            "containers. " + TEST_KEY_WARNING
+        ),
+        "format_version": 1,
+        "flag_chunked": FLAG_CHUNKED,
+        "chunk_size": streaming.CHUNK_SIZE,
+        "tag_len": streaming.TAG_LEN,
+        "wire_chunk_size": streaming.WIRE_CHUNK_SIZE,
+        "nonce_prefix_len": streaming.NONCE_PREFIX_LEN,
+        "max_chunks": streaming.MAX_CHUNKS,
+        "identity": identity.encode(),
+        "public": public.encode(),
+        "key_id": public.key_id_hex,
+        "nonces": [],
+        "containers": [],
+    }
+
+    prefix = _filler(b"hpqc-vector-prefix", streaming.NONCE_PREFIX_LEN)
+    for index in (0, 1, 2, 255, 256, 0x01020304, streaming.MAX_CHUNKS - 1):
+        for final in (False, True):
+            data["nonces"].append({
+                "prefix": prefix.hex(),
+                "index": index,
+                "final": final,
+                "nonce": streaming.chunk_nonce(prefix, index, final).hex(),
+            })
+
+    # Small enough to record inline, and one of each suite.
+    for cli_name, suite in sorted(suites.BY_CLI_NAME.items()):
+        plaintext = b"hpqc chunked test vector v1\n"
+        data["containers"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "chunks": 1,
+            "plaintext": plaintext.hex(),
+            "plaintext_len": len(plaintext),
+            "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
+            "container": sealed(plaintext, suite).hex(),
+        })
+
+    # One byte past a chunk boundary: the smallest input that needs a
+    # non-final chunk, and therefore the smallest one that exercises the
+    # final-chunk marker at all.
+    big = _filler(b"hpqc-vector-chunked", streaming.CHUNK_SIZE + 1)
+    data["containers"].append({
+        "suite": "chacha20",
+        "suite_id": suites.DEFAULT_SUITE.id,
+        "chunks": 2,
+        "plaintext_len": len(big),
+        "plaintext_sha256": hashlib.sha256(big).hexdigest(),
+        "container": sealed(big, suites.DEFAULT_SUITE).hex(),
+    })
+
+    return data
+
+
 BUILDERS = {
     "v1.json": build_v1,
     "v1-signed.json": build_v1_signed,
     "v1-wrapped.json": build_v1_wrapped,
+    "v1-chunked.json": build_v1_chunked,
 }
 
 

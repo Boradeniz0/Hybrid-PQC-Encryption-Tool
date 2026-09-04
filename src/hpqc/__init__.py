@@ -12,8 +12,13 @@ signed a file is itself confidential.
 
 Private keys can be kept under a passphrase -- scrypt to a key, ChaCha20-Poly1305
 around the secret -- rather than relying on file permissions alone.
+
+Files past a megabyte are sealed as a chunked stream (the STREAM construction:
+a counter nonce per chunk and an explicit final-chunk marker), so the memory
+cost is one chunk rather than the whole file. Signed files are the exception,
+because a signature covers a whole message and so needs one.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = ["__version__"]

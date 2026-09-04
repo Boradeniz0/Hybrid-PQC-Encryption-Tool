@@ -13,6 +13,8 @@ has to reproduce yesterday's answers. tests/vectors/v1-signed.json does the same
 for sender authentication, and records two extra things: the digest of the exact
 byte string the signatures cover, which pins the construction, and one container
 that must never verify -- a signature made for a different recipient, re-sealed.
+tests/vectors/v1-chunked.json covers the streamed payload shape, and records the
+STREAM nonce table for the same reason the signed file records digests.
 
 The digests matter because a recorded *signature* cannot pin a construction. Drop
 the recipient from the signed message and the recorded signature stops verifying
@@ -30,17 +32,20 @@ hybrid.HKDF_LABEL.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import unicodedata
 from pathlib import Path
 
 import pytest
 
-from hpqc import hybrid, signing, suites, wrapping
+from hpqc import hybrid, signing, streaming, suites, wrapping
 from hpqc.container import (
+    FLAG_CHUNKED,
     FLAG_SIGNED,
     FORMAT_VERSION,
     decrypt,
+    decrypt_stream,
     open_container,
     parse_header,
 )
@@ -56,6 +61,7 @@ def _load(name: str) -> dict:
 VECTORS = _load("v1.json")
 SIGNED = _load("v1-signed.json")
 WRAPPED = _load("v1-wrapped.json")
+CHUNKED = _load("v1-chunked.json")
 
 
 @pytest.fixture(scope="module")
@@ -357,3 +363,127 @@ class TestWrappedKeys:
 
     def test_the_secret_is_not_sitting_in_the_file(self, vector) -> None:
         assert bytes.fromhex(vector["blob"]) not in vector["wrapped"].encode("ascii")
+
+
+# --------------------------------------------------------------------------
+# Chunked containers
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def chunked_identity() -> PrivateKey:
+    return PrivateKey.decode(CHUNKED["identity"])
+
+
+def test_the_chunked_vectors_target_this_format() -> None:
+    assert CHUNKED["format_version"] == FORMAT_VERSION
+    assert CHUNKED["flag_chunked"] == FLAG_CHUNKED
+
+
+def test_the_chunking_constants_have_not_changed() -> None:
+    """Every one of these is on the wire, implicitly.
+
+    Nothing in a container states its chunk size: the reader assumes it, and
+    finds the boundaries by counting. Change the constant and every file
+    written before the change becomes unreadable, without a single test
+    failing anywhere else.
+    """
+    assert CHUNKED["chunk_size"] == streaming.CHUNK_SIZE
+    assert CHUNKED["tag_len"] == streaming.TAG_LEN
+    assert CHUNKED["wire_chunk_size"] == streaming.WIRE_CHUNK_SIZE
+    assert CHUNKED["nonce_prefix_len"] == streaming.NONCE_PREFIX_LEN
+    assert CHUNKED["max_chunks"] == streaming.MAX_CHUNKS
+
+
+@pytest.mark.parametrize(
+    "vector",
+    CHUNKED["nonces"],
+    ids=[f"{v['index']}{'-final' if v['final'] else ''}" for v in CHUNKED["nonces"]],
+)
+def test_the_stream_nonce_construction_is_unchanged(vector) -> None:
+    """The vector that actually pins the layout.
+
+    A recorded container cannot do this job. Widen the counter, move the final
+    -chunk byte to the front, swap 0x00 and 0x01 -- the writer and the reader
+    change together, so the recorded container stops opening either way, and
+    the failure says nothing about which change caused it. These triples name
+    it exactly: the byte string, for a fixed prefix, index and final flag.
+    """
+    nonce = streaming.chunk_nonce(
+        bytes.fromhex(vector["prefix"]), vector["index"], vector["final"]
+    )
+    assert nonce.hex() == vector["nonce"]
+
+
+def _open_chunked(blob: bytes, identity: PrivateKey):
+    sink = io.BytesIO()
+    opened = decrypt_stream(io.BytesIO(blob), sink, identity)
+    return sink.getvalue(), opened
+
+
+@pytest.mark.parametrize(
+    "vector",
+    CHUNKED["containers"],
+    ids=[f"{v['suite']}-{v['chunks']}chunk" for v in CHUNKED["containers"]],
+)
+class TestChunkedContainers:
+    def test_it_decrypts_to_the_recorded_digest(
+        self, vector, chunked_identity
+    ) -> None:
+        plaintext, opened = _open_chunked(
+            bytes.fromhex(vector["container"]), chunked_identity
+        )
+        assert len(plaintext) == vector["plaintext_len"]
+        assert hashlib.sha256(plaintext).hexdigest() == vector["plaintext_sha256"]
+        assert opened.chunks == vector["chunks"]
+        if "plaintext" in vector:
+            assert plaintext == bytes.fromhex(vector["plaintext"])
+
+    def test_its_header_still_parses_as_recorded(self, vector) -> None:
+        header, header_bytes, payload = parse_header(
+            bytes.fromhex(vector["container"])
+        )
+        assert header.version == FORMAT_VERSION
+        assert header.chunked and not header.signed
+        assert header.suite.id == vector["suite_id"]
+        assert header.key_id.hex() == CHUNKED["key_id"]
+        assert len(header_bytes) == 1168
+        # Tags are the only per-chunk overhead; nothing else is framed.
+        assert len(payload) == vector["plaintext_len"] + vector["chunks"] * 16
+
+    def test_truncating_a_recorded_container_is_still_refused(
+        self, vector, chunked_identity
+    ) -> None:
+        """The frozen half of the truncation defence.
+
+        The live tests build a container and cut it; this one cuts a container
+        built by an earlier version of the code, so a change that made the
+        final-chunk marker stop mattering fails here too.
+        """
+        blob = bytes.fromhex(vector["container"])
+        with pytest.raises(HpqcError):
+            _open_chunked(blob[: -streaming.TAG_LEN - 1], chunked_identity)
+
+    def test_a_recorded_container_is_still_rejected_when_corrupted(
+        self, vector, chunked_identity
+    ) -> None:
+        corrupted = bytearray(bytes.fromhex(vector["container"]))
+        corrupted[-1] ^= 0x01
+        with pytest.raises(HpqcError):
+            _open_chunked(bytes(corrupted), chunked_identity)
+
+
+def test_a_recorded_multi_chunk_container_loses_its_last_chunk_and_fails(
+    chunked_identity,
+) -> None:
+    """Cut on a chunk boundary, so every remaining chunk is untouched.
+
+    Corrupting bytes proves the AEAD works. Removing a whole valid chunk is the
+    attack the marker exists for, and this runs it against a frozen file.
+    """
+    vector = next(v for v in CHUNKED["containers"] if v["chunks"] > 1)
+    blob = bytes.fromhex(vector["container"])
+    cut = blob[: -streaming.WIRE_CHUNK_SIZE]
+
+    with pytest.raises(HpqcError):
+        _open_chunked(cut, chunked_identity)

@@ -219,13 +219,13 @@ def test_an_unknown_suite_is_refused(alice, alice_pub) -> None:
         decrypt(bytes(blob), alice)
 
 
-@pytest.mark.parametrize("value", [0x02, 0x04, 0x80, 0xFF])
+@pytest.mark.parametrize("value", [0x04, 0x08, 0x80, 0xFC])
 def test_unknown_flag_bits_are_refused(value, alice, alice_pub) -> None:
     """Reserved bits are a forward-compatibility hook, not something to ignore.
 
-    Bit 0 is taken (FLAG_SIGNED); every other bit still has to be refused by
-    name, so a file written by a newer build fails loudly here instead of being
-    half understood.
+    Bits 0 and 1 are taken (FLAG_SIGNED, FLAG_CHUNKED); every other bit still
+    has to be refused by name, so a file written by a newer build fails loudly
+    here instead of being half understood.
     """
     blob = bytearray(encrypt(b"secret", alice_pub))
     blob[OFF_FLAGS + 1] = value
@@ -254,6 +254,20 @@ def test_claiming_the_signed_flag_on_an_unsigned_file_fails(alice, alice_pub) ->
     blob[OFF_FLAGS + 1] = container.FLAG_SIGNED
 
     with pytest.raises(DecryptionError, match="authentication failed"):
+        decrypt(bytes(blob), alice)
+
+
+def test_claiming_both_signed_and_chunked_is_refused(alice, alice_pub) -> None:
+    """The one flag combination this build never writes.
+
+    Both bits are individually known, so the allow-list lets the pair through;
+    it takes a rule of its own to stop a header that would send a signature
+    parser walking into chunk framing.
+    """
+    blob = bytearray(encrypt(b"secret", alice_pub))
+    blob[OFF_FLAGS + 1] = container.FLAG_SIGNED | container.FLAG_CHUNKED
+
+    with pytest.raises(FormatError, match="both signed and chunked"):
         decrypt(bytes(blob), alice)
 
 

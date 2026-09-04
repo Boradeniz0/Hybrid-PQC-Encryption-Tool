@@ -6,10 +6,11 @@ Byte layout (all integers big-endian):
     0       4      magic, b"HPQC"
     4       1      format version, 1
     5       1      cipher suite id  -> suites.by_id()
-    6       2      flags; bit 0 = the payload is signed, other bits reserved
+    6       2      flags; bit 0 = signed, bit 1 = chunked, rest reserved
     8       8      recipient key id (truncated SHA-256, a UX hint only)
     16      16     HKDF salt
-    32      12     AEAD nonce  (suite.nonce_len)
+    32      12     AEAD nonce  (suite.nonce_len); in chunked mode the
+                       first 7 bytes are the STREAM nonce prefix
     44      2      length of the ephemeral X25519 public key (32)
     46      32     ephemeral X25519 public key
     78      2      length of the ML-KEM-768 ciphertext (1088)
@@ -33,9 +34,18 @@ Two properties matter more than the exact offsets:
   half understands -- while this build still reads every unsigned file written
   before signing existed. The format version did not have to move.
 
-Encryption is one-shot, so the whole plaintext is held in memory. Streaming
-(chunked AEAD with a per-chunk counter nonce and an explicit final-chunk
-marker) is the next flag bit.
+* **The payload comes in two shapes.** With bit 1 clear it is a single AEAD
+  ciphertext, and both plaintext and ciphertext are held in memory at once.
+  With bit 1 set it is a sequence of fixed-size chunks, each sealed under its
+  own nonce, and neither side has to hold more than one chunk. See streaming.py
+  for why the chunked shape needs an explicit final-chunk marker.
+
+The two shapes are mutually exclusive with signing, and that is a property of
+signatures rather than an implementation shortcut: a signature is a statement
+about a whole message, so it cannot be produced until the whole message has
+been read, and it cannot be checked until the whole message has been received.
+Signing therefore uses the one-shot payload, and a container claiming to be
+both signed and chunked is refused as malformed.
 """
 
 from __future__ import annotations
@@ -43,11 +53,11 @@ from __future__ import annotations
 import os
 import struct
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import BinaryIO, Optional, Tuple
 
 from cryptography.exceptions import InvalidTag
 
-from . import hybrid, signing, suites
+from . import hybrid, signing, streaming, suites
 from .errors import DecryptionError, FormatError, SignatureError, WrongRecipientError
 from .hybrid import MLKEM768_CIPHERTEXT_LEN, SALT_LEN
 from .keys import (
@@ -66,7 +76,13 @@ FORMAT_VERSION = 1
 
 FLAGS_NONE = 0
 FLAG_SIGNED = 0x0001  # the AEAD payload starts with a signature block
-_KNOWN_FLAGS = FLAG_SIGNED
+FLAG_CHUNKED = 0x0002  # the payload is a STREAM of fixed-size sealed chunks
+_KNOWN_FLAGS = FLAG_SIGNED | FLAG_CHUNKED
+
+#: The most a v1 header can occupy (it is in fact always 1168 bytes). Streaming
+#: reads this much off the front of a container to get at the header without
+#: needing a seekable input; whatever came along for the ride is payload.
+MAX_HEADER_LEN = 4096
 
 _PREAMBLE = struct.Struct(">4sBBH8s16s")  # magic, version, suite, flags, key id, salt
 
@@ -117,6 +133,21 @@ class Header:
         """
         return bool(self.flags & FLAG_SIGNED)
 
+    @property
+    def chunked(self) -> bool:
+        """True if the payload is a STREAM of sealed chunks, not one ciphertext."""
+        return bool(self.flags & FLAG_CHUNKED)
+
+    @property
+    def nonce_prefix(self) -> bytes:
+        """The STREAM per-file nonce prefix: the first 7 bytes of the nonce.
+
+        The other five are not fed to the nonce, but they are still random and
+        still covered by the associated data, so nothing about the header can
+        be edited without breaking every chunk.
+        """
+        return self.nonce[: streaming.NONCE_PREFIX_LEN]
+
 
 def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
     """Split a container into (header, header_bytes, aead_ciphertext).
@@ -149,6 +180,15 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
         raise FormatError(
             f"unknown header flags 0x{unknown:04x}; the file uses a feature "
             f"this build does not implement (known flags: 0x{_KNOWN_FLAGS:04x})"
+        )
+
+    if flags & FLAG_SIGNED and flags & FLAG_CHUNKED:
+        # Never written, so this can only be a doctored header. Refuse it here
+        # rather than let a signature parser loose on chunk framing: the
+        # signature block would be read out of what is really a sealed chunk.
+        raise FormatError(
+            "header claims the payload is both signed and chunked; a signature "
+            "covers a whole message, so signed containers are never chunked"
         )
 
     nonce = reader.take(suite.nonce_len, "AEAD nonce")
@@ -185,14 +225,27 @@ def encrypt(
     confidential and the signature covers what was actually written rather
     than the ciphertext. See signing.py for why that ordering matters.
     """
-    ephemeral_public, kem_ciphertext, ikm = hybrid.encapsulate(recipient)
-
     payload = plaintext
     flags = FLAGS_NONE
     if sender is not None:
         payload = signing.sign_payload(plaintext, sender, recipient, suite)
         flags = FLAG_SIGNED
 
+    header, header_bytes, key = _seal_setup(recipient, suite, flags)
+    ciphertext = suite.aead(key).encrypt(header.nonce, payload, header_bytes)
+    return header_bytes + ciphertext
+
+
+def _seal_setup(
+    recipient: PublicKey, suite: Suite, flags: int
+) -> Tuple[Header, bytes, bytes]:
+    """Run the KEM and build the header for a new container.
+
+    Shared by the one-shot and chunked writers so that neither can drift from
+    the other on the part that matters: which values go into the header, and
+    which of them are bound into the key derivation.
+    """
+    ephemeral_public, kem_ciphertext, ikm = hybrid.encapsulate(recipient)
     header = Header(
         suite=suite,
         flags=flags,
@@ -202,12 +255,13 @@ def encrypt(
         # ML-KEM encapsulation, fresh salt), so this nonce is never reused
         # under it. A random nonce is belt-and-braces; the freshness of the
         # key is what actually rules out the catastrophic nonce-reuse case.
+        # In chunked mode only the first 7 bytes reach the nonce -- the chunk
+        # counter supplies the rest -- and the same argument still applies.
         nonce=os.urandom(suite.nonce_len),
         ephemeral_public=ephemeral_public,
         kem_ciphertext=kem_ciphertext,
     )
     header_bytes = header.pack()
-
     key = hybrid.derive_key(
         ikm=ikm,
         salt=header.salt,
@@ -216,8 +270,27 @@ def encrypt(
         kem_ciphertext=kem_ciphertext,
         recipient=recipient,
     )
-    ciphertext = suite.aead(key).encrypt(header.nonce, payload, header_bytes)
-    return header_bytes + ciphertext
+    return header, header_bytes, key
+
+
+def encrypt_stream(
+    source: BinaryIO,
+    sink: BinaryIO,
+    recipient: PublicKey,
+    suite: Suite = DEFAULT_SUITE,
+) -> int:
+    """Chunk-encrypt `source` into `sink`. Returns the number of chunks.
+
+    Neither the plaintext nor the ciphertext is ever fully resident, so this is
+    the path for files that do not fit in memory. There is no `sender`
+    parameter: a signature covers a whole message and this writer never has one
+    in hand. See streaming.py.
+    """
+    header, header_bytes, key = _seal_setup(recipient, suite, FLAG_CHUNKED)
+    sink.write(header_bytes)
+    return streaming.seal(
+        source, sink, key, suite, header.nonce_prefix, header_bytes
+    )
 
 
 @dataclass(frozen=True)
@@ -230,26 +303,28 @@ class Opened:
     proves the file is internally consistent, not who wrote it. Only a caller
     who pinned the sender's public key gets `verified=True`, and only that
     caller has learned an identity.
+
+    `chunks` is None when the one-shot path ran and `plaintext` holds the whole
+    message. It is a count when `decrypt_stream` streamed the file, and then
+    `plaintext` is empty -- the point of streaming is that the plaintext never
+    exists as one object.
     """
 
     plaintext: bytes
     signer: Optional[SigningPublicKey] = None
     verified: bool = False
+    chunks: Optional[int] = None
 
 
-def open_container(
-    container: bytes,
-    identity: PrivateKey,
-    sender: Optional[SigningPublicKey] = None,
-) -> Opened:
-    """Decrypt a container and, if it is signed, check the signatures.
+def _open_setup(
+    header: Header, identity: PrivateKey
+) -> Tuple[PublicKey, bytes]:
+    """Check the key id and re-derive the AEAD key from a parsed header.
 
-    Passing `sender` demands authentication: an unsigned file, a file signed by
-    a different key, or a signature that does not verify all raise
-    SignatureError rather than returning plaintext.
+    The mirror of _seal_setup, and shared for the same reason: the reader and
+    the writer have to agree byte for byte on what the key is derived from, and
+    two copies of that would only agree until one of them was edited.
     """
-    header, header_bytes, ciphertext = parse_header(container)
-
     recipient = identity.public_key()
     if header.key_id != recipient.key_id:
         raise WrongRecipientError(
@@ -268,6 +343,28 @@ def open_container(
         kem_ciphertext=header.kem_ciphertext,
         recipient=recipient,
     )
+    return recipient, key
+
+
+def open_container(
+    container: bytes,
+    identity: PrivateKey,
+    sender: Optional[SigningPublicKey] = None,
+) -> Opened:
+    """Decrypt a container and, if it is signed, check the signatures.
+
+    Passing `sender` demands authentication: an unsigned file, a file signed by
+    a different key, or a signature that does not verify all raise
+    SignatureError rather than returning plaintext.
+    """
+    header, header_bytes, ciphertext = parse_header(container)
+    if header.chunked:
+        raise FormatError(
+            "this container is chunked; open it with decrypt_stream, which "
+            "does not need the whole file in memory"
+        )
+
+    recipient, key = _open_setup(header, identity)
 
     try:
         payload = header.suite.aead(key).decrypt(
@@ -309,3 +406,51 @@ def decrypt(
     discards the answer about who produced it.
     """
     return open_container(container, identity, sender).plaintext
+
+
+def decrypt_stream(
+    source: BinaryIO,
+    sink: BinaryIO,
+    identity: PrivateKey,
+    sender: Optional[SigningPublicKey] = None,
+) -> Opened:
+    """Decrypt a container from a stream, writing the plaintext to `sink`.
+
+    Handles both payload shapes, because the reader does not get to choose:
+    which one a file uses is a flag in its header, and the caller learns it
+    only after parsing. A chunked container streams and comes back with
+    `Opened.chunks` set and `Opened.plaintext` empty. A one-shot container
+    cannot stream -- its AEAD tag covers the whole payload, so nothing can be
+    released before all of it is in hand -- and is read whole and returned in
+    full, exactly as `open_container` would.
+
+    The header is taken from a bounded read off the front, so this works on a
+    pipe: no seeking, and a hostile file cannot make the reader buffer more
+    than MAX_HEADER_LEN bytes before the format is known.
+    """
+    front = streaming.read_exactly(source, MAX_HEADER_LEN)
+    header, header_bytes, leftover = parse_header(front)
+
+    if not header.chunked:
+        opened = open_container(front + source.read(), identity, sender)
+        sink.write(opened.plaintext)
+        return opened
+
+    if sender is not None:
+        # Same fail-closed rule as the one-shot path: a chunked file is never
+        # signed, so an authentication request it cannot satisfy is an error
+        # rather than a plaintext with a caveat.
+        raise SignatureError(
+            "sender verification was requested, but this file is not signed"
+        )
+
+    _, key = _open_setup(header, identity)
+    chunks = streaming.open_stream(
+        streaming.PrefixedStream(leftover, source),
+        sink,
+        key,
+        header.suite,
+        header.nonce_prefix,
+        header_bytes,
+    )
+    return Opened(plaintext=b"", chunks=chunks)
