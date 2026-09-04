@@ -9,8 +9,11 @@ quantum attacker who breaks X25519.
 Sender authentication is optional and hybrid in the same way: Ed25519 with
 ML-DSA-65 (FIPS 204), both required, signed before encryption so that who
 signed a file is itself confidential.
+
+Private keys can be kept under a passphrase -- scrypt to a key, ChaCha20-Poly1305
+around the secret -- rather than relying on file permissions alone.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = ["__version__"]

@@ -15,6 +15,12 @@ Private key files are created with mode 0600 and hold the ML-KEM *seed*
 (64 bytes, FIPS 203 d||z) rather than the 2400-byte expanded key -- the
 expanded form is derived deterministically on load.
 
+Either private key can be written passphrase-protected instead of in the clear:
+pass `passphrase=` to `encode`/`write` and the secret is sealed by wrapping.py.
+Reading is symmetric, and mismatches fail loudly rather than silently -- a
+passphrase supplied for an unprotected key is an error, not a no-op, because the
+alternative is a file the user believes is protected and is not.
+
 Signing identities (SigningPrivateKey / SigningPublicKey) are a separate pair
 of types with their own armour prefixes. They are deliberately *not* folded
 into the encryption identity: a key should do one job, and signing is opt-in,
@@ -26,9 +32,9 @@ a hybrid signature.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
@@ -43,8 +49,9 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PublicKey,
 )
 
-from . import backend
-from .errors import FormatError
+from . import backend, wrapping
+from .armour import armour, dearmour
+from .errors import FormatError, PassphraseError
 
 # Wire sizes, all fixed by the algorithms themselves.
 X25519_KEY_LEN = 32
@@ -74,54 +81,67 @@ _SIGN_KEY_ID_DOMAIN = b"hpqc-sign-key-id-v1"
 PathLike = Union[str, "os.PathLike[str]"]
 
 
-def _b64encode(raw: bytes) -> str:
-    return base64.b64encode(raw).decode("ascii")
+def _decode_secret(cls, text: str, passphrase, *, kind: int, prefix: str, noun: str):
+    """Decode a private key file, wrapped or not.
 
-
-def _b64decode(text: str) -> bytes:
-    try:
-        # validate=True so stray characters are an error, not silently dropped.
-        return base64.b64decode(text, validate=True)
-    except ValueError as exc:  # binascii.Error subclasses ValueError
-        raise FormatError(f"key body is not valid base64: {exc}") from None
-
-
-def _armour(prefix: str, blob: bytes, comments: "list[str]") -> str:
-    lines = [f"# {c}" for c in comments]
-    lines.append(prefix + _b64encode(blob))
-    return "\n".join(lines) + "\n"
-
-
-def _dearmour(text: str, prefix: str, kind: str) -> bytes:
-    """Pull the single payload line out of an armoured key file."""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if not line.startswith(prefix):
-            raise FormatError(
-                f"expected an hpqc {kind} key starting with {prefix!r}, "
-                f"got {line[:16]!r}..."
+    Both mismatches are errors on purpose. A wrapped key with no passphrase
+    cannot be opened, and a passphrase handed to an unwrapped key means the
+    caller believes the file is protected when it is not -- worth saying rather
+    than ignoring.
+    """
+    if wrapping.is_wrapped(text):
+        if passphrase is None:
+            raise PassphraseError(
+                f"this {noun} key is passphrase-protected; "
+                "supply the passphrase to open it"
             )
-        return _b64decode(line[len(prefix) :])
-    raise FormatError(f"no hpqc {kind} key found (file has no payload line)")
+        blob, _ = wrapping.unwrap(text, passphrase, expected_kind=kind)
+        return cls.from_bytes(blob)
+
+    if passphrase is not None:
+        raise PassphraseError(
+            f"a passphrase was supplied, but this {noun} key file is not "
+            "passphrase-protected"
+        )
+    return cls.from_bytes(dearmour(text, prefix, noun))
 
 
 def _write_private_file(path: PathLike, text: str) -> None:
-    """Write a secret file at mode 0600, tightening it if it already existed.
+    """Write a secret file at mode 0600, atomically.
 
-    The mode argument to os.open only applies to files it *creates*, so
-    overwriting an existing key would otherwise inherit whatever permissions
-    were already there -- world-readable included. That was a real bug here;
-    it lives in one function so it cannot come back in a copy of it.
+    Two hazards, both of which have bitten this file before or would have:
+
+    * **Permissions.** The mode argument to os.open applies only to files it
+      *creates*, so writing over an existing key would inherit whatever
+      permissions were already there -- world-readable included. Creating a
+      fresh file and renaming it over the target sidesteps that entirely: the
+      mode belongs to the new inode. fchmod stays as belt and braces, since
+      umask can only clear bits from 0600, never add them.
+
+    * **Losing the key.** `hpqc passwd` rewrites a private key in place. A
+      truncating write that fails halfway leaves no key at all and no way back.
+      So the new contents are written to a temporary file in the same directory,
+      flushed to disk, and then renamed over the target -- os.replace is atomic,
+      so a reader sees either the old key or the new one.
+
+    It lives in one function so neither fix can come back undone in a copy of it.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
     try:
         if hasattr(os, "fchmod"):  # POSIX; Windows has no mode to fix.
             os.fchmod(fd, 0o600)
         os.write(fd, text.encode("ascii"))
-    finally:
+        os.fsync(fd)
+    except BaseException:
         os.close(fd)
+        os.unlink(tmp_name)
+        raise
+    else:
+        os.close(fd)
+    os.replace(tmp_name, path)
 
 
 def _key_id(x25519_public: bytes, mlkem_public: bytes) -> bytes:
@@ -177,7 +197,7 @@ class PublicKey:
         )
 
     def encode(self) -> str:
-        return _armour(
+        return armour(
             PUBLIC_PREFIX,
             self.to_bytes(),
             [
@@ -189,7 +209,7 @@ class PublicKey:
 
     @classmethod
     def decode(cls, text: str) -> "PublicKey":
-        return cls.from_bytes(_dearmour(text, PUBLIC_PREFIX, "public"))
+        return cls.from_bytes(dearmour(text, PUBLIC_PREFIX, "public"))
 
     def write(self, path: PathLike) -> None:
         Path(path).write_text(self.encode(), encoding="ascii")
@@ -262,8 +282,16 @@ class PrivateKey:
             mlkem_seed=blob[1 + X25519_KEY_LEN :],
         )
 
-    def encode(self) -> str:
-        return _armour(
+    def encode(self, passphrase=None, params=None) -> str:
+        """Armour the key, passphrase-protected if a passphrase is given."""
+        if passphrase is not None:
+            return wrapping.wrap(
+                self.to_bytes(),
+                wrapping.KIND_IDENTITY,
+                passphrase,
+                params or wrapping.Params(),
+            )
+        return armour(
             PRIVATE_PREFIX,
             self.to_bytes(),
             [
@@ -274,16 +302,23 @@ class PrivateKey:
         )
 
     @classmethod
-    def decode(cls, text: str) -> "PrivateKey":
-        return cls.from_bytes(_dearmour(text, PRIVATE_PREFIX, "private"))
+    def decode(cls, text: str, passphrase=None) -> "PrivateKey":
+        return _decode_secret(
+            cls,
+            text,
+            passphrase,
+            kind=wrapping.KIND_IDENTITY,
+            prefix=PRIVATE_PREFIX,
+            noun="private",
+        )
 
-    def write(self, path: PathLike) -> None:
+    def write(self, path: PathLike, passphrase=None, params=None) -> None:
         """Write the key at mode 0600. See _write_private_file."""
-        _write_private_file(path, self.encode())
+        _write_private_file(path, self.encode(passphrase, params))
 
     @classmethod
-    def read(cls, path: PathLike) -> "PrivateKey":
-        return cls.decode(Path(path).read_text(encoding="ascii"))
+    def read(cls, path: PathLike, passphrase=None) -> "PrivateKey":
+        return cls.decode(Path(path).read_text(encoding="ascii"), passphrase)
 
 
 def _sign_key_id(ed25519_public: bytes, mldsa_public: bytes) -> bytes:
@@ -348,7 +383,7 @@ class SigningPublicKey:
         )
 
     def encode(self) -> str:
-        return _armour(
+        return armour(
             SIGN_PUBLIC_PREFIX,
             self.to_bytes(),
             [
@@ -360,7 +395,7 @@ class SigningPublicKey:
 
     @classmethod
     def decode(cls, text: str) -> "SigningPublicKey":
-        return cls.from_bytes(_dearmour(text, SIGN_PUBLIC_PREFIX, "signing public"))
+        return cls.from_bytes(dearmour(text, SIGN_PUBLIC_PREFIX, "signing public"))
 
     def write(self, path: PathLike) -> None:
         Path(path).write_text(self.encode(), encoding="ascii")
@@ -440,8 +475,16 @@ class SigningPrivateKey:
             mldsa_seed=blob[1 + ED25519_KEY_LEN :],
         )
 
-    def encode(self) -> str:
-        return _armour(
+    def encode(self, passphrase=None, params=None) -> str:
+        """Armour the key, passphrase-protected if a passphrase is given."""
+        if passphrase is not None:
+            return wrapping.wrap(
+                self.to_bytes(),
+                wrapping.KIND_SIGNING_IDENTITY,
+                passphrase,
+                params or wrapping.Params(),
+            )
+        return armour(
             SIGN_PRIVATE_PREFIX,
             self.to_bytes(),
             [
@@ -452,13 +495,20 @@ class SigningPrivateKey:
         )
 
     @classmethod
-    def decode(cls, text: str) -> "SigningPrivateKey":
-        return cls.from_bytes(_dearmour(text, SIGN_PRIVATE_PREFIX, "signing private"))
+    def decode(cls, text: str, passphrase=None) -> "SigningPrivateKey":
+        return _decode_secret(
+            cls,
+            text,
+            passphrase,
+            kind=wrapping.KIND_SIGNING_IDENTITY,
+            prefix=SIGN_PRIVATE_PREFIX,
+            noun="signing private",
+        )
 
-    def write(self, path: PathLike) -> None:
+    def write(self, path: PathLike, passphrase=None, params=None) -> None:
         """Write the key at mode 0600. See _write_private_file."""
-        _write_private_file(path, self.encode())
+        _write_private_file(path, self.encode(passphrase, params))
 
     @classmethod
-    def read(cls, path: PathLike) -> "SigningPrivateKey":
-        return cls.decode(Path(path).read_text(encoding="ascii"))
+    def read(cls, path: PathLike, passphrase=None) -> "SigningPrivateKey":
+        return cls.decode(Path(path).read_text(encoding="ascii"), passphrase)

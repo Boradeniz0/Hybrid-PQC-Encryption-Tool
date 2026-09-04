@@ -23,7 +23,7 @@ from typing import Optional
 
 import click
 
-from . import __version__, backend, container, suites
+from . import __version__, armour, backend, container, suites, wrapping
 from .errors import HpqcError
 from .keys import (
     PRIVATE_PREFIX,
@@ -37,6 +37,127 @@ from .keys import (
 )
 
 STDIO = "-"
+
+# Note the absence of a --passphrase VALUE option anywhere below. Command lines
+# are visible to every user on the machine through ps, so a passphrase passed
+# that way is not a secret. Prompting or a file are the two ways in.
+PASSPHRASE_FILE_HELP = (
+    "Read the passphrase from FILE instead of prompting. "
+    "(There is deliberately no --passphrase VALUE: command lines are "
+    "visible to other users via ps.)"
+)
+
+
+def _read_passphrase_file(path: str) -> str:
+    """Read a passphrase from a file, stripping one trailing newline.
+
+    Exactly one, and no other whitespace: a passphrase may legitimately contain
+    spaces, including at its ends, and quietly trimming them would make the same
+    passphrase from a file and from a prompt disagree.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"cannot read {path}: {exc.strerror}") from None
+    if raw.endswith("\r\n"):
+        raw = raw[:-2]
+    elif raw.endswith("\n"):
+        raw = raw[:-1]
+    if not raw:
+        raise click.ClickException(
+            f"{path} is empty; refusing to use an empty passphrase"
+        )
+    return raw
+
+
+def _have_terminal() -> bool:
+    """Whether there is a terminal to ask a passphrase on."""
+    return sys.stdin.isatty()
+
+
+def _prompt_passphrase(prompt: str, *, confirm: bool) -> str:
+    """Ask for a passphrase on the terminal.
+
+    The prompt goes to stderr because stdout may be the plaintext. Without a
+    terminal there is nothing to prompt on, and reading it from stdin would
+    swallow the data being encrypted, so that case is refused with a pointer to
+    --passphrase-file rather than left to misbehave.
+    """
+    if not _have_terminal():
+        raise click.ClickException(
+            "a passphrase is needed but there is no terminal to ask on; "
+            "use --passphrase-file"
+        )
+    return click.prompt(
+        prompt, hide_input=True, confirmation_prompt=confirm, err=True
+    )
+
+
+def _scrypt_option(f):
+    """--scrypt-log-n, shared by every command that writes a protected key.
+
+    Exposed rather than hardcoded for two reasons: the parameters travel inside
+    the key file, so a lower or higher setting stays readable everywhere, and
+    128 MiB is a lot to ask of a small machine. Only N is adjustable; r and p
+    stay at 8 and 1, because N is the dial that buys resistance.
+    """
+    return click.option(
+        "--scrypt-log-n",
+        type=click.IntRange(wrapping.MIN_LOG_N, wrapping.MAX_LOG_N),
+        default=wrapping.DEFAULT_LOG_N,
+        show_default=True,
+        metavar="INT",
+        help="scrypt cost as log2(N); each step up doubles time and memory.",
+    )(f)
+
+
+def _params(scrypt_log_n: int) -> "wrapping.Params":
+    params = wrapping.Params(log_n=scrypt_log_n)
+    params.validate()  # catches a memory ceiling the range check cannot express
+    return params
+
+
+def _passphrase_for_new_key(
+    ask: bool, passphrase_file: Optional[str], *, what: str
+) -> Optional[str]:
+    """Resolve the passphrase to protect a *new* key with, or None for none."""
+    if ask and passphrase_file is not None:
+        raise click.ClickException(
+            "--passphrase and --passphrase-file do both the same job; pick one"
+        )
+    if passphrase_file is not None:
+        return _read_passphrase_file(passphrase_file)
+    if ask:
+        return _prompt_passphrase(f"passphrase for the new {what}", confirm=True)
+    return None
+
+
+def _read_key_text(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="ascii")
+    except OSError as exc:
+        raise click.ClickException(f"cannot read {path}: {exc.strerror}") from None
+    except UnicodeDecodeError:
+        raise click.ClickException(
+            f"{path} is not an hpqc key file (it is not text)"
+        ) from None
+
+
+def _open_private(path: str, passphrase_file: Optional[str], cls):
+    """Load a private key file, prompting for a passphrase if it needs one."""
+    text = _read_key_text(path)
+    passphrase = None
+    if wrapping.is_wrapped(text):
+        passphrase = (
+            _read_passphrase_file(passphrase_file)
+            if passphrase_file is not None
+            else _prompt_passphrase(f"passphrase for {path}", confirm=False)
+        )
+    elif passphrase_file is not None:
+        # Pass it through rather than ignoring it: the key layer explains that
+        # this file is not protected, which is what the user needs to hear.
+        passphrase = _read_passphrase_file(passphrase_file)
+    return cls.decode(text, passphrase)
 
 
 def _read_input(path: str) -> bytes:
@@ -91,20 +212,46 @@ def cli() -> None:
     help="Base name; writes BASENAME.key (private, 0600) and BASENAME.pub.",
 )
 @click.option("--force", is_flag=True, help="Overwrite existing key files.")
-def keygen(basename: str, force: bool) -> None:
+@click.option(
+    "-p",
+    "--passphrase",
+    "ask_passphrase",
+    is_flag=True,
+    help="Protect the private key with a passphrase (prompts twice).",
+)
+@click.option(
+    "--passphrase-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help=PASSPHRASE_FILE_HELP,
+)
+@_scrypt_option
+def keygen(
+    basename: str,
+    force: bool,
+    ask_passphrase: bool,
+    passphrase_file: Optional[str],
+    scrypt_log_n: int,
+) -> None:
     """Generate a hybrid X25519 + ML-KEM-768 key pair."""
     private_path = Path(f"{basename}.key")
     public_path = Path(f"{basename}.pub")
     _fail_if_exists(private_path, force)
     _fail_if_exists(public_path, force)
 
+    passphrase = _passphrase_for_new_key(
+        ask_passphrase, passphrase_file, what="private key"
+    )
+
     identity = PrivateKey.generate()
     public = identity.public_key()
 
-    identity.write(private_path)
+    identity.write(private_path, passphrase, _params(scrypt_log_n))
     public.write(public_path)
 
-    click.echo(f"private key: {private_path}  (mode 0600 -- keep it secret)")
+    protection = (
+        "passphrase-protected" if passphrase is not None else "mode 0600 only"
+    )
+    click.echo(f"private key: {private_path}  ({protection} -- keep it secret)")
     click.echo(f"public key:  {public_path}   (share this)")
     click.echo(f"key id:      {public.key_id_hex}")
 
@@ -119,7 +266,26 @@ def keygen(basename: str, force: bool) -> None:
     help="Base name; writes BASENAME.key (private, 0600) and BASENAME.pub.",
 )
 @click.option("--force", is_flag=True, help="Overwrite existing key files.")
-def signgen(basename: str, force: bool) -> None:
+@click.option(
+    "-p",
+    "--passphrase",
+    "ask_passphrase",
+    is_flag=True,
+    help="Protect the private key with a passphrase (prompts twice).",
+)
+@click.option(
+    "--passphrase-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help=PASSPHRASE_FILE_HELP,
+)
+@_scrypt_option
+def signgen(
+    basename: str,
+    force: bool,
+    ask_passphrase: bool,
+    passphrase_file: Optional[str],
+    scrypt_log_n: int,
+) -> None:
     """Generate a hybrid Ed25519 + ML-DSA-65 signing key pair.
 
     Kept separate from `keygen` on purpose: a key should do one job, and files
@@ -130,13 +296,20 @@ def signgen(basename: str, force: bool) -> None:
     _fail_if_exists(private_path, force)
     _fail_if_exists(public_path, force)
 
+    passphrase = _passphrase_for_new_key(
+        ask_passphrase, passphrase_file, what="signing private key"
+    )
+
     sender = SigningPrivateKey.generate()
     public = sender.public_key()
 
-    sender.write(private_path)
+    sender.write(private_path, passphrase, _params(scrypt_log_n))
     public.write(public_path)
 
-    click.echo(f"signing private key: {private_path}  (mode 0600 -- keep it secret)")
+    protection = (
+        "passphrase-protected" if passphrase is not None else "mode 0600 only"
+    )
+    click.echo(f"signing private key: {private_path}  ({protection})")
     click.echo(f"signing public key:  {public_path}   (give this to recipients)")
     click.echo(f"key id:              {public.key_id_hex}")
 
@@ -166,17 +339,28 @@ def signgen(basename: str, force: bool) -> None:
     type=click.Path(exists=True, dir_okay=False),
     help="Your signing .key file; adds sender authentication.",
 )
+@click.option(
+    "--passphrase-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help=f"For a protected signing key. {PASSPHRASE_FILE_HELP}",
+)
 def encrypt(
     input_path: str,
     recipient_path: str,
     output_path: str,
     aead: str,
     signing_key_path: Optional[str],
+    passphrase_file: Optional[str],
 ) -> None:
     """Encrypt INPUT (default stdin) to a recipient's public key."""
+    if signing_key_path is None and passphrase_file is not None:
+        raise click.ClickException(
+            "--passphrase-file only makes sense with --sign; there is no "
+            "private key to open otherwise"
+        )
     recipient = PublicKey.read(recipient_path)
     sender = (
-        SigningPrivateKey.read(signing_key_path)
+        _open_private(signing_key_path, passphrase_file, SigningPrivateKey)
         if signing_key_path is not None
         else None
     )
@@ -207,11 +391,20 @@ def encrypt(
     type=click.Path(exists=True, dir_okay=False),
     help="Sender's signing .pub file; requires and verifies a signature.",
 )
+@click.option(
+    "--passphrase-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help=f"For a protected identity. {PASSPHRASE_FILE_HELP}",
+)
 def decrypt(
-    input_path: str, key_path: str, output_path: str, sender_path: Optional[str]
+    input_path: str,
+    key_path: str,
+    output_path: str,
+    sender_path: Optional[str],
+    passphrase_file: Optional[str],
 ) -> None:
     """Decrypt INPUT (default stdin) with your private key."""
-    identity = PrivateKey.read(key_path)
+    identity = _open_private(key_path, passphrase_file, PrivateKey)
     sender = (
         SigningPublicKey.read(sender_path) if sender_path is not None else None
     )
@@ -236,6 +429,99 @@ def decrypt(
         )
 
 
+def _private_key_kind(text: str) -> int:
+    """Work out which kind of private key a file holds, without opening it."""
+    if wrapping.is_wrapped(text):
+        return wrapping.parse(text).kind
+    line = armour.payload_line(text)
+    # Signing first for clarity; the prefixes are chosen so that neither is a
+    # prefix of the other, which a test enforces.
+    if line.startswith(SIGN_PRIVATE_PREFIX):
+        return wrapping.KIND_SIGNING_IDENTITY
+    if line.startswith(PRIVATE_PREFIX):
+        return wrapping.KIND_IDENTITY
+    raise click.ClickException(
+        f"{line[:16]!r}... is not an hpqc private key; "
+        "passwd only works on private keys"
+    )
+
+
+@cli.command()
+@click.argument(
+    "key_path", metavar="KEYFILE", type=click.Path(exists=True, dir_okay=False)
+)
+@click.option(
+    "--remove",
+    is_flag=True,
+    help="Strip the passphrase, leaving the key protected by file mode only.",
+)
+@click.option(
+    "--passphrase-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help=f"The key's *current* passphrase. {PASSPHRASE_FILE_HELP}",
+)
+@click.option(
+    "--new-passphrase-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Read the new passphrase from FILE instead of prompting.",
+)
+@_scrypt_option
+def passwd(
+    key_path: str,
+    remove: bool,
+    passphrase_file: Optional[str],
+    new_passphrase_file: Optional[str],
+    scrypt_log_n: int,
+) -> None:
+    """Add, change, or remove the passphrase on a private KEYFILE.
+
+    The key itself is untouched -- only how it is stored changes -- so the
+    public key and key id stay exactly as they were. That is the point: without
+    this, changing a passphrase would mean generating a new identity, and
+    everyone holding your public key would have to fetch a new one.
+    """
+    if remove and new_passphrase_file is not None:
+        raise click.ClickException(
+            "--remove and --new-passphrase-file contradict each other"
+        )
+
+    text = _read_key_text(key_path)
+    kind = _private_key_kind(text)
+    cls = (
+        SigningPrivateKey
+        if kind == wrapping.KIND_SIGNING_IDENTITY
+        else PrivateKey
+    )
+    was_wrapped = wrapping.is_wrapped(text)
+
+    if remove and not was_wrapped:
+        raise click.ClickException(f"{key_path} has no passphrase to remove")
+
+    key = _open_private(key_path, passphrase_file, cls)
+
+    if remove:
+        new_passphrase = None
+    elif new_passphrase_file is not None:
+        new_passphrase = _read_passphrase_file(new_passphrase_file)
+    else:
+        new_passphrase = _prompt_passphrase(
+            f"new passphrase for {key_path}", confirm=True
+        )
+
+    # Written to a temporary file and renamed over the original, so an
+    # interrupted rewrite cannot leave the key half-written or gone.
+    key.write(key_path, new_passphrase, _params(scrypt_log_n))
+
+    if remove:
+        what = "passphrase removed; the key is now protected by file mode only"
+    elif was_wrapped:
+        what = "passphrase changed"
+    else:
+        what = "passphrase added"
+    click.echo(f"{key_path}: {what}")
+    click.echo(f"key id: {key.public_key().key_id_hex} (unchanged)")
+
+
 @cli.command()
 @click.argument("input_path", metavar="[INPUT]", default=STDIO)
 def info(input_path: str) -> None:
@@ -247,6 +533,14 @@ def info(input_path: str) -> None:
         return
 
     text = _as_text(data)
+    if text and wrapping.is_wrapped(text):
+        wrapped = wrapping.parse(text)
+        click.echo("type:       hpqc wrapped private key")
+        click.echo(f"contents:   {wrapped.kind_name}")
+        click.echo(f"protection: {wrapped.params.describe()}")
+        # The key id is derived from the key itself, which is sealed.
+        click.echo("key id:     unavailable without the passphrase")
+        return
     if text and SIGN_PUBLIC_PREFIX in text:
         public = SigningPublicKey.decode(text)
         click.echo("type:       hpqc signing public key")

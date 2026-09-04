@@ -33,3 +33,7 @@ class BackendError(HpqcError):
 
 class SignatureError(HpqcError):
     """Sender authentication failed, or was asked for and is not present."""
+
+
+class PassphraseError(HpqcError):
+    """A wrapped key could not be opened: wrong passphrase, or none supplied."""

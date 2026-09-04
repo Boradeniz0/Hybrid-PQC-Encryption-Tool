@@ -16,6 +16,13 @@ almost always trips the AEAD tag first, so those mutations never reach
 signing.py's parser at all. To actually fuzz it the payload has to be mutated
 *before* it is sealed -- which is also the realistic threat, since the sender
 is who chooses the payload.
+
+Wrapped key files get a pass too. A key file is untrusted input like any other,
+and its header carries scrypt cost parameters -- so on top of the usual two
+properties, a mutation must never make the parser attempt an enormous
+allocation. That is why every mutation here uses a low recorded cost and the
+whole test still finishes in well under a second: any mutation that produced a
+real derivation at a mutated cost would show up as the suite hanging.
 """
 
 from __future__ import annotations
@@ -24,8 +31,11 @@ import random
 
 import pytest
 
+from hpqc import wrapping
+from hpqc.armour import armour
 from hpqc.container import decrypt, encrypt, open_container
 from hpqc.errors import HpqcError
+from hpqc.keys import PrivateKey
 from hpqc.signing import sign_payload
 from hpqc.suites import DEFAULT_SUITE
 
@@ -138,3 +148,54 @@ def test_a_mutated_signature_block_never_escapes_and_never_verifies(
             )
         else:
             pytest.fail("a mutated signature block verified successfully")
+
+
+def test_a_mutated_wrapped_key_never_escapes_and_never_opens(monkeypatch) -> None:
+    """Fuzz the wrapped-key parser, including its cost parameters.
+
+    Two ways this could go wrong beyond a stray exception: a mutation that makes
+    the file open anyway, and a mutated log2(N) or r that the parser accepts and
+    hands to scrypt, turning a corrupt key file into a multi-gigabyte
+    allocation.
+
+    The memory ceiling is lowered to exactly what the recorded key needs for the
+    duration. The real ceiling is 1 GiB, which a mutation can legitimately land
+    under -- N=2^20 at r=8 is a valid, expensive key -- and then this test would
+    spend seconds and a gigabyte on it, at the mercy of the seed. With the
+    ceiling at the recorded cost, every mutation that raises it is refused
+    outright, so each iteration is either cheap or instant while the parser is
+    still fuzzed over every byte.
+    """
+    passphrase = "correct horse battery staple"
+    params = wrapping.Params(log_n=10)
+    text = PrivateKey.generate().encode(passphrase, params)
+    blob = wrapping.parse(text).to_bytes()
+    monkeypatch.setattr(wrapping, "MAX_MEMORY_BYTES", params.memory_bytes)
+    rng = random.Random(SEED + 5)
+
+    for _ in range(ITERATIONS):
+        mutated = _mutate(rng, blob)
+        if mutated == blob:
+            continue
+        candidate = armour(wrapping.WRAPPED_PREFIX, mutated, [])
+        try:
+            wrapping.unwrap(candidate, passphrase)
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"{type(exc).__name__} escaped the wrapped-key parser: {exc}\n"
+                f"blob prefix: {mutated[:40].hex()}"
+            )
+        else:
+            pytest.fail("a mutated wrapped key opened successfully")
+
+
+def test_random_garbage_is_never_mistaken_for_a_wrapped_key() -> None:
+    rng = random.Random(SEED + 6)
+
+    for _ in range(ITERATIONS):
+        blob = bytes(rng.randrange(256) for _ in range(rng.randrange(0, 200)))
+        candidate = armour(wrapping.WRAPPED_PREFIX, blob, [])
+        with pytest.raises(HpqcError):
+            wrapping.unwrap(candidate, "anything")

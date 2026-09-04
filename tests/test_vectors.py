@@ -31,11 +31,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from pathlib import Path
 
 import pytest
 
-from hpqc import hybrid, signing, suites
+from hpqc import hybrid, signing, suites, wrapping
 from hpqc.container import (
     FLAG_SIGNED,
     FORMAT_VERSION,
@@ -43,8 +44,8 @@ from hpqc.container import (
     open_container,
     parse_header,
 )
-from hpqc.errors import HpqcError, SignatureError
-from hpqc.keys import PrivateKey, PublicKey, SigningPublicKey
+from hpqc.errors import HpqcError, PassphraseError, SignatureError
+from hpqc.keys import PrivateKey, PublicKey, SigningPrivateKey, SigningPublicKey
 
 
 def _load(name: str) -> dict:
@@ -54,6 +55,7 @@ def _load(name: str) -> dict:
 
 VECTORS = _load("v1.json")
 SIGNED = _load("v1-signed.json")
+WRAPPED = _load("v1-wrapped.json")
 
 
 @pytest.fixture(scope="module")
@@ -288,3 +290,70 @@ class TestFrozenForwardingRejection:
         with pytest.raises(SignatureError) as caught:
             open_container(blob, signed_identity)
         assert not isinstance(caught.value, DecryptionError)
+
+
+# --------------------------------------------------------------------------
+# Passphrase-wrapped private keys
+# --------------------------------------------------------------------------
+
+_WRAPPED_CLASSES = {
+    wrapping.KIND_IDENTITY: PrivateKey,
+    wrapping.KIND_SIGNING_IDENTITY: SigningPrivateKey,
+}
+
+
+def test_the_wrapped_vectors_target_this_format() -> None:
+    assert WRAPPED["format_version"] == wrapping.WRAP_VERSION
+
+
+def test_the_wrap_label_has_not_changed() -> None:
+    """It is associated data, so changing it makes every wrapped key unopenable."""
+    assert wrapping.WRAP_LABEL.decode("ascii") == WRAPPED["wrap_label"]
+
+
+@pytest.mark.parametrize(
+    "vector", WRAPPED["keys"], ids=[k["kind_name"] for k in WRAPPED["keys"]]
+)
+class TestWrappedKeys:
+    def test_it_still_opens_with_the_recorded_passphrase(self, vector) -> None:
+        """Pins the layout, the scrypt call, and the associated data at once."""
+        blob, kind = wrapping.unwrap(vector["wrapped"], WRAPPED["passphrase_nfd"])
+
+        assert blob.hex() == vector["blob"]
+        assert kind == vector["kind"]
+
+    def test_the_normalised_passphrase_opens_it_too(self, vector) -> None:
+        """The recorded passphrase is NFD; a user typing NFC must still get in.
+
+        This is the test that would have caught shipping without normalisation:
+        a key wrapped on one system simply would not open on another, and
+        nothing in the error would say why.
+        """
+        composed = unicodedata.normalize("NFC", WRAPPED["passphrase_nfd"])
+        assert composed != WRAPPED["passphrase_nfd"]  # genuinely different bytes
+
+        blob, _ = wrapping.unwrap(vector["wrapped"], composed)
+        assert blob.hex() == vector["blob"]
+
+    def test_the_recorded_parameters_are_what_the_file_carries(self, vector) -> None:
+        params = wrapping.parse(vector["wrapped"]).params
+
+        assert params.log_n == WRAPPED["scrypt"]["log_n"]
+        assert params.r == WRAPPED["scrypt"]["r"]
+        assert params.p == WRAPPED["scrypt"]["p"]
+
+    def test_it_loads_through_the_key_class_to_the_recorded_identity(
+        self, vector
+    ) -> None:
+        cls = _WRAPPED_CLASSES[vector["kind"]]
+        key = cls.decode(vector["wrapped"], WRAPPED["passphrase_nfd"])
+
+        assert key.public_key().key_id_hex == vector["key_id"]
+        assert key.public_key().encode() == vector["public"]
+
+    def test_the_wrong_passphrase_still_fails(self, vector) -> None:
+        with pytest.raises(PassphraseError):
+            wrapping.unwrap(vector["wrapped"], "not the passphrase")
+
+    def test_the_secret_is_not_sitting_in_the_file(self, vector) -> None:
+        assert bytes.fromhex(vector["blob"]) not in vector["wrapped"].encode("ascii")

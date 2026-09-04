@@ -35,9 +35,11 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from helpers import seal  # noqa: E402
 
-from hpqc import hybrid, signing, suites  # noqa: E402
+from hpqc import hybrid, signing, suites, wrapping  # noqa: E402
 from hpqc.container import FLAG_SIGNED, encrypt  # noqa: E402
 from hpqc.keys import PrivateKey, SigningPrivateKey  # noqa: E402
+
+import unicodedata  # noqa: E402
 
 VECTORS = ROOT / "tests" / "vectors"
 
@@ -211,9 +213,63 @@ def build_v1_signed() -> dict:
     return data
 
 
+def build_v1_wrapped() -> dict:
+    """Passphrase-wrapped private keys.
+
+    Opening a wrapped key is deterministic given the file and the passphrase, so
+    one recorded file pins the whole construction: the byte layout, how scrypt is
+    called, what goes into the associated data, and the NFC normalisation of the
+    passphrase. Change any of those and this file stops opening.
+
+    The cost is deliberately low so the tests stay quick. The parameters live
+    inside the file, which is exactly what makes that safe -- the *default* cost
+    is asserted separately, in tests/test_wrapping.py.
+    """
+    # NFD: the same characters as "cafe\u0301 passphrase" typed on a system that
+    # decomposes accents. Recording this form and opening with the composed one
+    # is what pins the normalisation.
+    passphrase = unicodedata.normalize("NFD", "caf\u00e9 passphrase \u00fczerine")
+    params = wrapping.Params(log_n=12)
+
+    identity = PrivateKey.generate()
+    signer = SigningPrivateKey.generate()
+
+    return {
+        "note": (
+            "Frozen known-answer vectors for hpqc passphrase-wrapped private "
+            "keys (scrypt + ChaCha20-Poly1305). " + TEST_KEY_WARNING + " The "
+            "passphrase is recorded in NFD form on purpose; opening with its "
+            "NFC form must work, which is what pins the normalisation."
+        ),
+        "format_version": wrapping.WRAP_VERSION,
+        "wrap_label": wrapping.WRAP_LABEL.decode("ascii"),
+        "passphrase_nfd": passphrase,
+        "scrypt": {"log_n": params.log_n, "r": params.r, "p": params.p},
+        "keys": [
+            {
+                "kind": wrapping.KIND_IDENTITY,
+                "kind_name": "identity",
+                "wrapped": identity.encode(passphrase, params),
+                "blob": identity.to_bytes().hex(),
+                "key_id": identity.public_key().key_id_hex,
+                "public": identity.public_key().encode(),
+            },
+            {
+                "kind": wrapping.KIND_SIGNING_IDENTITY,
+                "kind_name": "signing identity",
+                "wrapped": signer.encode(passphrase, params),
+                "blob": signer.to_bytes().hex(),
+                "key_id": signer.public_key().key_id_hex,
+                "public": signer.public_key().encode(),
+            },
+        ],
+    }
+
+
 BUILDERS = {
     "v1.json": build_v1,
     "v1-signed.json": build_v1_signed,
+    "v1-wrapped.json": build_v1_wrapped,
 }
 
 

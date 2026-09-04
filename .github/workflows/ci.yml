@@ -88,3 +88,36 @@ jobs:
           hpqc decrypt -k ci.key signed.hpqc --sender signer.pub 2>/dev/null > piped-out.txt
           cmp msg.txt piped-out.txt
           echo "signature notice stays off stdout: ok"
+
+          # A low scrypt cost: the default is ~128 MiB and a third of a second
+          # by design, and the parameters live in the file, so turning them down
+          # here exercises exactly the same code path.
+          printf 'correct horse battery staple' > pw
+          printf 'a different passphrase' > pw2
+          hpqc keygen -o locked --passphrase-file pw --scrypt-log-n 14
+          hpqc info locked.key | grep -q 'wrapped private key'
+          hpqc info locked.key | grep -q 'unavailable without the passphrase'
+          echo "wrapped key described without the passphrase: ok"
+          hpqc encrypt -r locked.pub msg.txt -o locked.hpqc
+          hpqc decrypt -k locked.key locked.hpqc -o locked-out.txt --passphrase-file pw
+          cmp msg.txt locked-out.txt
+          echo "passphrase-protected round trip: ok"
+          if hpqc decrypt -k locked.key locked.hpqc -o /dev/null --passphrase-file pw2 2>/dev/null; then
+            echo "FAIL: opened with the wrong passphrase"; exit 1
+          fi
+          echo "wrong passphrase rejected: ok"
+          if hpqc decrypt -k locked.key locked.hpqc -o /dev/null 2>/dev/null; then
+            echo "FAIL: opened a protected key with no passphrase"; exit 1
+          fi
+          echo "missing passphrase refused: ok"
+          before="$(hpqc info locked.pub | grep 'key id')"
+          hpqc passwd locked.key --passphrase-file pw --new-passphrase-file pw2 --scrypt-log-n 14
+          hpqc decrypt -k locked.key locked.hpqc -o rekeyed.txt --passphrase-file pw2
+          cmp msg.txt rekeyed.txt
+          test "$(hpqc info locked.pub | grep 'key id')" = "$before"
+          echo "passwd changed the passphrase, not the identity: ok"
+          hpqc passwd locked.key --remove --passphrase-file pw2
+          hpqc decrypt -k locked.key locked.hpqc -o unlocked.txt
+          cmp msg.txt unlocked.txt
+          test "$(stat -c '%a' locked.key)" = "600"
+          echo "passwd --remove: ok"

@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from hpqc.cli import cli
+from hpqc import wrapping
 from hpqc.keys import PrivateKey, PublicKey, SigningPrivateKey, SigningPublicKey
 
 
@@ -311,3 +312,342 @@ def test_signing_with_an_encryption_key_is_refused(signed_workspace, runner) -> 
     assert result.exit_code != 0
     assert "signing private" in str(result.exception)
     assert not (signed_workspace / "m.hpqc").exists()
+
+
+# --------------------------------------------------------------------------
+# Passphrase-protected private keys
+# --------------------------------------------------------------------------
+
+# Every keygen below passes a low scrypt cost. The default is ~128 MiB and a
+# third of a second on purpose; paying that a few dozen times would make the
+# suite slow without testing anything the parameters do not already cover.
+FAST = ["--scrypt-log-n", "12"]
+PASSPHRASE = "correct horse battery staple"
+
+
+@pytest.fixture
+def pwfile(tmp_path: Path):
+    """Write a passphrase to a file and return its name, cwd-relative."""
+
+    def write(text: str, name: str = "pw.txt") -> str:
+        (tmp_path / name).write_text(text, encoding="utf-8")
+        return name
+
+    return write
+
+
+@pytest.fixture
+def faketty(monkeypatch):
+    """Pretend there is a terminal, so the passphrase prompt is allowed.
+
+    `_prompt_passphrase` refuses to prompt without a tty -- reading a passphrase
+    from stdin would swallow the data being encrypted. Under CliRunner stdin is
+    never a tty, so exercising the prompt at all means saying otherwise. The
+    check lives behind `_have_terminal` for exactly this reason: CliRunner
+    substitutes its own stdin, so patching the real one has no effect.
+    """
+    monkeypatch.setattr("hpqc.cli._have_terminal", lambda: True)
+
+
+@pytest.fixture
+def protected(workspace, runner, pwfile):
+    """A workspace whose `secret` identity is passphrase-protected."""
+    pw = pwfile(PASSPHRASE)
+    result = run(runner, "keygen", "-o", "secret", "--passphrase-file", pw, *FAST)
+    assert result.exit_code == 0, result.output
+    return workspace
+
+
+def test_keygen_can_protect_the_private_key(protected, runner) -> None:
+    text = (protected / "secret.key").read_text()
+
+    assert wrapping.is_wrapped(text)
+    assert oct((protected / "secret.key").stat().st_mode)[-3:] == "600"
+    # The public half is not a secret and is never wrapped.
+    assert not wrapping.is_wrapped((protected / "secret.pub").read_text())
+
+
+def test_info_describes_a_wrapped_key_without_the_passphrase(protected, runner) -> None:
+    output = run(runner, "info", "secret.key").output
+
+    assert "wrapped private key" in output
+    assert "X25519 + ML-KEM-768" in output
+    assert "scrypt N=2^12" in output
+    assert "unavailable without the passphrase" in output
+
+
+def test_a_protected_key_round_trips(protected, runner, pwfile) -> None:
+    (protected / "m.txt").write_bytes(b"under a passphrase")
+    run(runner, "encrypt", "-r", "secret.pub", "m.txt", "-o", "m.hpqc")
+    result = run(
+        runner, "decrypt", "-k", "secret.key", "m.hpqc", "-o", "out.txt",
+        "--passphrase-file", pwfile(PASSPHRASE),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (protected / "out.txt").read_bytes() == b"under a passphrase"
+
+
+def test_the_wrong_passphrase_fails_and_writes_nothing(
+    protected, runner, pwfile
+) -> None:
+    run(runner, "encrypt", "-r", "secret.pub", "-o", "m.hpqc", stdin=b"x")
+    result = runner.invoke(
+        cli,
+        ["decrypt", "-k", "secret.key", "m.hpqc", "-o", "out.txt",
+         "--passphrase-file", pwfile("not it", "bad.txt")],
+    )
+
+    assert result.exit_code != 0
+    assert "wrong passphrase" in str(result.exception)
+    assert not (protected / "out.txt").exists()
+
+
+def test_without_a_terminal_the_missing_passphrase_is_explained(
+    protected, runner
+) -> None:
+    """The alternative is reading it from stdin and eating the ciphertext."""
+    run(runner, "encrypt", "-r", "secret.pub", "-o", "m.hpqc", stdin=b"x")
+    result = run(runner, "decrypt", "-k", "secret.key", "m.hpqc", "-o", "out.txt")
+
+    assert result.exit_code != 0
+    assert "no terminal" in result.output
+    assert "--passphrase-file" in result.output
+
+
+def test_the_passphrase_can_be_typed_at_a_prompt(
+    workspace, runner, faketty
+) -> None:
+    result = run(
+        runner, "keygen", "-o", "typed", "-p", *FAST,
+        stdin=f"{PASSPHRASE}\n{PASSPHRASE}\n".encode(),
+    )
+    assert result.exit_code == 0, result.output
+    assert wrapping.is_wrapped((workspace / "typed.key").read_text())
+
+    run(runner, "encrypt", "-r", "typed.pub", "-o", "m.hpqc", stdin=b"typed")
+    result = run(
+        runner, "decrypt", "-k", "typed.key", "m.hpqc", "-o", "out.txt",
+        stdin=f"{PASSPHRASE}\n".encode(),
+    )
+    assert result.exit_code == 0, result.output
+    assert (workspace / "out.txt").read_bytes() == b"typed"
+
+
+def test_a_mistyped_confirmation_is_rejected(workspace, runner, faketty) -> None:
+    result = runner.invoke(
+        cli, ["keygen", "-o", "typed", "-p", *FAST], input=b"one\ntwo\n"
+    )
+
+    assert result.exit_code != 0
+    assert "do not match" in result.output
+    assert not (workspace / "typed.key").exists()
+
+
+def test_the_two_passphrase_sources_cannot_be_combined(
+    workspace, runner, pwfile
+) -> None:
+    result = run(
+        runner, "keygen", "-o", "k", "-p",
+        "--passphrase-file", pwfile(PASSPHRASE), *FAST,
+    )
+
+    assert result.exit_code != 0
+    assert "pick one" in result.output
+
+
+def test_an_empty_passphrase_file_is_refused(workspace, runner, pwfile) -> None:
+    result = run(
+        runner, "keygen", "-o", "k", "--passphrase-file", pwfile(""), *FAST
+    )
+
+    assert result.exit_code != 0
+    assert "empty" in result.output
+    assert not (workspace / "k.key").exists()
+
+
+def test_exactly_one_trailing_newline_is_stripped(workspace, runner, pwfile) -> None:
+    """A passphrase may end in a space; only the line ending is removed."""
+    run(
+        runner, "keygen", "-o", "k",
+        "--passphrase-file", pwfile("pass phrase \n", "with-space.txt"), *FAST,
+    )
+    run(runner, "encrypt", "-r", "k.pub", "-o", "m.hpqc", stdin=b"x")
+
+    kept = run(
+        runner, "decrypt", "-k", "k.key", "m.hpqc", "-o", "ok.txt",
+        "--passphrase-file", pwfile("pass phrase ", "kept.txt"),
+    )
+    assert kept.exit_code == 0, kept.output
+
+    trimmed = runner.invoke(
+        cli,
+        ["decrypt", "-k", "k.key", "m.hpqc", "-o", "no.txt",
+         "--passphrase-file", pwfile("pass phrase", "trimmed.txt")],
+    )
+    assert trimmed.exit_code != 0
+
+
+def test_a_passphrase_for_an_unprotected_key_is_an_error(
+    workspace, runner, pwfile
+) -> None:
+    run(runner, "encrypt", "-r", "alice.pub", "-o", "m.hpqc", stdin=b"x")
+    result = runner.invoke(
+        cli,
+        ["decrypt", "-k", "alice.key", "m.hpqc", "-o", "out.txt",
+         "--passphrase-file", pwfile(PASSPHRASE)],
+    )
+
+    assert result.exit_code != 0
+    assert "not passphrase-protected" in str(result.exception)
+
+
+def test_a_protected_signing_key_can_still_sign(workspace, runner, pwfile) -> None:
+    pw = pwfile(PASSPHRASE)
+    run(runner, "signgen", "-o", "signer", "--passphrase-file", pw, *FAST)
+    (workspace / "m.txt").write_bytes(b"signed under a passphrase")
+
+    result = run(
+        runner, "encrypt", "-r", "alice.pub", "m.txt", "-o", "m.hpqc",
+        "-s", "signer.key", "--passphrase-file", pw,
+    )
+    assert result.exit_code == 0, result.output
+
+    result = run(
+        runner, "decrypt", "-k", "alice.key", "m.hpqc", "-o", "out.txt",
+        "--sender", "signer.pub",
+    )
+    assert result.exit_code == 0, result.output
+    assert (workspace / "out.txt").read_bytes() == b"signed under a passphrase"
+
+
+def test_a_passphrase_file_without_a_key_to_open_is_refused(
+    workspace, runner, pwfile
+) -> None:
+    result = run(
+        runner, "encrypt", "-r", "alice.pub", "-o", "m.hpqc",
+        "--passphrase-file", pwfile(PASSPHRASE), stdin=b"x",
+    )
+
+    assert result.exit_code != 0
+    assert "only makes sense with --sign" in result.output
+
+
+# --------------------------------------------------------------------------
+# hpqc passwd
+# --------------------------------------------------------------------------
+
+
+def _key_id(output: str) -> str:
+    for line in output.splitlines():
+        if line.startswith("key id"):
+            return line.split(":", 1)[1].strip().split()[0]
+    raise AssertionError(f"no key id in {output!r}")
+
+
+def test_passwd_changes_the_passphrase_without_changing_the_key(
+    protected, runner, pwfile
+) -> None:
+    """The identity must survive: otherwise every holder of the public key
+    would have to fetch a new one just because a passphrase changed."""
+    before = PublicKey.read(protected / "secret.pub")
+    old = pwfile(PASSPHRASE)
+    new = pwfile("a different passphrase", "new.txt")
+
+    result = run(
+        runner, "passwd", "secret.key",
+        "--passphrase-file", old, "--new-passphrase-file", new, *FAST,
+    )
+    assert result.exit_code == 0, result.output
+    assert "passphrase changed" in result.output
+    assert _key_id(result.output) == before.key_id_hex
+
+    assert PrivateKey.read(protected / "secret.key",
+                           "a different passphrase").public_key() == before
+
+    with pytest.raises(Exception):
+        PrivateKey.read(protected / "secret.key", PASSPHRASE)
+
+
+def test_passwd_can_remove_the_passphrase(protected, runner, pwfile) -> None:
+    result = run(
+        runner, "passwd", "secret.key", "--remove",
+        "--passphrase-file", pwfile(PASSPHRASE),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "passphrase removed" in result.output
+    assert not wrapping.is_wrapped((protected / "secret.key").read_text())
+    assert PrivateKey.read(protected / "secret.key")
+    assert oct((protected / "secret.key").stat().st_mode)[-3:] == "600"
+
+
+def test_passwd_can_add_a_passphrase_to_an_unprotected_key(
+    workspace, runner, pwfile
+) -> None:
+    before = PublicKey.read(workspace / "alice.pub")
+    result = run(
+        runner, "passwd", "alice.key",
+        "--new-passphrase-file", pwfile(PASSPHRASE), *FAST,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "passphrase added" in result.output
+    assert wrapping.is_wrapped((workspace / "alice.key").read_text())
+    assert PrivateKey.read(workspace / "alice.key", PASSPHRASE).public_key() == before
+
+
+def test_passwd_works_on_signing_keys_too(workspace, runner, pwfile) -> None:
+    run(runner, "signgen", "-o", "signer")
+    before = SigningPublicKey.read(workspace / "signer.pub")
+
+    result = run(
+        runner, "passwd", "signer.key",
+        "--new-passphrase-file", pwfile(PASSPHRASE), *FAST,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert SigningPrivateKey.read(
+        workspace / "signer.key", PASSPHRASE
+    ).public_key() == before
+
+
+def test_passwd_refuses_to_remove_a_passphrase_that_is_not_there(
+    workspace, runner
+) -> None:
+    result = run(runner, "passwd", "alice.key", "--remove")
+
+    assert result.exit_code != 0
+    assert "no passphrase to remove" in result.output
+
+
+def test_passwd_rejects_contradictory_options(protected, runner, pwfile) -> None:
+    result = run(
+        runner, "passwd", "secret.key", "--remove",
+        "--passphrase-file", pwfile(PASSPHRASE),
+        "--new-passphrase-file", pwfile("x", "new.txt"),
+    )
+
+    assert result.exit_code != 0
+    assert "contradict" in result.output
+
+
+def test_passwd_refuses_a_public_key_file(workspace, runner) -> None:
+    result = run(runner, "passwd", "alice.pub")
+
+    assert result.exit_code != 0
+    assert "not an hpqc private key" in result.output
+
+
+def test_passwd_leaves_the_key_intact_when_it_fails(protected, runner, pwfile) -> None:
+    """The rewrite is a temp file and a rename, so a failure loses nothing."""
+    before = (protected / "secret.key").read_text()
+    result = runner.invoke(
+        cli,
+        ["passwd", "secret.key", "--passphrase-file", pwfile("wrong", "bad.txt"),
+         "--new-passphrase-file", pwfile("new", "new.txt")],
+    )
+
+    assert result.exit_code != 0
+    assert (protected / "secret.key").read_text() == before
+    assert [p.name for p in protected.iterdir() if p.name.startswith(".")] == []

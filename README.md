@@ -31,6 +31,17 @@ $ hpqc decrypt -k alice.key report.pdf.hpqc -o report.pdf --sender bob-sign.pub
 signature ok: signed by key id 1322446e7dc517ec
 ```
 
+Private keys can be kept under a passphrase rather than file permissions alone:
+
+```console
+$ hpqc keygen -o alice --passphrase
+passphrase for the new private key:
+Repeat for confirmation:
+private key: alice.key  (passphrase-protected -- keep it secret)
+public key:  alice.pub   (share this)
+key id:      dc367bffcdf81019
+```
+
 ## Why hybrid
 
 An attacker recording your traffic today can store it until a
@@ -78,11 +89,13 @@ resolve at all.
 ## Usage
 
 ```
-hpqc keygen  [-o BASENAME] [--force]     write BASENAME.key + BASENAME.pub
-hpqc signgen [-o BASENAME] [--force]     the same, for a signing key pair
+hpqc keygen  [-o BASENAME] [--force] [-p | --passphrase-file F]
+hpqc signgen [-o BASENAME] [--force] [-p | --passphrase-file F]
 hpqc encrypt -r RECIPIENT.pub [INPUT] [-o OUT] [--aead chacha20|aes]
-                                         [-s SIGNING.key]
+                                         [-s SIGNING.key] [--passphrase-file F]
 hpqc decrypt -k IDENTITY.key  [INPUT] [-o OUT] [--sender SIGNER.pub]
+                                         [--passphrase-file F]
+hpqc passwd  KEYFILE [--remove] [--passphrase-file F] [--new-passphrase-file F]
 hpqc info    [INPUT]                     describe a container or a key file
 ```
 
@@ -264,6 +277,59 @@ not delivered fails closed.
 Post-quantum signatures are simply large: ML-DSA-65 alone is 3309 bytes of
 that, and its verifying key another 1952.
 
+## Passphrase-protected private keys
+
+By default a private key file is protected by its mode alone, `0600`, like an
+`age` identity file. That is a reasonable default and it is worth nothing the
+moment the file leaves the machine — in a backup, a synced folder, a stolen
+laptop. `--passphrase` (or `--passphrase-file`) derives a key from a passphrase
+with **scrypt** and seals the private key under ChaCha20-Poly1305.
+
+```console
+$ hpqc info alice.key
+type:       hpqc wrapped private key
+contents:   X25519 + ML-KEM-768 private key
+protection: scrypt N=2^17 r=8 p=1 (128 MiB)
+key id:     unavailable without the passphrase
+```
+
+`hpqc passwd` adds, changes, or removes a passphrase. The key itself never
+changes, so the public key and the key id stay exactly as they were — without
+that, changing a passphrase would mean a new identity and everyone holding your
+public key having to fetch a new one.
+
+### A key file is untrusted input
+
+The cost parameters travel inside the file, so raising the default later does not
+strand keys written today, and someone on a small machine can turn it down with
+`--scrypt-log-n`. That also means a *file* can claim any parameters it likes. A
+key file asking for N=2²³ at r=8 wants 8 GiB of memory, and reading a key file
+must not be a way to take a machine down — so the parameters are validated
+against a memory ceiling **before** scrypt is called, not after.
+
+The whole wrapper header is the AEAD's associated data, prefixed by a domain
+label. Worth being precise about what that buys, because it is less than it first
+appears: the scrypt parameters and the salt are covered twice over, since
+changing them changes the derived key and the tag would fail regardless. What the
+AAD *alone* protects are the fields that never reach the KDF — the kind byte, the
+format version, the algorithm ids, the sealed length. Relabelling a wrapped
+encryption identity as a signing key is the case that isolates it.
+
+### Two details that would otherwise bite
+
+**There is deliberately no `--passphrase VALUE` option.** Command lines are
+visible to every user on the machine through `ps`. Prompting and
+`--passphrase-file` are the two ways in.
+
+**Passphrases are NFC-normalised** before being encoded to UTF-8. "é" is one
+code point or two depending on where it was typed, so without normalisation a
+key wrapped on one system would simply not open on another, with nothing in the
+error to suggest why.
+
+Defaults are N=2¹⁷, r=8, p=1 — 128 MiB and roughly a third of a second. A
+wrapped identity file is 347 bytes against 252 unwrapped; a wrapped signing key
+315 against 217.
+
 ## File format
 
 `.hpqc` containers are `header || AEAD ciphertext || 16-byte tag`. All
@@ -340,6 +406,29 @@ An identity is always *both* algorithms. They are generated, stored, and
 fingerprinted as one unit, because letting them travel separately is exactly
 how you end up shipping a "hybrid" scheme an attacker can downgrade.
 
+A passphrase-protected private key uses one prefix for both kinds,
+`hpqc-wsk1`, with a byte inside saying what it holds — one wrapper format
+rather than a new key file type per key type:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | wrapper format version, `1` |
+| 1 | 1 | inner key kind (1 = identity, 2 = signing identity) |
+| 2 | 1 | KDF id, `1` = scrypt |
+| 3 | 1 | scrypt log2(N) |
+| 4 | 1 | scrypt r |
+| 5 | 1 | scrypt p |
+| 6 | 1 | AEAD id, `1` = ChaCha20-Poly1305 |
+| 7 | 16 | scrypt salt |
+| 23 | 12 | AEAD nonce |
+| 35 | 2 | length of the sealed blob |
+| 37 | … | sealed blob (ciphertext, then a 16-byte tag) |
+
+The kind byte is in the clear on purpose. It costs nothing — the prefix already
+said "private key" — and it lets `hpqc info` describe a file, and a wrong-file
+mistake fail instantly, without a passphrase and without spending a third of a
+second in the KDF first.
+
 Signing keys are a separate pair of types with their own prefixes,
 `hpqc-ssk1` and `hpqc-spk1`. They are deliberately not folded into the
 encryption identity: a key should do one job, signing stays opt-in, and
@@ -376,7 +465,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-222 passed
+329 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -434,6 +523,15 @@ actually fails. Among them:
 - **The signed-message construction is pinned by digest.** Recorded signatures
   cannot do this; see below.
 - **The signature notice never lands on stdout.** stdout is the plaintext.
+- **A key file cannot make the machine allocate 8 GiB.** Cost parameters are
+  refused before scrypt runs, so a corrupt or hostile key file is an error
+  rather than an allocation. Fuzzing the wrapper covers the same ground over
+  every byte of the header.
+- **The key kind is checked before the KDF**, asserted by making the derivation
+  fail loudly if it is reached rather than by timing it — a stopwatch would only
+  say it was fast today.
+- **`hpqc passwd` cannot lose a key.** It rewrites a private key in place, so a
+  failure is tested to leave the original untouched and no temporary file behind.
 
 ## What building this turned up
 
@@ -458,6 +556,21 @@ confidentiality, but a parser that crashes on chosen input is the wrong shape,
 and a hostile `.pub` file reached the same code from the other direction. Both
 now go through one `_exchange` helper that converts it to a `FormatError`.
 
+**`hashlib.scrypt` is unusable at sensible parameters.** It inherits OpenSSL's
+default 32 MiB memory limit, so anything past N=2¹⁴ fails with
+`ValueError: [digital envelope routines] memory limit exceeded` — well below a
+reasonable default, and with an error that does not hint at the `maxmem`
+argument you were supposed to pass. `cryptography`'s `Scrypt` has no such
+ceiling, which is what hpqc uses.
+
+**An in-place rewrite of a private key can destroy it.** `hpqc passwd` writes
+over an existing key file. A truncating write that fails halfway leaves no key
+and no way back — and unlike a lost passphrase, this one is the tool's fault. Key
+writes now go to a temporary file in the same directory and are renamed over the
+target, so a reader sees either the old key or the new one. That also made the
+original permission bug structurally impossible: the mode belongs to the new
+inode, so there is no existing file's permissions left to inherit.
+
 **A frozen negative vector proved less than it looked.** Adding sender
 authentication, I recorded a container whose signature was made for a different
 recipient, expecting it to guard against surreptitious forwarding for good. It
@@ -470,6 +583,15 @@ construction; only a recorded *digest of the signed message* can. So the vectors
 now carry both, and the negative one is documented as guarding something
 narrower: a build that accepts forwarded containers outright. Checking that a
 test fails when you break the thing it tests is the only way to find this.
+
+**"The header is associated data" was doing less work than it sounded.** I
+wrote that every scrypt parameter in a wrapped key is authenticated, which is
+true, and tested it by flipping bits in each. Then I removed the header from the
+AAD to check the tests caught it — and the parameter tests kept passing. They
+always would have: changing `log2(N)` changes the derived key, so the tag fails
+whether or not the field is authenticated. The AAD is only load-bearing for the
+fields that never reach the KDF. The claim and the tests now say which is which.
+Same lesson as the vector above, from the other direction.
 
 **The declared Python floor was wrong.** `requires-python = ">=3.9"` looked
 fine and was not: `cryptography>=46` declares `!=3.9.0,!=3.9.1`, so on those
@@ -490,8 +612,10 @@ What it does **not** do, by design in v1:
   file proves consistency, not identity, and the tool says so.
 - **No streaming.** The whole plaintext is held in memory. Chunked AEAD with a
   counter nonce and an explicit final-chunk marker is the next flag bit.
-- **No passphrase on private keys.** They sit on disk protected only by file
-  permissions, like `age` identity files.
+- **No memory hygiene.** Passphrases and private keys are ordinary Python
+  objects: they are not pinned, not zeroed after use, and may be copied by the
+  interpreter or swapped to disk. A passphrase raises the cost of a stolen key
+  file; it does not defend against something already reading this process.
 - **Single recipient per file.**
 - **Not audited.** This is a learning and portfolio project, written against
   the standards below. Read the code before trusting it with anything real.
@@ -500,7 +624,7 @@ What it does **not** do, by design in v1:
 
 - [x] ML-DSA-65 signatures for sender authentication
 - [ ] Streaming / chunked AEAD for large files
-- [ ] Passphrase-wrapped private keys (scrypt + AEAD)
+- [x] Passphrase-wrapped private keys (scrypt + AEAD)
 - [ ] Multiple recipients per file
 - [ ] ML-KEM-1024 suite
 - [x] Known-answer test vectors checked into the repo
@@ -513,6 +637,7 @@ What it does **not** do, by design in v1:
 - [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) — EdDSA (Ed25519)
 - [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869) — HKDF
 - [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439) — ChaCha20 and Poly1305
+- [RFC 7914](https://www.rfc-editor.org/rfc/rfc7914) — the scrypt password-based KDF
 - [X-Wing](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/) — a hybrid KEM combiner; `hpqc` uses the same `ss_m ‖ ss_x` ordering
 - [draft-ietf-tls-hybrid-design](https://datatracker.ietf.org/doc/draft-ietf-tls-hybrid-design/) — hybrid key exchange in TLS 1.3
 - Don Davis, *Defective Sign & Encrypt in S/MIME, PKCS#7, MOSS, PEM, PGP, and XML* (USENIX Annual Technical Conference, 2001) — where surreptitious forwarding comes from
