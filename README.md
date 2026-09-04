@@ -474,6 +474,10 @@ version and ML-KEM availability it actually tested against, and then drives the
 unit tests call click in-process, so they would still pass with a broken
 console-script entry point.
 
+[TESTING.md](TESTING.md) walks through the same ground by hand, including the
+cases that have to fail and a couple of deliberate breakages to watch the tests
+catch.
+
 The suite is mostly negative tests, because that is where a crypto tool
 actually fails. Among them:
 
