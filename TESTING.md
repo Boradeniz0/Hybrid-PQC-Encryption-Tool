@@ -441,7 +441,16 @@ transcript — so it cannot be used to steer a recipient onto a different cipher
 ```console
 pytest -q                 # 676 passed
 pytest -q -W error        # clean with warnings escalated to errors
+tools/ci-local.sh         # the same, on all four Pythons CI uses, in docker
 ```
+
+The last one exists because one Python is not a matrix. A test written to check
+that hpqc survives a reader closing a pipe was itself unportable — it called
+`subprocess.communicate()` on a child whose stdin it had already handed away
+and closed, which raises before Python 3.12 — and it passed locally, went out,
+and turned CI red. `tools/ci-local.sh` reads the version list and the smoke
+test straight out of `.github/workflows/ci.yml`, so it cannot drift from what
+actually runs.
 
 The most instructive thing you can do with it is break something on purpose and
 watch which test notices. Reverse the hybrid combiner in `src/hpqc/hybrid.py`:

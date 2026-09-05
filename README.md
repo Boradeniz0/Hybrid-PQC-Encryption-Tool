@@ -850,6 +850,18 @@ version and ML-KEM availability it actually tested against, and then drives the
 unit tests call click in-process, so they would still pass with a broken
 console-script entry point.
 
+`tools/ci-local.sh` runs all of that, on every Python in the matrix, in docker:
+
+```console
+$ tools/ci-local.sh          # the whole matrix
+$ tools/ci-local.sh 3.9      # just one
+```
+
+It reads the version list and the smoke test out of the workflow file rather
+than restating them, so the local run cannot drift from the real one. One
+Python is not a matrix, and finding that out from a red badge is slower than
+finding it out here.
+
 [TESTING.md](TESTING.md) walks through the same ground by hand, including the
 cases that have to fail and a couple of deliberate breakages to watch the tests
 catch.
@@ -1080,6 +1092,18 @@ unopenable. I ran it: 410 tests passed and not one of them was the vectors. The
 same was true of reordering the stanza fields on the wire. That is the whole
 argument for recording a derivation rather than a container — a container that
 stops opening tells you something changed, and never which thing.
+
+**The test for a portability fix was itself unportable.** Restoring SIGPIPE's
+default needed a test with a real pipe and a real subprocess, so it hands
+`head`'s stdin to hpqc, closes its own copy, and reads what comes out. Calling
+`head.communicate()` after that raises `ValueError: flush of closed file` on
+anything before Python 3.12 — it tries to flush a file it no longer owns. It
+passed here, went out, and turned the CI red on the two oldest Pythons in the
+matrix, which is exactly the version-specific behaviour the fix underneath it
+was about. Reading `head.stdout` directly works everywhere. What the episode
+actually produced is `tools/ci-local.sh`: the repository is private, so the CI
+logs are not readable from a terminal, and a matrix you cannot run is a matrix
+you find out about afterwards.
 
 **A shell check that failed about one run in ten.** The CI smoke test is full
 of lines like `hpqc info f.hpqc | grep -q '^recipients:  3'`. `grep -q` exits at

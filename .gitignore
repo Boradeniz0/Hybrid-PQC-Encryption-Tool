@@ -18,3 +18,8 @@ htmlcov/
 *.key
 *.pub
 *.hpqc
+
+# Scratch directories other tools drop here. Named rather than left untracked,
+# because `git add -A` does not ask what a directory is for.
+output/
+tmp/

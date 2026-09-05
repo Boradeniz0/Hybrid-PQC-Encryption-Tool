@@ -1264,7 +1264,12 @@ def test_a_reader_that_stops_early_is_not_an_error(workspace, runner) -> None:
     )
     assert proc.returncode == 0 and proc.stdout == plaintext
 
-    # Now with a reader that leaves after one line.
+    # Now with a reader that leaves after one line. The pipe is wired by hand
+    # rather than with communicate(): after handing head's stdin to the writer
+    # and closing our copy, communicate() tries to flush a closed file, which
+    # is a ValueError before Python 3.12. Reading head's stdout directly works
+    # everywhere -- and this test exists to check a portability fix, so it had
+    # better be portable itself.
     head = subprocess.Popen(["head", "-1"], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE)
     writer = subprocess.Popen(
@@ -1273,10 +1278,13 @@ def test_a_reader_that_stops_early_is_not_an_error(workspace, runner) -> None:
         stdout=head.stdin,
         stderr=subprocess.PIPE,
     )
-    head.stdin.close()
-    assert head.communicate()[0] == b"first line\n"
+    head.stdin.close()  # only the writer holds the write end now
+    try:
+        assert head.stdout.read() == b"first line\n"
+    finally:
+        head.stdout.close()
+        head.wait()
     stderr = writer.communicate()[1]
-    head.wait()
 
     # Killed by SIGPIPE, exactly as `cat big | head` is -- not a silent exit 1.
     assert writer.returncode == -signal.SIGPIPE, writer.returncode
