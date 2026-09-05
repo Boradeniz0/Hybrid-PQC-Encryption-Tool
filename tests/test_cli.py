@@ -1091,3 +1091,193 @@ class TestSeveralRecipients:
         result = run(runner, "info", "many.hpqc")
         assert f"header:      {header_len} bytes" in shown(result)
         assert "recipients:  6" in shown(result)
+
+
+# --------------------------------------------------------------------------
+# The second hybrid KEM
+# --------------------------------------------------------------------------
+
+
+class TestKemChoice:
+    def test_keygen_makes_a_1024_key_and_says_so(self, workspace, runner) -> None:
+        result = run(runner, "keygen", "-o", "big", "--kem", "mlkem1024")
+        assert result.exit_code == 0, shown(result)
+        assert "algorithms:  X448+ML-KEM-1024" in shown(result)
+
+        result = run(runner, "info", "big.pub")
+        assert "algorithms: X448 + ML-KEM-1024" in shown(result)
+        result = run(runner, "info", "big.key")
+        assert "algorithms: X448 + ML-KEM-1024" in shown(result)
+
+    def test_the_default_is_unchanged(self, workspace, runner) -> None:
+        """Every key written before --kem existed is what --kem's default writes."""
+        result = run(runner, "info", "alice.pub")
+        assert "algorithms: X25519 + ML-KEM-768" in shown(result)
+        assert (workspace / "alice.pub").read_text().count("hpqc-pk1") == 1
+
+    def test_the_kem_comes_from_the_key_not_the_command_line(
+        self, workspace, runner
+    ) -> None:
+        """`encrypt` has no --kem: the recipient's key already decided."""
+        run(runner, "keygen", "-o", "big", "--kem", "mlkem1024")
+        (workspace / "m.txt").write_bytes(b"category five")
+
+        result = run(runner, "encrypt", "-r", "big.pub", "m.txt", "-o", "b.hpqc")
+        assert result.exit_code == 0, shown(result)
+        assert "suite:       X448+ML-KEM-1024/ChaCha20-Poly1305 (0x03)" in shown(
+            run(runner, "info", "b.hpqc")
+        )
+
+        result = run(runner, "encrypt", "-r", "alice.pub", "m.txt", "-o", "a.hpqc")
+        assert "suite:       X25519+ML-KEM-768/ChaCha20-Poly1305 (0x01)" in shown(
+            run(runner, "info", "a.hpqc")
+        )
+
+    @pytest.mark.parametrize("aead,suite_id", [("chacha20", "0x03"), ("aes", "0x04")])
+    def test_both_aeads_pair_with_the_bigger_kem(
+        self, workspace, runner, aead, suite_id
+    ) -> None:
+        run(runner, "keygen", "-o", "big", "--kem", "mlkem1024")
+        (workspace / "m.txt").write_bytes(b"category five")
+
+        run(runner, "encrypt", "-r", "big.pub", "m.txt", "-o", "b.hpqc", "--aead", aead)
+        assert f"({suite_id})" in shown(run(runner, "info", "b.hpqc"))
+
+        result = run(runner, "decrypt", "-k", "big.key", "b.hpqc", "-o", "back.txt")
+        assert result.exit_code == 0, shown(result)
+        assert (workspace / "back.txt").read_bytes() == b"category five"
+
+    def test_a_group_of_1024_recipients(self, workspace, runner) -> None:
+        for name in ("big1", "big2"):
+            run(runner, "keygen", "-o", name, "--kem", "mlkem1024")
+        (workspace / "m.txt").write_bytes(b"category five")
+
+        result = run(runner, "encrypt", "-r", "big1.pub", "-r", "big2.pub",
+                     "m.txt", "-o", "g.hpqc")
+        assert result.exit_code == 0, shown(result)
+        info = shown(run(runner, "info", "g.hpqc"))
+        assert "recipients:  2" in info
+        assert "kem ct:      1568 bytes x 2" in info
+
+        for name in ("big1", "big2"):
+            result = run(runner, "decrypt", "-k", f"{name}.key", "g.hpqc",
+                         "-o", f"{name}.txt")
+            assert (workspace / f"{name}.txt").read_bytes() == b"category five"
+
+    def test_mixing_key_types_in_one_file_is_refused(self, workspace, runner) -> None:
+        run(runner, "keygen", "-o", "big", "--kem", "mlkem1024")
+        (workspace / "m.txt").write_bytes(b"x")
+
+        result = run(runner, "encrypt", "-r", "big.pub", "-r", "alice.pub",
+                     "m.txt", "-o", "x.hpqc")
+        assert result.exit_code != 0
+        assert "one file has one KEM" in shown(result)
+        assert not (workspace / "x.hpqc").exists()
+
+    def test_the_wrong_kind_of_identity_is_refused(self, workspace, runner) -> None:
+        run(runner, "keygen", "-o", "big", "--kem", "mlkem1024")
+        (workspace / "m.txt").write_bytes(b"x")
+        run(runner, "encrypt", "-r", "big.pub", "m.txt", "-o", "b.hpqc")
+
+        result = runner.invoke(
+            cli, ["decrypt", "-k", "alice.key", "b.hpqc", "-o", "no.txt"]
+        )
+        assert result.exit_code != 0
+        assert "but the supplied identity is" in str(result.exception)
+        assert not (workspace / "no.txt").exists()
+
+    def test_a_1024_key_can_be_passphrase_protected(
+        self, workspace, runner, pwfile
+    ) -> None:
+        pw = pwfile("open sesame")
+        result = run(runner, "keygen", "-o", "big", "--kem", "mlkem1024",
+                     "--passphrase-file", pw, "--scrypt-log-n", "14")
+        assert result.exit_code == 0, shown(result)
+        (workspace / "m.txt").write_bytes(b"x")
+        run(runner, "encrypt", "-r", "big.pub", "m.txt", "-o", "b.hpqc")
+
+        result = run(runner, "decrypt", "-k", "big.key", "b.hpqc", "-o", "out.txt",
+                     "--passphrase-file", pw)
+        assert result.exit_code == 0, shown(result)
+        assert (workspace / "out.txt").read_bytes() == b"x"
+
+    def test_an_unknown_kem_name_is_refused_by_click(self, workspace, runner) -> None:
+        result = runner.invoke(cli, ["keygen", "-o", "x", "--kem", "mlkem512"])
+        assert result.exit_code != 0
+        assert "mlkem512" in shown(result)
+
+
+def test_info_on_a_missing_file_is_a_message_not_a_traceback(
+    workspace, runner
+) -> None:
+    """`info` stats the file for its size, and stat() on nothing is a crash.
+
+    It was one, briefly: the size was taken before the open, so a path that did
+    not exist reached os.stat instead of the error handling. Every other
+    command routes a bad path through click's `exists=True`; `info` accepts
+    anything so it can also read stdin, so this is where it has to be caught.
+    """
+    result = runner.invoke(cli, ["info", "nope.hpqc"])
+
+    assert result.exit_code != 0
+    assert "nope.hpqc" in shown(result)
+    assert "Traceback" not in shown(result)
+    assert not isinstance(result.exception, FileNotFoundError)
+
+
+def test_info_on_a_directory_is_a_message_too(workspace, runner) -> None:
+    result = runner.invoke(cli, ["info", "."])
+
+    assert result.exit_code != 0
+    assert "Traceback" not in shown(result)
+
+
+# --------------------------------------------------------------------------
+# Behaving like a filter
+# --------------------------------------------------------------------------
+
+
+def test_a_reader_that_stops_early_is_not_an_error(workspace, runner) -> None:
+    """`hpqc decrypt big.hpqc | head` must not fail, and must say nothing.
+
+    This one needs a real process and a real pipe: click's test runner has no
+    pipe to break. What it protects against is a silent failure -- click
+    intercepts EPIPE itself and exits 1 with nothing on stderr, so under
+    `set -o pipefail` a perfectly ordinary command fails a script for no
+    visible reason. Restoring SIGPIPE's default makes hpqc die the way `cat`
+    does instead.
+    """
+    import signal
+    import subprocess
+    import sys
+
+    plaintext = b"first line\n" + b"a" * (ONE_SHOT_LIMIT + 4096)
+    (workspace / "big.txt").write_bytes(plaintext)
+    result = run(runner, "encrypt", "-r", "alice.pub", "big.txt", "-o", "big.hpqc")
+    assert result.exit_code == 0, shown(result)
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "hpqc", "decrypt", "-k", "alice.key", "big.hpqc"],
+        cwd=workspace,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.returncode == 0 and proc.stdout == plaintext
+
+    # Now with a reader that leaves after one line.
+    head = subprocess.Popen(["head", "-1"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    writer = subprocess.Popen(
+        [sys.executable, "-m", "hpqc", "decrypt", "-k", "alice.key", "big.hpqc"],
+        cwd=workspace,
+        stdout=head.stdin,
+        stderr=subprocess.PIPE,
+    )
+    head.stdin.close()
+    assert head.communicate()[0] == b"first line\n"
+    stderr = writer.communicate()[1]
+    head.wait()
+
+    # Killed by SIGPIPE, exactly as `cat big | head` is -- not a silent exit 1.
+    assert writer.returncode == -signal.SIGPIPE, writer.returncode
+    assert stderr == b"", stderr

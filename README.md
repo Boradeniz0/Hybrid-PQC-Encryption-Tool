@@ -3,9 +3,10 @@
 [![CI](https://github.com/Boradeniz0/Hybrid-PQC-Encryption-Tool/actions/workflows/ci.yml/badge.svg)](https://github.com/Boradeniz0/Hybrid-PQC-Encryption-Tool/actions/workflows/ci.yml)
 
 A small command-line tool that encrypts files and messages to a public key
-using **X25519 + ML-KEM-768** together, derives one key from both with
+using an elliptic curve **and** ML-KEM together, derives one key from both with
 **HKDF-SHA256**, and seals the payload with an **AEAD**
-(ChaCha20-Poly1305 or AES-256-GCM). Sender authentication is optional and
+(ChaCha20-Poly1305 or AES-256-GCM). Two parameter sets: **X25519 + ML-KEM-768**
+by default, **X448 + ML-KEM-1024** on request. Sender authentication is optional and
 hybrid in the same way: **Ed25519 + ML-DSA-65**, both required. Files larger
 than a megabyte are encrypted as a chunked stream, so size is bounded by the
 disk rather than by memory. A file can be addressed to several recipients at
@@ -104,7 +105,8 @@ resolve at all.
 ## Usage
 
 ```
-hpqc keygen  [-o BASENAME] [--force] [-p | --passphrase-file F]
+hpqc keygen  [-o BASENAME] [--force] [--kem mlkem768|mlkem1024]
+                                         [-p | --passphrase-file F]
 hpqc signgen [-o BASENAME] [--force] [-p | --passphrase-file F]
 hpqc encrypt -r RECIPIENT.pub [-r ...] [INPUT] [-o OUT] [--aead chacha20|aes]
                                          [-s SIGNING.key] [--passphrase-file F]
@@ -592,6 +594,75 @@ but the count.
 Padding the list to a fixed size would hide that too, at the cost of a header
 sized for the largest group you ever send to.
 
+## Two hybrid KEMs
+
+| `--kem` | Diffie-Hellman | ML-KEM | NIST category | suite bytes |
+| --- | --- | --- | ---: | --- |
+| `mlkem768` (default) | X25519 | ML-KEM-768 | 3 | `0x01`, `0x02` |
+| `mlkem1024` | X448 | ML-KEM-1024 | 5 | `0x03`, `0x04` |
+
+```console
+$ hpqc keygen -o alice --kem mlkem1024
+private key: alice.key  (mode 0600 -- keep it secret)
+public key:  alice.pub   (share this)
+algorithms:  X448+ML-KEM-1024
+key id:      ee3ad63ca7aa1000
+```
+
+**The classical half moves with the post-quantum half.** Pairing ML-KEM-1024
+with X25519 would look like a stronger key and would not be one. The two halves
+are combined so an attacker must break *both*, which means the pair is as
+strong as its stronger half — so leaving the classical half at roughly 128 bits
+while raising the lattice half to category 5 buys nothing against the attacker
+the upgrade is meant for. X448 is what matches, and it costs 24 bytes of key
+and one more scalar multiplication.
+
+**`encrypt` has no `--kem`.** The KEM is not the sender's to choose: it is
+whatever the recipient's key already is. `--aead` names an AEAD, the recipient's
+key names a KEM, and the suite byte is where the two meet.
+
+**One file, one KEM.** A container carries one suite byte, so it cannot be
+addressed to an ML-KEM-768 recipient and an ML-KEM-1024 recipient at once:
+
+```console
+$ hpqc encrypt -r big.pub -r small.pub notes.txt -o notes.hpqc
+Error: small.pub is X25519+ML-KEM-768 but big.pub is X448+ML-KEM-1024;
+one file has one KEM, so these recipients need separate files
+```
+
+It *could* have been allowed — every stanza length-prefixes its own fields —
+but only by letting a prefix **select** how the rest is read instead of being
+checked against a value already known. That is the one thing this parser does
+not do anywhere else, and the convenience is not worth the exception.
+
+Which is the same reason the suite byte cannot be used to reinterpret a file.
+It arrives unauthenticated — nothing has verified a tag when the parser reads
+it — so relabelling a container fails on arithmetic, before a single key
+operation runs:
+
+```console
+$ printf '\x01' | dd of=big.hpqc bs=1 seek=5 count=1 conv=notrunc
+$ hpqc info big.hpqc
+error: ephemeral X25519 public key is 56 bytes, expected 32 here
+```
+
+The field is named after the suite the file *claims*, because that is all the
+parser has to go on — which is the point. It expected 32 bytes because byte 5
+said X25519, and found 56.
+
+**A key file says which it is, in one byte.** Type 1 is X25519 + ML-KEM-768;
+type 2 is X448 + ML-KEM-1024. That byte was introduced as a *format version*
+and never had a second value — and what a second parameter set needs it to say
+is which key this is, not which revision. So it is a key type now, and type 1
+is bit-for-bit what version 1 always was: every key file written before this
+change still reads, unchanged.
+
+The byte is not optional, either. A public key could be told apart by its
+length, but a private key stores the ML-KEM **seed**, which FIPS 203 fixes at
+64 bytes for every parameter set — so two private keys of different types
+differ only in their Diffie-Hellman half, and length alone cannot separate
+them.
+
 ## File format
 
 `.hpqc` containers are a header followed by a payload in one of two shapes.
@@ -606,11 +677,15 @@ All integers are big-endian.
 | 8 | 8 | recipient key id (truncated SHA-256) |
 | 16 | 16 | HKDF salt |
 | 32 | 12 | AEAD nonce (chunked: first 7 bytes are the STREAM prefix) |
-| 44 | 2 | length of the ephemeral X25519 public key (32) |
-| 46 | 32 | ephemeral X25519 public key |
-| 78 | 2 | length of the ML-KEM-768 ciphertext (1088) |
-| 80 | 1088 | ML-KEM-768 ciphertext |
+| 44 | 2 | length of the ephemeral DH public key (32, or 56) |
+| 46 | 32 | ephemeral DH public key |
+| 78 | 2 | length of the ML-KEM ciphertext (1088, or 1568) |
+| 80 | 1088 | ML-KEM ciphertext |
 | 1168 | … | payload |
+
+Offsets past 44 are those of suite `0x01`. Both lengths come from the suite
+byte, and a suite using X448 + ML-KEM-1024 makes them 56 and 1568, for a
+1672-byte header.
 
 With bit 1 clear the payload is one AEAD ciphertext followed by its 16-byte
 tag, and fixed overhead is **1184 bytes** per file whatever its size — 6549 if
@@ -766,7 +841,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-592 passed
+676 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -844,6 +919,19 @@ actually fails. Among them:
   succeed.
 - **A signature cannot cross between the two constructions.** A classic
   signature replayed into a listed container, and the reverse.
+- **The suite byte cannot reinterpret a container.** It arrives
+  unauthenticated and decides how every field after it is read, so a
+  relabelled file has to fail on arithmetic before a key operation runs — the
+  test asserts decapsulation is never reached, and asserts it *is* reached on
+  the untouched file so it cannot pass by never getting there. All 256 values
+  of the byte are tried against containers of both parameter sets.
+- **The KEM table is checked against the backend.** Every parser length is
+  looked up from one table copied out of FIPS 203; a typo there produces a
+  format that agrees with itself and with nothing else. The test generates a
+  key of each parameter set and asserts the real sizes match the table.
+- **A reader that stops early is not an error.** `hpqc decrypt big.hpqc | head`
+  runs as a real subprocess against a real pipe, and must die of SIGPIPE with
+  an empty stderr rather than exiting 1 in silence.
 - **The signature block is fuzzed separately.** Corrupting a finished signed
   container trips the AEAD tag first, so those mutations never reach the
   signature parser. Mutating the payload *before* sealing it does — and that is
@@ -993,6 +1081,34 @@ same was true of reordering the stanza fields on the wire. That is the whole
 argument for recording a derivation rather than a container — a container that
 stops opening tells you something changed, and never which thing.
 
+**A shell check that failed about one run in ten.** The CI smoke test is full
+of lines like `hpqc info f.hpqc | grep -q '^recipients:  3'`. `grep -q` exits at
+its first match, so if the writer still has a line to go it is killed by
+SIGPIPE — and under `set -o pipefail` that turns a check which *passed* into a
+failed script. It is a race, so it fails sometimes, which is exactly the shape
+of thing that gets rerun and forgotten. Worse is the same pattern inside an
+`if`: a SIGPIPE'd writer makes the status non-zero, the else branch runs, and a
+check for a leaked key id reports it as absent. Every one of them now runs the
+command, then greps the file it wrote.
+
+**`hpqc decrypt big.hpqc | head` exited 1 and said nothing.** Chasing the
+above, I found the real bug underneath it. Python ignores SIGPIPE and turns the
+failed write into `BrokenPipeError`; `run()` had a handler for exactly that,
+and it never ran, because click catches EPIPE first and calls `sys.exit(1)`
+after silencing the flush. So the most ordinary pipeline in the world failed,
+with an empty stderr and no explanation. Restoring SIGPIPE's default
+disposition at startup makes hpqc behave like `cat`: the write that has nowhere
+to go kills the process, the shell sees 141, and nothing is printed.
+
+**I put a traceback into `hpqc info` while tidying it up.** Reading a header
+from a stream meant taking the file's size from `stat()`, and I put the `stat()`
+one line above the `open()` instead of one line below. `hpqc info nope.hpqc`
+then raised `FileNotFoundError` instead of saying "cannot read nope.hpqc". Six
+hundred tests did not catch it, because `info` is the one command that accepts
+a path click cannot check with `exists=True` — it also reads stdin — and no
+test had ever given it a path that was not there. The CI smoke script found it
+within a minute of being run.
+
 **A domain-separation label that nothing behavioural pins.** hpqc gives the
 two signing constructions different labels, which is the standard hygiene. I
 went to check the tests caught a shared label and they did not — all 557 other
@@ -1039,6 +1155,8 @@ What it does **not** do, by design in v1:
   open it reveals which slot is yours to anyone who can measure it.
 - **Any recipient of an unsigned file can re-send it as if it came from you.**
   They hold the file key. Signing is the answer; an unsigned file has no answer.
+- **One KEM per file.** A container has one suite byte, so recipients using
+  different parameter sets need different files.
 - **Not audited.** This is a learning and portfolio project, written against
   the standards below. Read the code before trusting it with anything real.
 
@@ -1049,8 +1167,8 @@ What it does **not** do, by design in v1:
 - [x] Passphrase-wrapped private keys (scrypt + AEAD)
 - [x] Multiple recipients per file
 - [x] Signing to a recipient list (bind the container, not the recipient)
+- [x] ML-KEM-1024 suite (with X448, so both halves move together)
 - [ ] Signing a streamed file (a signature trailer over a rolling digest)
-- [ ] ML-KEM-1024 suite
 - [x] Known-answer test vectors checked into the repo
 
 ## References

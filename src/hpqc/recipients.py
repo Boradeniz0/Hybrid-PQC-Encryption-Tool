@@ -61,8 +61,7 @@ from cryptography.exceptions import InvalidTag
 
 from . import hybrid
 from .errors import WrongRecipientError
-from .hybrid import MLKEM768_CIPHERTEXT_LEN
-from .keys import X25519_KEY_LEN, PrivateKey, PublicKey
+from .keys import PrivateKey, PublicKey
 from .suites import Suite
 from .wire import U16, Reader
 
@@ -109,8 +108,8 @@ def wrapped_key_len(suite: Suite) -> int:
 def stanza_len(suite: Suite) -> int:
     """The exact size of one stanza on the wire, for header-size arithmetic."""
     return (
-        U16.size + X25519_KEY_LEN
-        + U16.size + MLKEM768_CIPHERTEXT_LEN
+        U16.size + suite.kem.dh_len
+        + U16.size + suite.kem.kem_ciphertext_len
         + U16.size + wrapped_key_len(suite)
     )
 
@@ -119,10 +118,10 @@ def read_stanza(reader: Reader, suite: Suite) -> Stanza:
     """Parse one stanza, checking every length against what the suite fixes."""
     return Stanza(
         ephemeral_public=reader.take_prefixed(
-            "ephemeral X25519 public key", X25519_KEY_LEN
+            f"ephemeral {suite.kem.dh_name} public key", suite.kem.dh_len
         ),
         kem_ciphertext=reader.take_prefixed(
-            "ML-KEM-768 ciphertext", MLKEM768_CIPHERTEXT_LEN
+            f"{suite.kem.kem_name} ciphertext", suite.kem.kem_ciphertext_len
         ),
         wrapped_key=reader.take_prefixed(
             "wrapped file key", wrapped_key_len(suite)

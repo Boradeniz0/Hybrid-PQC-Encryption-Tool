@@ -318,7 +318,7 @@ def test_a_low_order_recipient_key_is_rejected_cleanly(alice_pub, point) -> None
     """A malicious .pub file must not crash the sender either."""
     from hpqc.keys import PublicKey
 
-    hostile = PublicKey(x25519_bytes=point, mlkem_bytes=alice_pub.mlkem_bytes)
+    hostile = PublicKey(dh_bytes=point, kem_bytes=alice_pub.kem_bytes)
 
     with pytest.raises(FormatError, match="recipient X25519 public key"):
         encrypt(b"secret", hostile)

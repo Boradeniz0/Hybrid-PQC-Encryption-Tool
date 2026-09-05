@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 593 tests). This is
+The automated suite covers all of this and more (`pytest`, 676 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -330,7 +330,68 @@ signed.hpqc 8972
 
 5365 bytes of it, of which ML-DSA-65's signature alone is 3309.
 
-## 6. What has to fail
+## 6. The second hybrid KEM
+
+```console
+hpqc keygen -o big --kem mlkem1024
+hpqc info big.pub
+hpqc encrypt -r big.pub minutes.txt -o big.hpqc
+hpqc info big.hpqc | head -6
+```
+
+```
+algorithms:  X448+ML-KEM-1024
+algorithms: X448 + ML-KEM-1024
+suite:       X448+ML-KEM-1024/ChaCha20-Poly1305 (0x03)
+header:      1672 bytes (authenticated as AAD)
+kem ct:      1568 bytes
+```
+
+There is no `--kem` on `encrypt`: the recipient's key already decided, and
+`--aead` picks only the AEAD. The two meet at the suite byte.
+
+### The suite byte cannot reinterpret a file
+
+It says how every field after it is read, and it arrives unauthenticated. So
+relabelling a 1024 container as a 768 one has to fail on arithmetic, long
+before any key is touched:
+
+```console
+cp big.hpqc relabelled.hpqc
+printf '\x01' | dd of=relabelled.hpqc bs=1 seek=5 count=1 conv=notrunc status=none
+hpqc info relabelled.hpqc; echo "exit=$?"
+```
+
+```
+error: ephemeral X25519 public key is 56 bytes, expected 32 here
+exit=1
+```
+
+The field is named after the suite the file *claims*: byte 5 now says X25519,
+so the parser expected 32 bytes and found 56. That is all it has to go on, and
+it is enough.
+
+Compare that with the suite downgrade in the next section, which gets all the
+way to a tag failure: there the two suites have identical field sizes, so only
+the AEAD notices. Here the lengths disagree and the parser stops first.
+
+### One file, one KEM
+
+```console
+hpqc encrypt -r big.pub -r alice.pub minutes.txt -o x.hpqc; echo "exit=$?"
+hpqc decrypt -k alice.key big.hpqc -o /dev/null; echo "exit=$?"
+```
+
+```
+Error: alice.pub is X25519+ML-KEM-768 but big.pub is X448+ML-KEM-1024;
+one file has one KEM, so these recipients need separate files
+exit=1
+error: this file uses X448+ML-KEM-1024, but the supplied identity is
+X25519+ML-KEM-768
+exit=1
+```
+
+## 7. What has to fail
 
 This is the interesting part. Each of these must exit non-zero with a readable
 message — never a traceback.
@@ -375,10 +436,10 @@ what the file *claims*; nothing in it is trusted until the tag verifies. The
 suite byte is covered twice over — by the AEAD's associated data and by the HKDF
 transcript — so it cannot be used to steer a recipient onto a different cipher.
 
-## 7. The test suite
+## 8. The test suite
 
 ```console
-pytest -q                 # 593 passed
+pytest -q                 # 676 passed
 pytest -q -W error        # clean with warnings escalated to errors
 ```
 

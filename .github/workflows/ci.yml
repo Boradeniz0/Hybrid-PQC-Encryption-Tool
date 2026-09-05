@@ -42,6 +42,7 @@ jobs:
           python -c "import cryptography; print('cryptography', cryptography.__version__)"
           python -c "from cryptography.hazmat.backends.openssl.backend import backend; print(backend.openssl_version_text())"
           python -c "from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey; print('ML-KEM-768: available')"
+          python -c "from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM1024PrivateKey; print('ML-KEM-1024: available')"
           python -c "from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey; print('ML-DSA-65: available')"
 
       - name: Test
@@ -52,6 +53,12 @@ jobs:
         # a broken console-script entry point. This runs the real binary.
         run: |
           set -euo pipefail
+          # Run a command, then grep what it wrote -- never `cmd | grep -q`.
+          # grep -q exits at the first match, so a writer with more to say is
+          # killed by SIGPIPE, and under `set -o pipefail` that fails the whole
+          # script for a check that actually passed. It is a race, so it fails
+          # about one run in ten and looks like flakiness.
+          says() { local pattern="$1"; shift; "$@" > .says.txt; grep -q -- "$pattern" .says.txt; }
           work="$(mktemp -d)"
           cd "$work"
           hpqc keygen -o ci
@@ -75,7 +82,8 @@ jobs:
           echo "wrong identity rejected: ok"
           hpqc decrypt -k ci.key msg.hpqc -o /dev/null
           echo "output to a character device: ok"
-          printf 'piped\n' | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key | grep -qx piped
+          printf 'piped\n' | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key > piped.txt
+          grep -qx piped piped.txt
           echo "stdin/stdout pipeline: ok"
 
           hpqc signgen -o signer
@@ -84,8 +92,8 @@ jobs:
           hpqc decrypt -k ci.key signed.hpqc -o signed-out.txt --sender signer.pub
           cmp msg.txt signed-out.txt
           echo "signed round trip: ok"
-          hpqc info signed.hpqc | grep -q '^signed:      yes'
-          hpqc info msg.hpqc    | grep -q '^signed:      no'
+          says '^signed:      yes' hpqc info signed.hpqc
+          says '^signed:      no' hpqc info msg.hpqc
           echo "info reports the signed flag: ok"
           if hpqc decrypt -k ci.key signed.hpqc -o /dev/null --sender impostor.pub 2>err.txt; then
             echo "FAIL: verified against the wrong sender"; exit 1
@@ -109,8 +117,8 @@ jobs:
           printf 'correct horse battery staple' > pw
           printf 'a different passphrase' > pw2
           hpqc keygen -o locked --passphrase-file pw --scrypt-log-n 14
-          hpqc info locked.key | grep -q 'wrapped private key'
-          hpqc info locked.key | grep -q 'unavailable without the passphrase'
+          says 'wrapped private key' hpqc info locked.key
+          says 'unavailable without the passphrase' hpqc info locked.key
           echo "wrapped key described without the passphrase: ok"
           hpqc encrypt -r locked.pub msg.txt -o locked.hpqc
           hpqc decrypt -k locked.key locked.hpqc -o locked-out.txt --passphrase-file pw
@@ -142,8 +150,8 @@ jobs:
           # an ordinary small message is still written the way it always was.
           head -c 3000000 /dev/urandom > big.bin
           hpqc encrypt -r ci.pub big.bin -o big.hpqc
-          hpqc info big.hpqc | grep -q '^chunked:     yes'
-          hpqc info msg.hpqc | grep -q '^chunked:     no'
+          says '^chunked:     yes' hpqc info big.hpqc
+          says '^chunked:     no' hpqc info msg.hpqc
           echo "automatic chunking above the threshold: ok"
           hpqc decrypt -k ci.key big.hpqc -o big-out.bin
           cmp big.bin big-out.bin
@@ -166,8 +174,8 @@ jobs:
           echo "no partial plaintext left behind: ok"
 
           hpqc encrypt -r ci.pub big.bin -o big-signed.hpqc -s signer.key
-          hpqc info big-signed.hpqc | grep -q '^chunked:     no'
-          hpqc info big-signed.hpqc | grep -q '^signed:      yes'
+          says '^chunked:     no' hpqc info big-signed.hpqc
+          says '^signed:      yes' hpqc info big-signed.hpqc
           echo "signing a large file falls back to one-shot: ok"
 
           cat big.bin | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key > piped-big.bin
@@ -179,7 +187,7 @@ jobs:
           hpqc keygen -o second
           hpqc keygen -o third
           hpqc encrypt -r ci.pub -r second.pub -r third.pub msg.txt -o group.hpqc
-          hpqc info group.hpqc | grep -q '^recipients:  3 (the file does not name them)'
+          says '^recipients:  3 (the file does not name them)' hpqc info group.hpqc
           for who in ci second third; do
             hpqc decrypt -k "$who.key" group.hpqc -o "got-$who.txt"
             cmp msg.txt "got-$who.txt"
@@ -187,18 +195,22 @@ jobs:
           echo "three recipients, three round trips: ok"
           # Hex, not grep: a key id is binary and would never match as text.
           # od rather than xxd, which is not guaranteed to be installed.
-          tohex() { od -An -v -tx1 "$1" | tr -d ' \n'; }
+          tohex() { od -An -v -tx1 "$1" | tr -d ' \n' > hex.txt; }
+          key_id() { hpqc info "$1" > who.txt; sed -n 's/^key id: *//p' who.txt; }
+          tohex group.hpqc
           for who in ci second third; do
-            id="$(hpqc info "$who.pub" | sed -n 's/^key id: *//p')"
-            if tohex group.hpqc | grep -q "$id"; then
+            # An `if` on a pipeline hides a SIGPIPE'd writer even better than
+            # `set -e` does: the status goes non-zero, the else branch runs,
+            # and a leaked key id reports itself as absent.
+            if grep -q "$(key_id "$who.pub")" hex.txt; then
               echo "FAIL: $who's key id appears in the container"; exit 1
             fi
           done
           echo "no recipient is named in the file: ok"
           # The same search against the shape that is supposed to contain it,
           # so a broken search cannot make the check above pass for free.
-          ci_id="$(hpqc info ci.pub | sed -n 's/^key id: *//p')"
-          tohex msg.hpqc | grep -q "$ci_id"
+          tohex msg.hpqc
+          grep -q "$(key_id ci.pub)" hex.txt
           echo "the single-recipient shape does name its recipient: ok"
 
           hpqc keygen -o outsider
@@ -220,7 +232,7 @@ jobs:
           echo "signing a chunked list refused: ok"
 
           hpqc encrypt -r ci.pub --hide-recipients msg.txt -o hidden.hpqc
-          hpqc info hidden.hpqc | grep -q '^recipients:  1'
+          says '^recipients:  1' hpqc info hidden.hpqc
           hpqc decrypt -k ci.key hidden.hpqc -o hidden-out.txt
           cmp msg.txt hidden-out.txt
           echo "one hidden recipient: ok"
@@ -231,16 +243,16 @@ jobs:
           cmp big.bin group-big.bin
           echo "chunked + several recipients through a pipe: ok"
           hpqc encrypt -r ci.pub -r second.pub big.bin -o group-big.hpqc
-          hpqc info group-big.hpqc | grep -q '^chunked:     yes'
-          hpqc info group-big.hpqc | grep -q '^recipients:  2'
+          says '^chunked:     yes' hpqc info group-big.hpqc
+          says '^recipients:  2' hpqc info group-big.hpqc
           echo "info reports both shapes at once: ok"
 
           # Signing to a recipient list. There is no recipient to bind, so the
           # header is bound instead -- every recipient verifies one signature.
           hpqc encrypt -r ci.pub -r second.pub -r third.pub msg.txt \
             -o signed-group.hpqc -s signer.key
-          hpqc info signed-group.hpqc | grep -q '^recipients:  3'
-          hpqc info signed-group.hpqc | grep -q '^signed:      yes'
+          says '^recipients:  3' hpqc info signed-group.hpqc
+          says '^signed:      yes' hpqc info signed-group.hpqc
           for who in ci second third; do
             hpqc decrypt -k "$who.key" signed-group.hpqc -o "sg-$who.txt" \
               --sender signer.pub 2>"sg-$who.err"
@@ -260,8 +272,50 @@ jobs:
           grep -q 'recipient slot' err.txt
           echo "outsider rejected on a signed group file: ok"
           # The signer is inside the AEAD, so a header-only tool cannot see it.
-          signer_id="$(hpqc info signer.pub | sed -n 's/^key id: *//p')"
-          if tohex signed-group.hpqc | grep -q "$signer_id"; then
+          tohex signed-group.hpqc
+          if grep -q "$(key_id signer.pub)" hex.txt; then
             echo "FAIL: the signer's key id is visible in the container"; exit 1
           fi
           echo "the signer stays confidential: ok"
+
+          # The second hybrid KEM. The classical half moves with it, so this
+          # is X448 + ML-KEM-1024 rather than X25519 + ML-KEM-1024.
+          says 'algorithms:  X448+ML-KEM-1024' hpqc keygen -o big --kem mlkem1024
+          hpqc keygen -o big2 --kem mlkem1024
+          says '^algorithms: X448 + ML-KEM-1024' hpqc info big.pub
+          says '^algorithms: X448 + ML-KEM-1024' hpqc info big.key
+          says '^algorithms: X25519 + ML-KEM-768' hpqc info ci.pub
+          echo "keygen --kem: ok"
+          for aead in chacha20 aes; do
+            hpqc encrypt -r big.pub msg.txt -o "big-$aead.hpqc" --aead "$aead"
+            hpqc decrypt -k big.key "big-$aead.hpqc" -o "big-$aead.txt"
+            cmp msg.txt "big-$aead.txt"
+          done
+          says 'X448+ML-KEM-1024/ChaCha20-Poly1305 (0x03)' hpqc info big-chacha20.hpqc
+          says 'X448+ML-KEM-1024/AES-256-GCM (0x04)' hpqc info big-aes.hpqc
+          echo "both AEADs at ML-KEM-1024: ok"
+          hpqc encrypt -r big.pub -r big2.pub msg.txt -o big-group.hpqc -s signer.key
+          says '^kem ct:      1568 bytes x 2' hpqc info big-group.hpqc
+          hpqc decrypt -k big2.key big-group.hpqc -o bg.txt --sender signer.pub
+          cmp msg.txt bg.txt
+          echo "signed 1024 group: ok"
+          # The recipient's key decides the KEM, so one file cannot have two.
+          if hpqc encrypt -r big.pub -r ci.pub msg.txt -o x.hpqc 2>err.txt; then
+            echo "FAIL: mixed key types in one file"; exit 1
+          fi
+          grep -q 'one file has one KEM' err.txt
+          echo "mixed key types refused: ok"
+          if hpqc decrypt -k ci.key big-chacha20.hpqc -o /dev/null 2>err.txt; then
+            echo "FAIL: a 768 identity opened a 1024 file"; exit 1
+          fi
+          grep -q 'but the supplied identity is' err.txt
+          echo "wrong key type refused: ok"
+          # The suite byte says how to read everything after it and arrives
+          # unauthenticated; relabelling must fail on arithmetic, not on a tag.
+          cp big-chacha20.hpqc relabelled.hpqc
+          printf '\x01' | dd of=relabelled.hpqc bs=1 seek=5 count=1 conv=notrunc status=none
+          if hpqc info relabelled.hpqc 2>err.txt; then
+            echo "FAIL: a relabelled container parsed"; exit 1
+          fi
+          grep -q 'expected 32 here' err.txt
+          echo "the suite byte cannot reinterpret a container: ok"

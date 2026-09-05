@@ -1,4 +1,4 @@
-"""Post-quantum backend probing: ML-KEM-768 and ML-DSA-65.
+"""Post-quantum backend probing: ML-KEM and ML-DSA-65.
 
 Both live in `cryptography` 46+ and both need the wheel to have been built
 against OpenSSL 3.5 or newer. Either failure is common enough that it deserves
@@ -25,10 +25,14 @@ try:
     from cryptography.hazmat.primitives.asymmetric.mlkem import (  # type: ignore[import-not-found]
         MLKEM768PrivateKey,
         MLKEM768PublicKey,
+        MLKEM1024PrivateKey,
+        MLKEM1024PublicKey,
     )
 except Exception as exc:  # pragma: no cover - depends on the installed stack
     MLKEM768PrivateKey = None  # type: ignore[assignment,misc]
     MLKEM768PublicKey = None  # type: ignore[assignment,misc]
+    MLKEM1024PrivateKey = None  # type: ignore[assignment,misc]
+    MLKEM1024PublicKey = None  # type: ignore[assignment,misc]
     _MLKEM_IMPORT_ERROR = exc
 
 try:
@@ -52,11 +56,15 @@ def _help(algorithm: str) -> str:
     )
 
 
-def require_mlkem() -> None:
-    """Raise BackendError unless ML-KEM-768 can be imported."""
+def require_mlkem(algorithm: str = "ML-KEM-768") -> None:
+    """Raise BackendError unless ML-KEM can be imported.
+
+    Both parameter sets live in the same module, so one import decides both;
+    `algorithm` only picks which name the message says is missing.
+    """
     if MLKEM768PrivateKey is None:
         raise BackendError(
-            f"{_help('ML-KEM-768')}\n\nUnderlying import error: {_MLKEM_IMPORT_ERROR}"
+            f"{_help(algorithm)}\n\nUnderlying import error: {_MLKEM_IMPORT_ERROR}"
         )
 
 

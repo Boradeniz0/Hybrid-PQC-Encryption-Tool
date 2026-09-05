@@ -131,8 +131,8 @@ def signed_message(
             bytes([suite.id]),
             sender.ed25519_bytes,
             sender.mldsa_bytes,
-            recipient.x25519_bytes,
-            recipient.mlkem_bytes,
+            recipient.dh_bytes,
+            recipient.kem_bytes,
             plaintext,
         )
     )

@@ -38,6 +38,7 @@ from helpers import seal  # noqa: E402
 
 from hpqc import (  # noqa: E402
     hybrid,
+    kems,
     recipients,
     signing,
     streaming,
@@ -595,6 +596,154 @@ def build_v1_signed_recipients() -> dict:
     return data
 
 
+def build_v1_mlkem1024() -> dict:
+    """The second hybrid KEM: X448 + ML-KEM-1024, suites 0x03 and 0x04.
+
+    Four things are recorded, and the first two are the ones a container cannot
+    stand in for.
+
+    * `kem` -- the parameter set table itself. Every length the container
+      parser checks is looked up from it, so a typo there would produce a
+      format that agrees with itself and with nothing else. Freezing the
+      numbers is the only way a self-consistent mistake gets caught.
+
+    * `derivations` -- the derived key for fixed inputs under each suite. The
+      transcript now covers two variable-length fields whose sizes come from
+      the suite byte; drop the suite byte from it, or reorder the fields, and
+      a recorded container still round-trips.
+
+    * `keys` -- one identity and its public key. This pins the blob layout:
+      one type byte, a 56-byte X448 key, a 1568-byte ML-KEM key, and a private
+      blob whose 64-byte seed is exactly as long as ML-KEM-768's -- which is
+      why the type byte has to exist at all.
+
+    * `containers` -- every shape at this parameter set: one recipient, a
+      recipient list, a signed list, and a chunked file.
+    """
+    kem = kems.X448_MLKEM1024
+    identities = [PrivateKey.generate(kem) for _ in range(2)]
+    publics = [k.public_key() for k in identities]
+    stranger = PrivateKey.generate(kem)
+    small = PrivateKey.generate()
+    signer = SigningPrivateKey.generate()
+
+    suite_ids = {
+        "chacha20": suites.CHACHA20_POLY1305_1024,
+        "aes": suites.AES_256_GCM_1024,
+    }
+
+    data = {
+        "note": (
+            "Frozen known-answer vectors for hpqc's X448 + ML-KEM-1024 hybrid "
+            "KEM. " + TEST_KEY_WARNING
+        ),
+        "format_version": 1,
+        "kem": {
+            "id": kem.id,
+            "name": kem.name,
+            "dh_name": kem.dh_name,
+            "dh_len": kem.dh_len,
+            "dh_shared_len": kem.dh_shared_len,
+            "kem_name": kem.kem_name,
+            "kem_public_len": kem.kem_public_len,
+            "kem_ciphertext_len": kem.kem_ciphertext_len,
+            "kem_seed_len": kems.KEM_SEED_LEN,
+            "ikm_len": kem.ikm_len,
+            "suite_ids": {n: s.id for n, s in sorted(suite_ids.items())},
+            "header_len": 32 + 12 + 2 + kem.dh_len + 2 + kem.kem_ciphertext_len,
+            "stanza_len": recipients.stanza_len(suites.CHACHA20_POLY1305_1024),
+        },
+        "keys": {
+            "identity": identities[0].encode(),
+            "public": publics[0].encode(),
+            "key_id": publics[0].key_id_hex,
+            "public_blob": publics[0].to_bytes().hex(),
+            "private_blob": identities[0].to_bytes().hex(),
+            # A 768 identity, to prove the two cannot be confused for each other.
+            "other_kem_identity": small.encode(),
+        },
+        "identities": [k.encode() for k in identities],
+        "publics": [p.encode() for p in publics],
+        "stranger": stranger.encode(),
+        "signer": signer.encode(),
+        "signer_public": signer.public_key().encode(),
+        "derivations": [],
+        "containers": [],
+    }
+
+    plaintext = b"hpqc ML-KEM-1024 test vector v1\n"
+
+    for cli_name, suite in sorted(suite_ids.items()):
+        data["containers"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "shape": "one recipient",
+            "recipients": 1,
+            "plaintext": plaintext.hex(),
+            "container": encrypt(plaintext, publics[0], suite).hex(),
+        })
+        data["containers"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "shape": "recipient list",
+            "recipients": 2,
+            "plaintext": plaintext.hex(),
+            "container": encrypt_many(
+                plaintext, publics, suite=suite
+            ).hex(),
+        })
+        data["containers"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "shape": "signed recipient list",
+            "recipients": 2,
+            "signed": True,
+            "plaintext": plaintext.hex(),
+            "container": encrypt_many(
+                plaintext, publics, suite=suite, sender=signer
+            ).hex(),
+        })
+
+        ikm = _filler(b"hpqc-vector-1024-ikm", kem.ikm_len)
+        salt = _filler(b"hpqc-vector-1024-salt", hybrid.SALT_LEN)
+        epk = _filler(b"hpqc-vector-1024-epk", kem.dh_len)
+        kem_ct = _filler(b"hpqc-vector-1024-kemct", kem.kem_ciphertext_len)
+        row = {
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "ikm": ikm.hex(),
+            "salt": salt.hex(),
+            "ephemeral_public": epk.hex(),
+            "kem_ciphertext": kem_ct.hex(),
+        }
+        for label_name, label in (
+            ("payload", hybrid.HKDF_LABEL),
+            ("wrap", hybrid.WRAP_LABEL),
+        ):
+            row[f"{label_name}_key"] = hybrid.derive_key(
+                ikm=ikm, salt=salt, suite=suite,
+                ephemeral_public=epk, kem_ciphertext=kem_ct,
+                recipient=publics[0], label=label,
+            ).hex()
+        data["derivations"].append(row)
+
+    chunked = _filler(b"hpqc-vector-1024-chunked", streaming.CHUNK_SIZE + 1)
+    sink = io.BytesIO()
+    encrypt_stream_many(
+        io.BytesIO(chunked), sink, publics, suite=suites.CHACHA20_POLY1305_1024
+    )
+    data["chunked_container"] = {
+        "suite": "chacha20",
+        "recipients": 2,
+        "chunks": 2,
+        "plaintext_len": len(chunked),
+        "plaintext_sha256": hashlib.sha256(chunked).hexdigest(),
+        "container": sink.getvalue().hex(),
+    }
+
+    return data
+
+
 BUILDERS = {
     "v1.json": build_v1,
     "v1-signed.json": build_v1_signed,
@@ -602,6 +751,7 @@ BUILDERS = {
     "v1-chunked.json": build_v1_chunked,
     "v1-recipients.json": build_v1_recipients,
     "v1-signed-recipients.json": build_v1_signed_recipients,
+    "v1-mlkem1024.json": build_v1_mlkem1024,
 }
 
 

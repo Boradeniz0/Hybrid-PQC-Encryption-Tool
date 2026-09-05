@@ -1,10 +1,14 @@
 """hpqc -- hybrid post-quantum encryption for files and messages.
 
-Key agreement is X25519 (classical ECDH) combined with ML-KEM-768 (FIPS 203).
-Both shared secrets feed a single HKDF-SHA256 extraction, and the resulting key
-drives an AEAD. Breaking the file requires breaking *both* primitives, so it
-stays safe against a classical attacker who breaks ML-KEM and against a
-quantum attacker who breaks X25519.
+Key agreement is an elliptic-curve Diffie-Hellman combined with ML-KEM
+(FIPS 203). Both shared secrets feed a single HKDF-SHA256 extraction, and the
+resulting key drives an AEAD. Breaking the file requires breaking *both*
+primitives, so it stays safe against a classical attacker who breaks ML-KEM and
+against a quantum attacker who breaks the elliptic curve.
+
+Two parameter sets: X25519 with ML-KEM-768 (the default, NIST category 3) and
+X448 with ML-KEM-1024 (category 5). The classical half moves with the
+post-quantum half, because raising only one of them raises nothing.
 
 Sender authentication is optional and hybrid in the same way: Ed25519 with
 ML-DSA-65 (FIPS 204), both required, signed before encryption so that who
@@ -26,6 +30,6 @@ and not who they are. Signing such a file binds the header itself rather than a
 recipient, because there is no recipient in it to bind.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = ["__version__"]

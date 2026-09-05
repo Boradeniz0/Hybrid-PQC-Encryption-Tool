@@ -12,11 +12,14 @@ Byte layout (all integers big-endian):
     16      16     HKDF salt
     32      12     AEAD nonce  (suite.nonce_len); in chunked mode the
                        first 7 bytes are the STREAM nonce prefix
-    44      2      length of the ephemeral X25519 public key (32)
-    46      32     ephemeral X25519 public key
-    78      2      length of the ML-KEM-768 ciphertext (1088)
-    80      1088   ML-KEM-768 ciphertext
+    44      2      length of the ephemeral DH public key (32, or 56)
+    46      32     ephemeral DH public key
+    78      2      length of the ML-KEM ciphertext (1088, or 1568)
+    80      1088   ML-KEM ciphertext
     1168    ...    AEAD ciphertext || 16-byte tag
+
+    (offsets past 44 are those of suite 0x01; the two lengths come from the
+     suite byte, and a suite using X448 + ML-KEM-1024 makes them 56 and 1568)
 
 With bit 2 set the file has more than one recipient (or one it declines to
 name), and everything from offset 44 is replaced by a list:
@@ -37,8 +40,12 @@ Two properties matter more than the exact offsets:
   ML-KEM ciphertext, retarget the key id -- the tag check fails. Nothing in the
   header is trusted before the tag is verified.
 
-* **Variable-size fields are length-prefixed.** v1 only ever emits 32 and 1088,
-  but a future ML-KEM-1024 suite drops in without a parser change.
+* **Variable-size fields are length-prefixed, and the prefix is checked rather
+  than believed.** Every length is looked up from the suite byte and the
+  prefix must match it. That is what let ML-KEM-1024 arrive as two rows in
+  suites.py rather than as a branch here -- and it is also why a container has
+  exactly one KEM: a prefix that *selected* the parse instead of confirming it
+  would be a length trusted before anything is authenticated.
 
 * **The header's length can depend on its own contents, and is still bounded.**
   A recipient list makes the header variable-length for the first time. The
@@ -93,10 +100,9 @@ from .errors import (
     TruncatedError,
     WrongRecipientError,
 )
-from .hybrid import MLKEM768_CIPHERTEXT_LEN, SALT_LEN
+from .hybrid import SALT_LEN
 from .keys import (
     KEY_ID_LEN,
-    X25519_KEY_LEN,
     PrivateKey,
     PublicKey,
     SigningPrivateKey,
@@ -291,10 +297,10 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
         )
     else:
         ephemeral_public = reader.take_prefixed(
-            "ephemeral X25519 public key", X25519_KEY_LEN
+            f"ephemeral {suite.kem.dh_name} public key", suite.kem.dh_len
         )
         kem_ciphertext = reader.take_prefixed(
-            "ML-KEM-768 ciphertext", MLKEM768_CIPHERTEXT_LEN
+            f"{suite.kem.kem_name} ciphertext", suite.kem.kem_ciphertext_len
         )
 
     header = Header(
@@ -414,6 +420,21 @@ def _recipient_flags(to: Sequence[PublicKey], hide_recipients: bool) -> int:
     return FLAG_RECIPIENTS if len(to) > 1 or hide_recipients else FLAGS_NONE
 
 
+def _check_suite(to: Sequence[PublicKey], suite: Suite) -> None:
+    """Every recipient's key must be the KEM the suite names.
+
+    A container carries one suite byte, so it carries one KEM. Mixing key types
+    in one file is refused here rather than half-supported: see suites.py.
+    """
+    wrong = [r for r in to if r.kem.id != suite.kem.id]
+    if wrong:
+        raise ValueError(
+            f"suite {suite.name} needs {suite.kem.name} recipients, but "
+            f"{len(wrong)} of {len(to)} " + ("is", "are")[len(wrong) > 1] + " "
+            + ", ".join(sorted({r.kem.name for r in wrong}))
+        )
+
+
 def _seal_setup(
     to: Sequence[PublicKey], suite: Suite, flags: int
 ) -> Tuple[Header, bytes, bytes]:
@@ -430,6 +451,7 @@ def _seal_setup(
     encapsulations, so the payload key is random and each recipient gets a
     sealed copy of it. See recipients.py.
     """
+    _check_suite(to, suite)
     salt = os.urandom(SALT_LEN)
     # The payload key is unique per file (fresh ephemeral X25519 key, fresh
     # ML-KEM encapsulation, fresh salt -- or, in the list shape, 32 fresh
@@ -546,6 +568,12 @@ def _open_setup(
     two copies of that would only agree until one of them was edited.
     """
     recipient = identity.public_key()
+
+    if recipient.kem.id != header.suite.kem.id:
+        raise WrongRecipientError(
+            f"this file uses {header.suite.kem.name}, but the supplied "
+            f"identity is {recipient.kem.name}"
+        )
 
     if header.multi:
         # No key id to check against: the stanzas name nobody, so the only way

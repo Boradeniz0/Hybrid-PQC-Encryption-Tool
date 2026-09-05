@@ -44,7 +44,7 @@ from pathlib import Path
 import pytest
 
 from hpqc import container as container_module
-from hpqc import hybrid, recipients, signing, streaming, suites, wrapping
+from hpqc import hybrid, kems, recipients, signing, streaming, suites, wrapping
 from hpqc.container import (
     FLAG_CHUNKED,
     FLAG_RECIPIENTS,
@@ -75,6 +75,7 @@ WRAPPED = _load("v1-wrapped.json")
 CHUNKED = _load("v1-chunked.json")
 RECIPIENTS = _load("v1-recipients.json")
 SIGNED_RECIPIENTS = _load("v1-signed-recipients.json")
+MLKEM1024 = _load("v1-mlkem1024.json")
 
 
 @pytest.fixture(scope="module")
@@ -839,3 +840,163 @@ def test_the_forwarded_vector_is_a_real_container(signed_list_identities) -> Non
     assert payload.endswith(
         bytes.fromhex(SIGNED_RECIPIENTS["containers"][0]["plaintext"])
     )
+
+
+# --------------------------------------------------------------------------
+# The second hybrid KEM
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def big_identities():
+    return [PrivateKey.decode(t) for t in MLKEM1024["identities"]]
+
+
+def test_the_1024_vectors_target_this_format() -> None:
+    assert MLKEM1024["format_version"] == FORMAT_VERSION
+
+
+def test_the_kem_table_has_not_changed() -> None:
+    """The numbers every parser looks up, frozen against a self-consistent typo.
+
+    Get one of these wrong and hpqc still encrypts and decrypts perfectly --
+    with itself, and with nothing else that implements FIPS 203.
+    """
+    recorded = MLKEM1024["kem"]
+    kem = kems.by_id(recorded["id"])
+
+    assert kem.name == recorded["name"]
+    assert kem.dh_name == recorded["dh_name"]
+    assert kem.dh_len == recorded["dh_len"]
+    assert kem.dh_shared_len == recorded["dh_shared_len"]
+    assert kem.kem_name == recorded["kem_name"]
+    assert kem.kem_public_len == recorded["kem_public_len"]
+    assert kem.kem_ciphertext_len == recorded["kem_ciphertext_len"]
+    assert kems.KEM_SEED_LEN == recorded["kem_seed_len"]
+    assert kem.ikm_len == recorded["ikm_len"]
+
+    for name, suite_id in recorded["suite_ids"].items():
+        assert suites.by_id(suite_id).kem is kem
+        assert suites.by_id(suite_id).aead_name == suites.BY_CLI_NAME[name].aead_name
+
+    assert recipients.stanza_len(suites.by_id(3)) == recorded["stanza_len"]
+
+
+def test_a_recorded_1024_key_still_decodes() -> None:
+    """The blob layout: one type byte, then two halves of recorded length.
+
+    The private blob is the reason the type byte exists. Its ML-KEM seed is 64
+    bytes for every parameter set, so a 768 and a 1024 private key differ only
+    by their DH half -- length alone cannot tell them apart.
+    """
+    recorded = MLKEM1024["keys"]
+    identity = PrivateKey.decode(recorded["identity"])
+    public = PublicKey.decode(recorded["public"])
+
+    assert identity.public_key() == public
+    assert public.key_id_hex == recorded["key_id"]
+    assert public.to_bytes().hex() == recorded["public_blob"]
+    assert identity.to_bytes().hex() == recorded["private_blob"]
+    assert identity.kem is kems.X448_MLKEM1024
+
+    other = PrivateKey.decode(recorded["other_kem_identity"])
+    assert other.kem is kems.X25519_MLKEM768
+    assert other.to_bytes()[0] != identity.to_bytes()[0]
+    assert len(other.to_bytes()) != len(identity.to_bytes())
+
+
+@pytest.mark.parametrize(
+    "vector", MLKEM1024["derivations"], ids=[v["suite"] for v in MLKEM1024["derivations"]]
+)
+def test_the_1024_derivations_are_unchanged(vector) -> None:
+    suite = suites.by_id(vector["suite_id"])
+    public = PublicKey.decode(MLKEM1024["publics"][0])
+    args = dict(
+        ikm=bytes.fromhex(vector["ikm"]),
+        salt=bytes.fromhex(vector["salt"]),
+        suite=suite,
+        ephemeral_public=bytes.fromhex(vector["ephemeral_public"]),
+        kem_ciphertext=bytes.fromhex(vector["kem_ciphertext"]),
+        recipient=public,
+    )
+    assert hybrid.derive_key(**args, label=hybrid.HKDF_LABEL).hex() == vector[
+        "payload_key"
+    ]
+    assert hybrid.derive_key(**args, label=hybrid.WRAP_LABEL).hex() == vector[
+        "wrap_key"
+    ]
+
+
+@pytest.mark.parametrize(
+    "vector",
+    MLKEM1024["containers"],
+    ids=[f"{v['suite']}-{v['shape'].replace(' ', '-')}" for v in MLKEM1024["containers"]],
+)
+class TestRecorded1024Containers:
+    def test_it_still_decrypts(self, vector, big_identities) -> None:
+        blob = bytes.fromhex(vector["container"])
+        for identity in big_identities[: vector["recipients"]]:
+            assert decrypt(blob, identity) == bytes.fromhex(vector["plaintext"])
+
+    def test_its_header_still_parses_as_recorded(self, vector) -> None:
+        header, header_bytes, _ = parse_header(bytes.fromhex(vector["container"]))
+        assert header.suite.id == vector["suite_id"]
+        assert header.suite.kem is kems.X448_MLKEM1024
+        assert header.recipient_count == vector["recipients"]
+        assert header.signed == vector.get("signed", False)
+        if vector["recipients"] == 1 and not header.multi:
+            assert len(header_bytes) == MLKEM1024["kem"]["header_len"]
+
+    def test_a_stranger_still_cannot(self, vector) -> None:
+        stranger = PrivateKey.decode(MLKEM1024["stranger"])
+        with pytest.raises(HpqcError):
+            decrypt(bytes.fromhex(vector["container"]), stranger)
+
+    def test_a_768_identity_still_cannot(self, vector) -> None:
+        small = PrivateKey.decode(MLKEM1024["keys"]["other_kem_identity"])
+        with pytest.raises(WrongRecipientError, match="but the supplied identity is"):
+            decrypt(bytes.fromhex(vector["container"]), small)
+
+    def test_relabelling_it_as_the_smaller_kem_still_fails(self, vector) -> None:
+        """The suite byte cannot reinterpret a recorded container's fields."""
+        blob = bytearray(bytes.fromhex(vector["container"]))
+        blob[5] = vector["suite_id"] - 2  # 0x03 -> 0x01, 0x04 -> 0x02
+        with pytest.raises(HpqcError, match="expected 32 here"):
+            parse_header(bytes(blob))
+
+
+SIGNED_1024 = [v for v in MLKEM1024["containers"] if v.get("signed")]
+
+
+@pytest.mark.parametrize(
+    "vector", SIGNED_1024, ids=[v["suite"] for v in SIGNED_1024]
+)
+def test_a_recorded_1024_signature_still_verifies(vector, big_identities) -> None:
+    signer = SigningPublicKey.decode(MLKEM1024["signer_public"])
+    for identity in big_identities[: vector["recipients"]]:
+        opened = open_container(bytes.fromhex(vector["container"]), identity, signer)
+        assert opened.verified and opened.signer == signer
+
+
+def test_the_recorded_1024_chunked_container_still_opens(big_identities) -> None:
+    vector = MLKEM1024["chunked_container"]
+    blob = bytes.fromhex(vector["container"])
+
+    header, _, _ = parse_header(blob)
+    assert header.chunked and header.multi
+    assert header.suite.kem is kems.X448_MLKEM1024
+
+    for identity in big_identities[: vector["recipients"]]:
+        sink = io.BytesIO()
+        opened = decrypt_stream(io.BytesIO(blob), sink, identity)
+        assert opened.chunks == vector["chunks"]
+        assert hashlib.sha256(sink.getvalue()).hexdigest() == vector[
+            "plaintext_sha256"
+        ]
+
+    with pytest.raises(HpqcError):
+        decrypt_stream(
+            io.BytesIO(blob[: -streaming.WIRE_CHUNK_SIZE]),
+            io.BytesIO(),
+            big_identities[0],
+        )

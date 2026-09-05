@@ -377,3 +377,73 @@ def test_a_mutated_signature_block_in_a_listed_container_never_verifies(
             )
         else:
             pytest.fail("a mutated signature block verified successfully")
+
+
+def test_random_corruption_of_a_1024_container_never_escapes() -> None:
+    """The same two properties over the second parameter set.
+
+    Four lengths change at once between the two KEMs, and every one of them is
+    read from a prefix the file supplies. Fuzzing only the first parameter set
+    would leave the arithmetic that reads the second entirely untested.
+    """
+    from hpqc import kems, suites
+
+    identity = PrivateKey.generate(kems.X448_MLKEM1024)
+    blob = encrypt(
+        b"the quick brown fox" * 10,
+        identity.public_key(),
+        suites.CHACHA20_POLY1305_1024,
+    )
+    rng = random.Random(SEED + 8)
+
+    for _ in range(ITERATIONS):
+        corrupted = _mutate(rng, blob)
+        if corrupted == blob:
+            continue
+        try:
+            decrypt(corrupted, identity)
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"{type(exc).__name__} escaped the parser: {exc}\n"
+                f"input prefix: {corrupted[:48].hex()}"
+            )
+        else:
+            pytest.fail("a corrupted container decrypted successfully")
+
+
+def test_every_suite_byte_against_every_container(alice, alice_pub) -> None:
+    """All 256 values of the byte that decides how the rest is read.
+
+    It arrives unauthenticated -- nothing has checked a tag when the parser
+    reaches it -- so every value has to be either the right one or a clean
+    error, on containers of both parameter sets and both payload shapes.
+    """
+    from hpqc import container as container_module
+    from hpqc import kems, suites
+
+    big = PrivateKey.generate(kems.X448_MLKEM1024)
+    cases = [
+        (encrypt(b"small", alice_pub), alice, suites.CHACHA20_POLY1305.id),
+        (
+            encrypt(b"big", big.public_key(), suites.CHACHA20_POLY1305_1024),
+            big,
+            suites.CHACHA20_POLY1305_1024.id,
+        ),
+        (
+            container_module.encrypt_many(b"listed", [alice_pub, PrivateKey.generate().public_key()]),
+            alice,
+            suites.CHACHA20_POLY1305.id,
+        ),
+    ]
+
+    for blob, identity, real in cases:
+        for value in range(256):
+            doctored = bytearray(blob)
+            doctored[5] = value
+            if value == real:
+                assert decrypt(bytes(doctored), identity)
+                continue
+            with pytest.raises(HpqcError):
+                decrypt(bytes(doctored), identity)

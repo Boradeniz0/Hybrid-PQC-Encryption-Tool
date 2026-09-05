@@ -1,9 +1,13 @@
-"""The hybrid KEM: X25519 + ML-KEM-768, combined through HKDF-SHA256.
+"""The hybrid KEM: Diffie-Hellman + ML-KEM, combined through HKDF-SHA256.
+
+Which pair is in play comes from the recipient's key (see kems.py): X25519 with
+ML-KEM-768, or X448 with ML-KEM-1024. Nothing below depends on which -- every
+length comes from the key rather than from a constant here.
 
 Encapsulation produces two independent shared secrets:
 
-  * ss_x  -- X25519(ephemeral_sk, recipient_x25519_pk), 32 bytes
-  * ss_m  -- ML-KEM-768 encapsulation against the recipient, 32 bytes
+  * ss_x  -- DH(ephemeral_sk, recipient_dh_pk), 32 or 56 bytes
+  * ss_m  -- ML-KEM encapsulation against the recipient, 32 bytes
 
 Neither is used directly. Both are concatenated into the HKDF input keying
 material, so the derived AEAD key is unpredictable unless the attacker can
@@ -20,8 +24,9 @@ Two details that are easy to get wrong and that this module gets right:
 2. The transcript is bound into HKDF's `info`. Suite byte, ephemeral public
    key, ML-KEM ciphertext, and both recipient public keys all go in, so a key
    derived for one message can never validate for another. Every field is
-   fixed-length, so plain concatenation is unambiguous -- no length-prefix
-   confusion is possible.
+   fixed-length *given the suite byte*, which comes second and pins all four
+   lengths, so plain concatenation is unambiguous -- no length-prefix confusion
+   is possible, and no two parameter sets can produce the same transcript.
 """
 
 from __future__ import annotations
@@ -30,14 +35,11 @@ from typing import Tuple
 
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey,
-    X25519PublicKey,
-)
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import backend
 from .errors import FormatError
+from .kems import Kem
 from .keys import PrivateKey, PublicKey
 from .suites import Suite
 
@@ -52,15 +54,15 @@ HKDF_LABEL = b"hpqc-v1 hybrid x25519+ml-kem-768"
 # and the key that seals a file key could be the same bytes.
 WRAP_LABEL = b"hpqc-v1 file key wrap x25519+ml-kem-768"
 
+#: Kept for the v1 constants that name it; a suite's own KEM is what the
+#: parsers actually consult.
 MLKEM768_CIPHERTEXT_LEN = 1088
 SHARED_SECRET_LEN = 32
 SALT_LEN = 16
 
 
-def _exchange(
-    private: X25519PrivateKey, peer_public: bytes, *, what: str
-) -> bytes:
-    """X25519 with attacker-controlled input made safe to call.
+def _exchange(private, peer_public: bytes, kem: Kem, *, what: str) -> bytes:
+    """Diffie-Hellman with attacker-controlled input made safe to call.
 
     OpenSSL rejects low-order points -- the ones that force an all-zero shared
     secret -- with a bare ValueError. Both peer public keys we touch come from
@@ -68,18 +70,19 @@ def _exchange(
     surface as a normal hpqc error instead of a traceback.
     """
     try:
-        return private.exchange(X25519PublicKey.from_public_bytes(peer_public))
+        return private.exchange(kem.dh_public.from_public_bytes(peer_public))
     except ValueError as exc:
         raise FormatError(f"invalid {what}: {exc}") from None
 
 
-def _combine(ss_mlkem: bytes, ss_x25519: bytes) -> bytes:
+def _combine(ss_mlkem: bytes, ss_dh: bytes) -> bytes:
     """Concatenate both shared secrets into HKDF input keying material.
 
-    ML-KEM first, X25519 second -- the same order X-Wing uses. Both halves are
-    exactly 32 bytes, so the split point is unambiguous.
+    ML-KEM first, Diffie-Hellman second -- the same order X-Wing uses. Both
+    halves are a fixed length for a given key type (32 and 32, or 32 and 56),
+    so the split point is unambiguous.
     """
-    return ss_mlkem + ss_x25519
+    return ss_mlkem + ss_dh
 
 
 def _transcript(
@@ -96,8 +99,8 @@ def _transcript(
             bytes([suite.id]),
             ephemeral_public,
             kem_ciphertext,
-            recipient.x25519_bytes,
-            recipient.mlkem_bytes,
+            recipient.dh_bytes,
+            recipient.kem_bytes,
         )
     )
 
@@ -133,22 +136,24 @@ def encapsulate(recipient: PublicKey) -> Tuple[bytes, bytes, bytes]:
     Returns (ephemeral_x25519_public, mlkem_ciphertext, ikm). The caller feeds
     ikm to derive_key and puts the two public values in the container header.
     """
-    backend.require_mlkem()
+    kem = recipient.kem
+    backend.require_mlkem(kem.kem_name)
 
-    ephemeral = X25519PrivateKey.generate()
+    ephemeral = kem.dh_private.generate()
     ephemeral_public = ephemeral.public_key().public_bytes_raw()
-    ss_x25519 = _exchange(
+    ss_dh = _exchange(
         ephemeral,
-        recipient.x25519_bytes,
-        what="recipient X25519 public key",
+        recipient.dh_bytes,
+        kem,
+        what=f"recipient {kem.dh_name} public key",
     )
 
     try:
         ss_mlkem, kem_ciphertext = recipient.mlkem().encapsulate()
     except UnsupportedAlgorithm as exc:  # pragma: no cover - stack dependent
-        raise backend.wrap_unsupported(exc) from None
+        raise backend.wrap_unsupported(exc, kem.kem_name) from None
 
-    return ephemeral_public, kem_ciphertext, _combine(ss_mlkem, ss_x25519)
+    return ephemeral_public, kem_ciphertext, _combine(ss_mlkem, ss_dh)
 
 
 def decapsulate(
@@ -162,16 +167,18 @@ def decapsulate(
     decryption oracle. The AEAD tag check downstream is what actually rejects
     the file.
     """
-    backend.require_mlkem()
+    kem = identity.kem
+    backend.require_mlkem(kem.kem_name)
 
-    ss_x25519 = _exchange(
-        identity.x25519(),
+    ss_dh = _exchange(
+        identity.dh(),
         ephemeral_public,
-        what="ephemeral X25519 public key in the header",
+        kem,
+        what=f"ephemeral {kem.dh_name} public key in the header",
     )
     try:
         ss_mlkem = identity.mlkem().decapsulate(kem_ciphertext)
     except UnsupportedAlgorithm as exc:  # pragma: no cover - stack dependent
-        raise backend.wrap_unsupported(exc) from None
+        raise backend.wrap_unsupported(exc, kem.kem_name) from None
 
-    return _combine(ss_mlkem, ss_x25519)
+    return _combine(ss_mlkem, ss_dh)

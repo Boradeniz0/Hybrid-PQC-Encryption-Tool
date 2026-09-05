@@ -175,8 +175,8 @@ class TestPrivacy:
         blob = container.encrypt_many(b"who is this for", crowd_pub)
         for public in crowd_pub:
             assert public.key_id not in blob
-            assert public.x25519_bytes not in blob
-            assert public.mlkem_bytes not in blob
+            assert public.dh_bytes not in blob
+            assert public.kem_bytes not in blob
 
     def test_the_single_recipient_shape_does_name_its_recipient(self, alice_pub):
         """The other half of the test above, and the reason it is not vacuous.

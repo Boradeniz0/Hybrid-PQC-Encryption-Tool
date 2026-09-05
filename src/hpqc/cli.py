@@ -19,6 +19,7 @@ plaintext itself, and mixing a status line into it would corrupt the output of
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -27,7 +28,16 @@ from typing import BinaryIO, Iterator, Optional
 
 import click
 
-from . import __version__, armour, backend, container, streaming, suites, wrapping
+from . import (
+    __version__,
+    armour,
+    backend,
+    container,
+    kems,
+    streaming,
+    suites,
+    wrapping,
+)
 from .errors import HpqcError
 from .keys import (
     PRIVATE_PREFIX,
@@ -182,6 +192,14 @@ def _read_recipients(paths) -> "list":
                 f"(key id {public.key_id_hex}); listing a recipient twice is "
                 "more often a mistake than a plan"
             )
+        if loaded and public.kem.id != loaded[0].kem.id:
+            # One suite byte per container means one KEM per container. Saying
+            # so here is better than a length mismatch four layers down.
+            raise click.ClickException(
+                f"{path} is {public.kem.name} but {paths[0]} is "
+                f"{loaded[0].kem.name}; one file has one KEM, so these "
+                "recipients need separate files"
+            )
         seen[public.key_id] = path
         loaded.append(public)
     return loaded
@@ -302,7 +320,7 @@ def _fail_if_exists(path: Path, force: bool) -> None:
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, "-V", "--version", prog_name="hpqc")
 def cli() -> None:
-    """Hybrid post-quantum encryption: X25519 + ML-KEM-768 -> HKDF -> AEAD.
+    """Hybrid post-quantum encryption: Diffie-Hellman + ML-KEM -> HKDF -> AEAD.
 
     Optional sender authentication uses Ed25519 + ML-DSA-65 and needs a
     separate signing key pair from `hpqc signgen`.
@@ -320,6 +338,19 @@ def cli() -> None:
 )
 @click.option("--force", is_flag=True, help="Overwrite existing key files.")
 @click.option(
+    "--kem",
+    "kem_name",
+    type=click.Choice(sorted(kems.BY_CLI_NAME)),
+    default="mlkem768",
+    show_default=True,
+    help=(
+        "Which hybrid KEM. mlkem768 is X25519 + ML-KEM-768 (NIST category 3); "
+        "mlkem1024 is X448 + ML-KEM-1024 (category 5). The classical half "
+        "moves with the post-quantum one, because raising only one of them "
+        "raises nothing."
+    ),
+)
+@click.option(
     "-p",
     "--passphrase",
     "ask_passphrase",
@@ -335,11 +366,12 @@ def cli() -> None:
 def keygen(
     basename: str,
     force: bool,
+    kem_name: str,
     ask_passphrase: bool,
     passphrase_file: Optional[str],
     scrypt_log_n: int,
 ) -> None:
-    """Generate a hybrid X25519 + ML-KEM-768 key pair."""
+    """Generate a hybrid key pair: Diffie-Hellman + ML-KEM."""
     private_path = Path(f"{basename}.key")
     public_path = Path(f"{basename}.pub")
     _fail_if_exists(private_path, force)
@@ -349,7 +381,8 @@ def keygen(
         ask_passphrase, passphrase_file, what="private key"
     )
 
-    identity = PrivateKey.generate()
+    kem = kems.BY_CLI_NAME[kem_name]
+    identity = PrivateKey.generate(kem)
     public = identity.public_key()
 
     identity.write(private_path, passphrase, _params(scrypt_log_n))
@@ -360,6 +393,7 @@ def keygen(
     )
     click.echo(f"private key: {private_path}  ({protection} -- keep it secret)")
     click.echo(f"public key:  {public_path}   (share this)")
+    click.echo(f"algorithms:  {kem.name}")
     click.echo(f"key id:      {public.key_id_hex}")
 
 
@@ -499,7 +533,9 @@ def encrypt(
         if signing_key_path is not None
         else None
     )
-    suite = suites.BY_CLI_NAME[aead]
+    # --aead names an AEAD; the KEM is not the sender's to pick, it is whatever
+    # the recipients' keys already are. This is where the two meet.
+    suite = suites.for_kem(to[0].kem, suites.BY_CLI_NAME[aead])
 
     with _input_stream(input_path) as source:
         # One byte past the limit is enough to tell "this fits" from "this does
@@ -733,8 +769,11 @@ def info(input_path: str) -> None:
         # container can now be larger than memory, so read the front and take
         # the size from the filesystem rather than pulling it all in to print
         # nine lines.
-        total = Path(input_path).stat().st_size
         with _input_stream(input_path) as source:
+            # The size is taken after the open, not before it: a missing or
+            # unreadable path has to come back as one clean message from
+            # _input_stream, not as a stat() traceback a few lines earlier.
+            total = Path(input_path).stat().st_size
             front = streaming.read_exactly(source, container.HEADER_READ_AHEAD)
             if front.startswith(container.MAGIC):
                 # Handed the still-open stream, not just the bytes: a long
@@ -770,13 +809,15 @@ def info(input_path: str) -> None:
     if text and PUBLIC_PREFIX in text:
         public = PublicKey.decode(text)
         click.echo("type:       hpqc public key")
-        click.echo("algorithms: X25519 + ML-KEM-768")
+        click.echo(f"algorithms: {public.kem.dh_name} + {public.kem.kem_name}")
         click.echo(f"key id:     {public.key_id_hex}")
         return
     if text and PRIVATE_PREFIX in text:
         identity = PrivateKey.decode(text)
         click.echo("type:       hpqc private key")
-        click.echo("algorithms: X25519 + ML-KEM-768")
+        click.echo(
+            f"algorithms: {identity.kem.dh_name} + {identity.kem.kem_name}"
+        )
         click.echo(f"key id:     {identity.key_id_hex}")
         return
 
@@ -847,8 +888,27 @@ def _describe_container(source: BinaryIO, total: int) -> None:
         click.echo("note:        ML-KEM unavailable here; this file cannot be decrypted")
 
 
+def _restore_sigpipe() -> None:
+    """Die on a closed pipe the way every other filter does.
+
+    Python ignores SIGPIPE and turns the failed write into BrokenPipeError,
+    which is right for a server and wrong for a filter. `hpqc decrypt big.hpqc
+    | head` then ends with click intercepting EPIPE and exiting 1 with nothing
+    on stderr -- a silent failure for a completely ordinary command, and one
+    `set -o pipefail` turns into a failed script.
+
+    Restoring the default disposition makes hpqc behave like `cat`: the write
+    that has nowhere to go kills the process, the shell sees SIGPIPE, and
+    nothing is printed. The BrokenPipeError handler below stays for platforms
+    that have no SIGPIPE at all.
+    """
+    if hasattr(signal, "SIGPIPE"):  # POSIX; Windows has no such signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+
 def run() -> int:
     """Entry point that turns expected errors into clean messages."""
+    _restore_sigpipe()
     try:
         # standalone_mode=False lets our own error handling run; click still
         # converts --help/--version into an Exit and hands back its code.
@@ -862,7 +922,7 @@ def run() -> int:
     except click.Abort:
         click.echo("aborted", err=True)
         return 130
-    except BrokenPipeError:  # pragma: no cover - `hpqc info big.hpqc | head`
+    except BrokenPipeError:  # pragma: no cover - only where SIGPIPE is absent
         return 0
     return result if isinstance(result, int) else 0
 

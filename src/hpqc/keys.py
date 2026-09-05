@@ -1,8 +1,11 @@
-"""Hybrid key pairs: an X25519 key and an ML-KEM-768 key travelling together.
+"""Hybrid key pairs: a Diffie-Hellman key and an ML-KEM key travelling together.
 
 A recipient is always *both* keys. Splitting them would let an attacker strip
-the post-quantum half and downgrade the file to plain X25519, so they are
-generated, stored, serialised, and identified as one unit.
+the post-quantum half and downgrade the file to plain Diffie-Hellman, so they
+are generated, stored, serialised, and identified as one unit.
+
+Which pair a key is comes from kems.py: X25519 with ML-KEM-768, or X448 with
+ML-KEM-1024. The leading byte of a key blob says which.
 
 On-disk armour is one base64 line with a human-readable prefix, plus comment
 lines the parser ignores:
@@ -12,8 +15,17 @@ lines the parser ignores:
     hpqc-pk1<base64>
 
 Private key files are created with mode 0600 and hold the ML-KEM *seed*
-(64 bytes, FIPS 203 d||z) rather than the 2400-byte expanded key -- the
-expanded form is derived deterministically on load.
+(64 bytes, FIPS 203 d||z) rather than the expanded key -- the expanded form is
+derived deterministically on load, and the seed is the same size whichever
+parameter set it belongs to, which is exactly why the blob cannot be told apart
+by its length and needs the type byte.
+
+That leading byte was introduced as a format version and never had a second
+value. Adding a second parameter set is the first thing that needs one -- and
+what it needs the byte to say is *which key this is*, not *which revision*. So
+it is a key type now, and type 1 is bit-for-bit what version 1 always was:
+every key file written before this change is still read, unchanged, and 
+X25519+ML-KEM-768 keys are still written exactly as they were.
 
 Either private key can be written passphrase-protected instead of in the clear:
 pass `passphrase=` to `encode`/`write` and the secret is sealed by wrapping.py.
@@ -44,33 +56,36 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey,
-    X25519PublicKey,
-)
-
-from . import backend, wrapping
+from . import backend, kems, wrapping
 from .armour import armour, dearmour
 from .errors import FormatError, PassphraseError
 
 # Wire sizes, all fixed by the algorithms themselves.
 X25519_KEY_LEN = 32
-MLKEM768_PUBLIC_LEN = 1184
-MLKEM768_SEED_LEN = 64
+MLKEM768_PUBLIC_LEN = kems.X25519_MLKEM768.kem_public_len
+MLKEM768_SEED_LEN = kems.KEM_SEED_LEN
 ED25519_KEY_LEN = 32
 MLDSA65_PUBLIC_LEN = 1952
 MLDSA65_SEED_LEN = 32
 
+#: The type byte at the front of an encryption key blob. Type 1 is what the
+#: original KEY_FORMAT_VERSION named; see the module docstring.
 KEY_FORMAT_VERSION = 1
 PUBLIC_PREFIX = "hpqc-pk1"
 PRIVATE_PREFIX = "hpqc-sk1"
 SIGN_PUBLIC_PREFIX = "hpqc-spk1"
 SIGN_PRIVATE_PREFIX = "hpqc-ssk1"
 
-_PUBLIC_BLOB_LEN = 1 + X25519_KEY_LEN + MLKEM768_PUBLIC_LEN
-_PRIVATE_BLOB_LEN = 1 + X25519_KEY_LEN + MLKEM768_SEED_LEN
 _SIGN_PUBLIC_BLOB_LEN = 1 + ED25519_KEY_LEN + MLDSA65_PUBLIC_LEN
 _SIGN_PRIVATE_BLOB_LEN = 1 + ED25519_KEY_LEN + MLDSA65_SEED_LEN
+
+
+def _public_blob_len(kem: "kems.Kem") -> int:
+    return 1 + kem.dh_len + kem.kem_public_len
+
+
+def _private_blob_len(kem: "kems.Kem") -> int:
+    return 1 + kem.dh_len + kems.KEM_SEED_LEN
 
 KEY_ID_LEN = 8
 _KEY_ID_DOMAIN = b"hpqc-key-id-v1"
@@ -144,56 +159,70 @@ def _write_private_file(path: PathLike, text: str) -> None:
     os.replace(tmp_name, path)
 
 
-def _key_id(x25519_public: bytes, mlkem_public: bytes) -> bytes:
+def _key_id(dh_public: bytes, kem_public: bytes) -> bytes:
     """Short, non-secret fingerprint of a recipient.
 
     Only used to tell the user "this file is not for that key" before spending
     a decapsulation; it is a UX affordance, never an access control.
+
+    The key type is not hashed in, and does not need to be: the two halves are
+    different lengths in every parameter set, so no two key types can produce
+    the same concatenation. Adding it would change every key id ever printed
+    for nothing.
     """
-    digest = hashlib.sha256(_KEY_ID_DOMAIN + x25519_public + mlkem_public).digest()
+    digest = hashlib.sha256(_KEY_ID_DOMAIN + dh_public + kem_public).digest()
     return digest[:KEY_ID_LEN]
 
 
 @dataclass(frozen=True)
 class PublicKey:
-    """A recipient: X25519 public key + ML-KEM-768 encapsulation key."""
+    """A recipient: a Diffie-Hellman public key + an ML-KEM encapsulation key.
 
-    x25519_bytes: bytes
-    mlkem_bytes: bytes
+    `kem` says which pair, and therefore how long each half is. It is part of
+    the key's identity, not decoration: two keys with the same bytes under
+    different parameter sets would be different keys, and the dataclass
+    compares them as such.
+    """
+
+    dh_bytes: bytes
+    kem_bytes: bytes
+    kem: kems.Kem = kems.DEFAULT_KEM
 
     @property
     def key_id(self) -> bytes:
-        return _key_id(self.x25519_bytes, self.mlkem_bytes)
+        return _key_id(self.dh_bytes, self.kem_bytes)
 
     @property
     def key_id_hex(self) -> str:
         return self.key_id.hex()
 
-    def x25519(self) -> X25519PublicKey:
-        return X25519PublicKey.from_public_bytes(self.x25519_bytes)
+    def dh(self):
+        return self.kem.dh_public.from_public_bytes(self.dh_bytes)
 
     def mlkem(self):
-        """Return the live ML-KEM-768 public key object."""
-        backend.require_mlkem()
+        """Return the live ML-KEM public key object."""
         try:
-            return backend.MLKEM768PublicKey.from_public_bytes(self.mlkem_bytes)
+            return self.kem.kem_public_class().from_public_bytes(self.kem_bytes)
         except UnsupportedAlgorithm as exc:  # pragma: no cover - stack dependent
-            raise backend.wrap_unsupported(exc) from None
+            raise backend.wrap_unsupported(exc, self.kem.kem_name) from None
 
     def to_bytes(self) -> bytes:
-        return bytes([KEY_FORMAT_VERSION]) + self.x25519_bytes + self.mlkem_bytes
+        return bytes([self.kem.id]) + self.dh_bytes + self.kem_bytes
 
     @classmethod
     def from_bytes(cls, blob: bytes) -> "PublicKey":
-        if len(blob) != _PUBLIC_BLOB_LEN:
+        if not blob:
+            raise FormatError("public key is empty")
+        kem = kems.by_id(blob[0])
+        expected = _public_blob_len(kem)
+        if len(blob) != expected:
             raise FormatError(
-                f"public key must be {_PUBLIC_BLOB_LEN} bytes, got {len(blob)}"
+                f"{kem.name} public key must be {expected} bytes, got {len(blob)}"
             )
-        if blob[0] != KEY_FORMAT_VERSION:
-            raise FormatError(f"unsupported key format version {blob[0]}")
         return cls(
-            x25519_bytes=blob[1 : 1 + X25519_KEY_LEN],
-            mlkem_bytes=blob[1 + X25519_KEY_LEN :],
+            dh_bytes=blob[1 : 1 + kem.dh_len],
+            kem_bytes=blob[1 + kem.dh_len :],
+            kem=kem,
         )
 
     def encode(self) -> str:
@@ -202,7 +231,7 @@ class PublicKey:
             self.to_bytes(),
             [
                 "hpqc public key -- safe to share",
-                "algorithms: X25519 + ML-KEM-768 (FIPS 203)",
+                f"algorithms: {self.kem.dh_name} + {self.kem.kem_name} (FIPS 203)",
                 f"key id: {self.key_id_hex}",
             ],
         )
@@ -221,45 +250,44 @@ class PublicKey:
 
 @dataclass(frozen=True)
 class PrivateKey:
-    """An identity: X25519 private key + ML-KEM-768 decapsulation seed."""
+    """An identity: a Diffie-Hellman private key + an ML-KEM decapsulation seed."""
 
-    x25519_bytes: bytes
-    mlkem_seed: bytes
+    dh_bytes: bytes
+    kem_seed: bytes
+    kem: kems.Kem = kems.DEFAULT_KEM
 
     @classmethod
-    def generate(cls) -> "PrivateKey":
-        backend.require_mlkem()
+    def generate(cls, kem: kems.Kem = kems.DEFAULT_KEM) -> "PrivateKey":
         try:
-            mlkem_key = backend.MLKEM768PrivateKey.generate()
-            seed = mlkem_key.private_bytes_raw()
+            seed = kem.kem_private_class().generate().private_bytes_raw()
         except UnsupportedAlgorithm as exc:  # pragma: no cover - stack dependent
-            raise backend.wrap_unsupported(exc) from None
-        if len(seed) != MLKEM768_SEED_LEN:  # pragma: no cover - backend contract
+            raise backend.wrap_unsupported(exc, kem.kem_name) from None
+        if len(seed) != kems.KEM_SEED_LEN:  # pragma: no cover - backend contract
             raise FormatError(
-                f"backend returned a {len(seed)}-byte ML-KEM key, "
-                f"expected the {MLKEM768_SEED_LEN}-byte seed"
+                f"backend returned a {len(seed)}-byte {kem.kem_name} key, "
+                f"expected the {kems.KEM_SEED_LEN}-byte seed"
             )
-        x25519_key = X25519PrivateKey.generate()
         return cls(
-            x25519_bytes=x25519_key.private_bytes_raw(),
-            mlkem_seed=seed,
+            dh_bytes=kem.dh_private.generate().private_bytes_raw(),
+            kem_seed=seed,
+            kem=kem,
         )
 
-    def x25519(self) -> X25519PrivateKey:
-        return X25519PrivateKey.from_private_bytes(self.x25519_bytes)
+    def dh(self):
+        return self.kem.dh_private.from_private_bytes(self.dh_bytes)
 
     def mlkem(self):
-        """Rebuild the ML-KEM-768 private key from its stored seed."""
-        backend.require_mlkem()
+        """Rebuild the ML-KEM private key from its stored seed."""
         try:
-            return backend.MLKEM768PrivateKey.from_seed_bytes(self.mlkem_seed)
+            return self.kem.kem_private_class().from_seed_bytes(self.kem_seed)
         except UnsupportedAlgorithm as exc:  # pragma: no cover - stack dependent
-            raise backend.wrap_unsupported(exc) from None
+            raise backend.wrap_unsupported(exc, self.kem.kem_name) from None
 
     def public_key(self) -> PublicKey:
         return PublicKey(
-            x25519_bytes=self.x25519().public_key().public_bytes_raw(),
-            mlkem_bytes=self.mlkem().public_key().public_bytes_raw(),
+            dh_bytes=self.dh().public_key().public_bytes_raw(),
+            kem_bytes=self.mlkem().public_key().public_bytes_raw(),
+            kem=self.kem,
         )
 
     @property
@@ -267,19 +295,22 @@ class PrivateKey:
         return self.public_key().key_id_hex
 
     def to_bytes(self) -> bytes:
-        return bytes([KEY_FORMAT_VERSION]) + self.x25519_bytes + self.mlkem_seed
+        return bytes([self.kem.id]) + self.dh_bytes + self.kem_seed
 
     @classmethod
     def from_bytes(cls, blob: bytes) -> "PrivateKey":
-        if len(blob) != _PRIVATE_BLOB_LEN:
+        if not blob:
+            raise FormatError("private key is empty")
+        kem = kems.by_id(blob[0])
+        expected = _private_blob_len(kem)
+        if len(blob) != expected:
             raise FormatError(
-                f"private key must be {_PRIVATE_BLOB_LEN} bytes, got {len(blob)}"
+                f"{kem.name} private key must be {expected} bytes, got {len(blob)}"
             )
-        if blob[0] != KEY_FORMAT_VERSION:
-            raise FormatError(f"unsupported key format version {blob[0]}")
         return cls(
-            x25519_bytes=blob[1 : 1 + X25519_KEY_LEN],
-            mlkem_seed=blob[1 + X25519_KEY_LEN :],
+            dh_bytes=blob[1 : 1 + kem.dh_len],
+            kem_seed=blob[1 + kem.dh_len :],
+            kem=kem,
         )
 
     def encode(self, passphrase=None, params=None) -> str:
@@ -296,7 +327,7 @@ class PrivateKey:
             self.to_bytes(),
             [
                 "hpqc private key -- KEEP THIS SECRET",
-                "algorithms: X25519 + ML-KEM-768 (FIPS 203)",
+                f"algorithms: {self.kem.dh_name} + {self.kem.kem_name} (FIPS 203)",
                 f"key id: {self.key_id_hex}",
             ],
         )
