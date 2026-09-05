@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import struct
 
-from .errors import FormatError
+from .errors import FormatError, TruncatedError
 
 U16 = struct.Struct(">H")
 
@@ -28,9 +28,14 @@ class Reader:
     def take(self, n: int, what: str) -> bytes:
         end = self._pos + n
         if end > len(self._data):
-            raise FormatError(
+            # TruncatedError, not a bare FormatError: the shortfall is the one
+            # thing only the parser knows, and a streaming reader needs it to
+            # decide how much more to ask for. It is still a FormatError, so
+            # callers that only care that parsing failed are unaffected.
+            raise TruncatedError(
                 f"truncated {self._noun}: need {n} bytes for {what} at offset "
-                f"{self._pos}, only {len(self._data) - self._pos} remain"
+                f"{self._pos}, only {len(self._data) - self._pos} remain",
+                needed=end - len(self._data),
             )
         chunk = self._data[self._pos : end]
         self._pos = end

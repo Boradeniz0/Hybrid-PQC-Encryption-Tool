@@ -250,3 +250,89 @@ def test_random_garbage_is_never_mistaken_for_a_wrapped_key() -> None:
         candidate = armour(wrapping.WRAPPED_PREFIX, blob, [])
         with pytest.raises(HpqcError):
             wrapping.unwrap(candidate, "anything")
+
+
+def test_random_corruption_of_a_recipient_list_never_escapes(
+    alice, alice_pub, bob, bob_pub
+) -> None:
+    """A recipient list is a length the header chooses for itself.
+
+    That is new, and it is the shape of parser bug that turns a malformed file
+    into a traceback or an enormous allocation: a count is read, believed, and
+    used to loop. Both recipients are tried on every mutation, because a
+    corrupted stanza must fail for whoever it was not addressed to just as
+    surely as for whoever it was.
+    """
+    blob = container_module.encrypt_many(
+        b"the quick brown fox jumps over the lazy dog" * 10, [alice_pub, bob_pub]
+    )
+    rng = random.Random(SEED + 5)
+
+    for _ in range(ITERATIONS):
+        corrupted = _mutate(rng, blob)
+        if corrupted == blob:
+            continue
+        for identity in (alice, bob):
+            try:
+                decrypt(corrupted, identity)
+            except HpqcError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - that is the point
+                pytest.fail(
+                    f"{type(exc).__name__} escaped the parser: {exc}\n"
+                    f"input prefix: {corrupted[:48].hex()}"
+                )
+            else:
+                pytest.fail("a corrupted recipient list decrypted successfully")
+
+
+def test_a_lying_recipient_count_never_escapes(alice, alice_pub, bob_pub) -> None:
+    """Every u16 the count field can hold, against a header sized for two.
+
+    The parser has to survive all 65536 of them, and the ones above
+    MAX_RECIPIENTS have to be refused before they can ask it to do any work --
+    otherwise the file decides how much the reader allocates.
+    """
+    from hpqc.wire import U16
+
+    blob = container_module.encrypt_many(b"x", [alice_pub, bob_pub])
+    offset = 44  # preamble (32) + a 12-byte nonce
+
+    for count in list(range(0, 300)) + [1023, 1024, 1025, 4096, 0xFFFF]:
+        if count == 2:
+            continue  # the truth; it is supposed to work
+        doctored = bytearray(blob)
+        doctored[offset : offset + 2] = U16.pack(count)
+        with pytest.raises(HpqcError):
+            decrypt(bytes(doctored), alice)
+
+
+def test_a_recipient_list_read_from_a_stream_never_escapes(
+    alice, alice_pub, bob_pub
+) -> None:
+    """The same mutations, through the incremental header reader.
+
+    `read_header` re-parses a growing buffer, so it meets truncation in the
+    middle of a field far more often than the all-at-once parser does -- and it
+    is the path a pipe takes.
+    """
+    blob = container_module.encrypt_many(b"streamed" * 100, [alice_pub, bob_pub])
+    rng = random.Random(SEED + 6)
+
+    for _ in range(ITERATIONS):
+        corrupted = _mutate(rng, blob)
+        if corrupted == blob:
+            continue
+        try:
+            container_module.decrypt_stream(
+                io.BytesIO(corrupted), io.BytesIO(), alice
+            )
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - that is the point
+            pytest.fail(
+                f"{type(exc).__name__} escaped read_header: {exc}\n"
+                f"input prefix: {corrupted[:48].hex()}"
+            )
+        else:
+            pytest.fail("a corrupted recipient list decrypted successfully")

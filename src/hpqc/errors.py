@@ -15,6 +15,20 @@ class FormatError(HpqcError):
     """The input is not a well-formed hpqc container or key file."""
 
 
+class TruncatedError(FormatError):
+    """The input ended before a field the parser still needed.
+
+    Carries `needed`: how many more bytes that one field was short by. A
+    reader working from a stream uses it to fetch more and try again, which is
+    how a header whose length depends on its own contents -- a recipient list
+    -- gets read without either a seek or an unbounded buffer.
+    """
+
+    def __init__(self, message: str, needed: int) -> None:
+        super().__init__(message)
+        self.needed = needed
+
+
 class UnsupportedSuiteError(FormatError):
     """The container asks for a cipher suite this build does not implement."""
 

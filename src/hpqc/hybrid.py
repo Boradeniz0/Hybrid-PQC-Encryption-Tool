@@ -45,6 +45,13 @@ from .suites import Suite
 # an old and a new build must never derive the same key from the same inputs.
 HKDF_LABEL = b"hpqc-v1 hybrid x25519+ml-kem-768"
 
+# The same derivation, run for a different purpose: turning a KEM output into
+# a key that wraps a file key for one recipient (see recipients.py). It has to
+# be a distinct label, because the two keys are derived from inputs that are
+# otherwise identical in shape -- without this, the key that seals a payload
+# and the key that seals a file key could be the same bytes.
+WRAP_LABEL = b"hpqc-v1 file key wrap x25519+ml-kem-768"
+
 MLKEM768_CIPHERTEXT_LEN = 1088
 SHARED_SECRET_LEN = 32
 SALT_LEN = 16
@@ -80,11 +87,12 @@ def _transcript(
     ephemeral_public: bytes,
     kem_ciphertext: bytes,
     recipient: PublicKey,
+    label: bytes,
 ) -> bytes:
     """Everything the derivation must be bound to, as HKDF `info`."""
     return b"".join(
         (
-            HKDF_LABEL,
+            label,
             bytes([suite.id]),
             ephemeral_public,
             kem_ciphertext,
@@ -101,13 +109,21 @@ def derive_key(
     ephemeral_public: bytes,
     kem_ciphertext: bytes,
     recipient: PublicKey,
+    label: bytes = HKDF_LABEL,
 ) -> bytes:
-    """HKDF-SHA256 the combined secrets down to one AEAD key."""
+    """HKDF-SHA256 the combined secrets down to one AEAD key.
+
+    `label` selects what the key is *for*. The default derives the key that
+    seals a payload directly; WRAP_LABEL derives the key that seals a file key
+    for one recipient. Same inputs, different label, unrelated outputs.
+    """
     return HKDF(
         algorithm=hashes.SHA256(),
         length=suite.key_len,
         salt=salt,
-        info=_transcript(suite, ephemeral_public, kem_ciphertext, recipient),
+        info=_transcript(
+            suite, ephemeral_public, kem_ciphertext, recipient, label
+        ),
     ).derive(ikm)
 
 

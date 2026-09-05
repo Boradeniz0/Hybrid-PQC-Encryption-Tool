@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 432 tests). This is
+The automated suite covers all of this and more (`pytest`, 543 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -179,7 +179,106 @@ the other way round. Asking for both explicitly is refused outright:
 hpqc encrypt -r alice.pub big.bin -o x.hpqc -s bob-sign.key --chunked
 ```
 
-## 5. What has to fail
+## 5. Several recipients
+
+```console
+hpqc keygen -o bob
+hpqc keygen -o carol
+hpqc keygen -o dave
+printf 'minutes of the meeting\n' > minutes.txt
+
+hpqc encrypt -r alice.pub -r bob.pub -r carol.pub minutes.txt -o minutes.hpqc
+hpqc info minutes.hpqc
+```
+
+```
+encrypted to 3 recipients; the file does not name them
+recipients:  3 (the file does not name them)
+header:      3568 bytes (authenticated as AAD)
+kem ct:      1088 bytes x 3
+```
+
+All three open it, and dave does not:
+
+```console
+for who in alice bob carol; do hpqc decrypt -k $who.key minutes.hpqc; done
+hpqc decrypt -k dave.key minutes.hpqc -o /dev/null; echo "exit=$?"
+```
+
+```
+minutes of the meeting
+minutes of the meeting
+minutes of the meeting
+error: none of this file's 3 recipient slot(s) could be opened with key id
+cfd18e698231d3b9; it was encrypted for someone else
+exit=1
+```
+
+Note what the error cannot say: which key the file *was* for. The stanzas carry
+no key ids, so the file genuinely does not know.
+
+### The file names nobody
+
+Search the container for each recipient's key id. It is binary, so hex, not
+`grep` on the raw file:
+
+```console
+for who in alice bob carol; do
+  id=$(hpqc info $who.pub | sed -n 's/^key id: *//p')
+  od -An -v -tx1 minutes.hpqc | tr -d ' \n' | grep -q "$id" \
+    && echo "$who: FOUND" || echo "$who: not present"
+done
+```
+
+```
+alice: not present
+bob: not present
+carol: not present
+```
+
+An absence is only worth something if the search works, so run the same search
+against a single-recipient file, which *does* publish its recipient:
+
+```console
+hpqc encrypt -r alice.pub minutes.txt -o one.hpqc
+id=$(hpqc info alice.pub | sed -n 's/^key id: *//p')
+od -An -v -tx1 one.hpqc | tr -d ' \n' | grep -q "$id" && echo FOUND
+```
+
+That prints `FOUND`. `--hide-recipients` gets the same anonymity for one
+recipient, and the sizes show what it costs:
+
+```console
+hpqc encrypt -r alice.pub --hide-recipients minutes.txt -o hidden.hpqc
+stat -c '%n %s' one.hpqc hidden.hpqc minutes.hpqc
+```
+
+```
+one.hpqc 1207
+hidden.hpqc 1259
+minutes.hpqc 3607
+```
+
+52 bytes to stop naming one recipient; 1174 for each extra one.
+
+### Removing a recipient
+
+```console
+hpqc encrypt -r alice.pub -r bob.pub minutes.txt -o pair.hpqc
+# drop the last stanza (1174 bytes) and rewrite the count from 2 to 1
+head -c $(( $(stat -c%s pair.hpqc) - 1174 )) pair.hpqc > cut.hpqc
+printf '\x00\x01' | dd of=cut.hpqc bs=1 seek=44 count=2 conv=notrunc status=none
+
+hpqc info cut.hpqc | grep recipients
+hpqc decrypt -k alice.key cut.hpqc -o /dev/null; echo "exit=$?"
+```
+
+The header parses and claims one recipient; alice's stanza is untouched and
+still hers. It fails anyway, because the whole header is the payload's
+associated data — so cutting bob out of the conversation is a denial of
+service, not a silent edit.
+
+## 6. What has to fail
 
 This is the interesting part. Each of these must exit non-zero with a readable
 message — never a traceback.
@@ -224,10 +323,10 @@ what the file *claims*; nothing in it is trusted until the tag verifies. The
 suite byte is covered twice over — by the AEAD's associated data and by the HKDF
 transcript — so it cannot be used to steer a recipient onto a different cipher.
 
-## 6. The test suite
+## 7. The test suite
 
 ```console
-pytest -q                 # 432 passed
+pytest -q                 # 543 passed
 pytest -q -W error        # clean with warnings escalated to errors
 ```
 
@@ -261,6 +360,22 @@ to watch a 3-chunk file quietly turn into a 2-chunk one:
 ```console
 pytest -q -k without_the_final_marker
 ```
+
+Now the one that breaks every file ever written and changes no behaviour at
+all. In `src/hpqc/hybrid.py`, edit the label the wrapping key is derived under:
+
+```python
+WRAP_LABEL = b"hpqc-v1 file key wrap x25519+ml-kem-768 CHANGED"
+```
+
+`pytest -q` fails **10 tests, every one of them in `tests/test_vectors.py`**.
+The other 533 pass — every round trip still works, because the writer and the
+reader moved together. What actually happened is that every file anyone had
+already encrypted to a recipient list became permanently unopenable. Reordering
+the stanza fields in `Stanza.pack` and `read_stanza` does the same thing and
+fails 28, all of them vectors. This is the argument for recording a
+*derivation* rather than a container: a recorded container that stops opening
+tells you something changed and never which thing.
 
 Two more worth trying the same way, both in `src/hpqc/signing.py`:
 

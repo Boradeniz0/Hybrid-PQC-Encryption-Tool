@@ -8,7 +8,8 @@ using **X25519 + ML-KEM-768** together, derives one key from both with
 (ChaCha20-Poly1305 or AES-256-GCM). Sender authentication is optional and
 hybrid in the same way: **Ed25519 + ML-DSA-65**, both required. Files larger
 than a megabyte are encrypted as a chunked stream, so size is bounded by the
-disk rather than by memory.
+disk rather than by memory. A file can be addressed to several recipients at
+once, and the header names none of them.
 
 ```console
 $ hpqc keygen -o alice
@@ -31,6 +32,18 @@ key id:              1322446e7dc517ec
 $ hpqc encrypt -r alice.pub report.pdf -o report.pdf.hpqc -s bob-sign.key
 $ hpqc decrypt -k alice.key report.pdf.hpqc -o report.pdf --sender bob-sign.pub
 signature ok: signed by key id 1322446e7dc517ec
+```
+
+Several recipients, if the file is for more than one person:
+
+```console
+$ hpqc encrypt -r alice.pub -r bob.pub -r carol.pub minutes.txt -o minutes.hpqc
+encrypted to 3 recipients; the file does not name them
+
+$ hpqc info minutes.hpqc
+recipients:  3 (the file does not name them)
+
+$ hpqc decrypt -k bob.key minutes.hpqc -o minutes.txt
 ```
 
 Private keys can be kept under a passphrase rather than file permissions alone:
@@ -93,9 +106,10 @@ resolve at all.
 ```
 hpqc keygen  [-o BASENAME] [--force] [-p | --passphrase-file F]
 hpqc signgen [-o BASENAME] [--force] [-p | --passphrase-file F]
-hpqc encrypt -r RECIPIENT.pub [INPUT] [-o OUT] [--aead chacha20|aes]
+hpqc encrypt -r RECIPIENT.pub [-r ...] [INPUT] [-o OUT] [--aead chacha20|aes]
                                          [-s SIGNING.key] [--passphrase-file F]
                                          [--chunked | --one-shot]
+                                         [--hide-recipients]
 hpqc decrypt -k IDENTITY.key  [INPUT] [-o OUT] [--sender SIGNER.pub]
                                          [--passphrase-file F]
 hpqc passwd  KEYFILE [--remove] [--passphrase-file F] [--new-passphrase-file F]
@@ -136,6 +150,16 @@ payload:     5001232 bytes
 chunked:     yes, 77 chunk(s) of up to 64 KiB (+16-byte tag each)
 plaintext:   5000000 bytes
 signed:      no
+```
+
+And for a file with several recipients it reports how many there are, which is
+all the file knows:
+
+```console
+$ hpqc info minutes.hpqc
+recipients:  3 (the file does not name them)
+header:      3568 bytes (authenticated as AAD)
+kem ct:      1088 bytes x 3
 ```
 
 ## How it works
@@ -423,6 +447,106 @@ the one-shot payload. Asking for both explicitly is an error; signing a large
 file falls back to one shot and says so, because silently dropping the
 signature would be worse than using the memory.
 
+## Several recipients
+
+One file, several people who can open it. The obvious approach does not work:
+the AEAD key is derived straight from the KEM output, and there is no way to
+make two independent encapsulations, to two different public keys, arrive at
+the same key. So the file gains one level of indirection, the same one PGP,
+CMS and age all use:
+
+1. Pick a random **file key**. This is what seals the payload.
+2. For each recipient, run the hybrid KEM against their public key and derive a
+   **wrapping key** from the result.
+3. Seal the file key under each wrapping key. Each sealed copy is a **stanza**,
+   and the header carries one per recipient.
+
+```console
+$ hpqc encrypt -r alice.pub -r bob.pub -r carol.pub minutes.txt -o minutes.hpqc
+encrypted to 3 recipients; the file does not name them
+```
+
+### The stanzas do not say who they are for
+
+There is no key id in a stanza. A recipient list in the clear tells anyone
+holding the file who else was in the conversation, and for a group message that
+is frequently worth more than the contents — it is proof that a particular set
+of people were talking. So the reader instead *tries* each stanza in turn and
+keeps the one that opens; the AEAD tag is the test.
+
+What the file still leaks is **how many** recipients there are, which is why
+`hpqc info` reports a count and nothing else:
+
+```console
+$ hpqc info minutes.hpqc
+recipients:  3 (the file does not name them)
+```
+
+The cost is paid twice, and both halves are worth stating. Opening a file is
+now O(recipients) decapsulations rather than O(1) — microseconds, and it does
+not matter. And "wrong key" can no longer name the key the file was for,
+because the file genuinely does not know:
+
+```console
+$ hpqc decrypt -k dave.key minutes.hpqc -o out.txt
+error: none of this file's 3 recipient slot(s) could be opened with key id
+26037352c3e3a2ce; it was encrypted for someone else
+```
+
+A single recipient keeps the older header, key id and all, because that shape
+costs 52 bytes less and there is nothing to hide when there is one name. If you
+want the same anonymity for one recipient, ask for it:
+
+```console
+$ hpqc encrypt -r alice.pub --hide-recipients report.pdf -o report.hpqc
+```
+
+### A wrapping key is used once, so its nonce is all zeros
+
+A nonce exists to stop two messages being encrypted under one key. Every stanza
+has a fresh ephemeral X25519 key and a fresh ML-KEM encapsulation behind it, so
+its wrapping key is unique to that stanza and seals exactly one thing. A random
+nonce here would add twelve bytes an attacker could fiddle with and buy nothing.
+
+The wrapping key is derived under a **different HKDF label** from the payload
+key, over the stanza's own ephemeral key and KEM ciphertext, the file's salt,
+and the recipient's own two public keys. So a stanza cannot be moved to another
+file or another recipient, and the key that wraps a file key can never collide
+with the key that seals a payload.
+
+### Removing a recipient cannot be done quietly
+
+The whole header is the payload's associated data, stanzas included. Strip
+Bob's stanza to cut him out of a conversation and the file stops opening for
+Alice too — she gets an authentication failure rather than a message that looks
+exactly as it should. The attack is still a denial of service; what it is not
+is silent.
+
+### What it does not defend against
+
+**Any recipient can re-send the file as if it came from you.** Everyone who can
+open the file has the file key, so any of them can decrypt it, wrap the same
+key to somebody new, and produce a container indistinguishable from one you
+wrote. This is inherent to multi-recipient encryption, and sender
+authentication is the only answer to it.
+
+**Signing to a list is not implemented yet.** The signature binds the
+recipient's public keys into the signed message, which is what stops
+surreptitious forwarding; with several recipients it has to bind the whole set,
+and the set has to travel inside the AEAD so that an eavesdropper still cannot
+read it. Until that exists the combination is refused rather than approximated
+— binding one of the recipients would verify for that person and fail for
+everybody else, and binding none would quietly reopen the hole.
+
+**Trial decryption is not constant time.** The loop stops at the first stanza
+that opens, so how long a decryption takes reveals *which* slot is yours to
+anyone able to measure it. Somebody holding only the file still learns nothing
+but the count.
+
+**The count is not padded.** Three recipients look like three recipients.
+Padding the list to a fixed size would hide that too, at the cost of a header
+sized for the largest group you ever send to.
+
 ## File format
 
 `.hpqc` containers are a header followed by a payload in one of two shapes.
@@ -433,7 +557,7 @@ All integers are big-endian.
 | 0 | 4 | magic, `HPQC` |
 | 4 | 1 | format version, `1` |
 | 5 | 1 | cipher suite id |
-| 6 | 2 | flags; bit 0 = signed, bit 1 = chunked, rest reserved |
+| 6 | 2 | flags; bit 0 = signed, bit 1 = chunked, bit 2 = recipient list, rest reserved |
 | 8 | 8 | recipient key id (truncated SHA-256) |
 | 16 | 16 | HKDF salt |
 | 32 | 12 | AEAD nonce (chunked: first 7 bytes are the STREAM prefix) |
@@ -451,13 +575,40 @@ last; overhead is 1168 plus 16 per chunk. Nothing frames the chunks, because a
 length prefix would be attacker-controlled data read before authentication —
 the reader knows the boundaries by counting.
 
+With bit 2 set the file has more than one recipient (or one it declines to
+name), and everything from offset 44 is replaced by a list:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 44 | 2 | recipient count, 1…1024 |
+| 46 | … | that many stanzas |
+| … | … | payload |
+
+Each stanza is `2+32` ephemeral X25519 public key, `2+1088` ML-KEM-768
+ciphertext, `2+48` wrapped file key — 1174 bytes, and nothing that identifies
+the recipient. The key id at offset 8 is all zeros, and a non-zero value there
+is refused: a fixed field nothing reads is a place to smuggle bytes past
+everyone who looks at the file with `info`.
+
+That makes the header the first field in the format whose length depends on its
+own contents. The reader neither seeks nor trusts a length it has not checked:
+it reads 4 KiB, parses, and when the parser runs out it reports exactly how many
+bytes the field it was reading is short by. At least that much is fetched and
+the parse retried, up to a hard cap. Each round asks for at least as much again
+as it already holds — fetching only the shortfall would be correct and
+quadratic in a count the file's writer chooses.
+
 Bits 0 and 1 together are refused as malformed rather than parsed: a signature
 covers a whole message, so this build never writes one, and letting a signature
-parser loose on chunk framing is a worse answer than saying no.
+parser loose on chunk framing is a worse answer than saying no. Bits 0 and 2
+together are refused for the reason in the section above.
 
-Sender authentication claimed bit 0 of the reserved `flags` field, and
-streaming claimed bit 1, which is what they were there for, so the format
-version has never had to move. An older build
+Sender authentication claimed bit 0 of the reserved `flags` field, streaming
+claimed bit 1 and the recipient list claimed bit 2, which is what they were
+there for, so the format version has never had to move. Bits 1 and 2 compose
+without either knowing about the other — one is about the payload, the other
+about the header — which is the payoff of putting both in the flags field
+rather than in the version. An older build
 meets a signed file, sees a flag bit it does not implement, and refuses it by
 name rather than decrypting something it only half understands; this build still
 reads every unsigned file written before signing existed. Unknown flag *bits*
@@ -568,7 +719,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-432 passed
+543 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -648,6 +799,27 @@ actually fails. Among them:
   final-chunk byte and the writer and reader move together, so the recorded
   file stops opening either way and the failure names no cause. The frozen
   (prefix, index, final) → nonce triples name it exactly.
+- **A recipient list names nobody — and the same search finds the name in the
+  shape that does publish it.** Asserting that eight bytes are absent from a
+  container passes just as readily when the search itself is broken, so the
+  test that looks for every recipient's key id in a listed file is paired with
+  one that looks for it in a single-recipient file and requires it to be there.
+- **Removing a recipient breaks the file for the others.** A stanza is cut on
+  its exact boundary and the count fixed, so the header parses and claims one
+  fewer recipient and every remaining stanza is genuine. Only the payload's
+  associated data covering the whole list catches it.
+- **The wrapping-key derivation is pinned by known answer.** Reuse the payload
+  label, drop the file's salt from it, stop binding the recipient's own public
+  keys — every one of those leaves the tool perfectly self-consistent and makes
+  every file ever written unopenable, and all 410 non-vector tests pass through
+  all of them. The frozen (ikm, salt, ephemeral key, KEM ciphertext, recipient)
+  → key rows are what notice.
+- **A lying recipient count.** All 65536 values the count field can hold, against
+  a header sized for two, must be an `HpqcError` and never an allocation.
+- **A header read off a pipe, seven bytes at a time.** The header is the first
+  structure whose length depends on its own contents, so reading it is a loop,
+  and the read loop is checked not to grow with the recipient count: a 47 KB
+  header must arrive in a handful of reads, not one per stanza.
 - **The signature notice never lands on stdout.** stdout is the plaintext.
 - **A key file cannot make the machine allocate 8 GiB.** Cost parameters are
   refused before scrypt runs, so a corrupt or hostile key file is an error
@@ -745,6 +917,26 @@ pass found that three assertions used `result.stderr`, which on click 8.1 raises
 `ValueError: stderr not separately captured` unless the runner is asked to
 separate the streams — so the 3.9 job could not have been passing.
 
+**A test that looks for what should not be there passes when it is broken.**
+The recipient list exists so that a file names nobody, and the obvious test is
+to search the container for each recipient's key id and require it to be
+absent. That test passes if the search is wrong, if the key ids are the wrong
+bytes, or if the container is empty. What makes it mean something is the twin
+test: the same search, against the single-recipient shape that is *supposed* to
+contain the key id, requiring it to be found. The CI smoke test needed the same
+pairing, and needed `od` rather than `grep` to do it at all — a key id is
+binary, so grepping the container as text would never have matched anything and
+the check would have reported success forever.
+
+**Only the frozen vectors noticed a change that broke every file.** Changing
+the HKDF label the wrapping key is derived under leaves the tool perfectly
+self-consistent: the writer and the reader move together, every round trip
+still works, and every file anyone had already encrypted becomes permanently
+unopenable. I ran it: 410 tests passed and not one of them was the vectors. The
+same was true of reordering the stanza fields on the wire. That is the whole
+argument for recording a derivation rather than a container — a container that
+stops opening tells you something changed, and never which thing.
+
 **The declared Python floor was wrong.** `requires-python = ">=3.9"` looked
 fine and was not: `cryptography>=46` declares `!=3.9.0,!=3.9.1`, so on those
 releases `pip install` fails in the resolver rather than with a useful message.
@@ -773,7 +965,12 @@ What it does **not** do, by design in v1:
   objects: they are not pinned, not zeroed after use, and may be copied by the
   interpreter or swapped to disk. A passphrase raises the cost of a stolen key
   file; it does not defend against something already reading this process.
-- **Single recipient per file.**
+- **A recipient list is not padded, and trial decryption is not constant
+  time.** The file reveals how many people can open it, and the time taken to
+  open it reveals which slot is yours to anyone who can measure it.
+- **Any recipient of a file can re-send it as if it came from you.** They hold
+  the file key. Sender authentication is the only answer, and it does not yet
+  work with a recipient list.
 - **Not audited.** This is a learning and portfolio project, written against
   the standards below. Read the code before trusting it with anything real.
 
@@ -782,7 +979,8 @@ What it does **not** do, by design in v1:
 - [x] ML-DSA-65 signatures for sender authentication
 - [x] Streaming / chunked AEAD for large files
 - [x] Passphrase-wrapped private keys (scrypt + AEAD)
-- [ ] Multiple recipients per file
+- [x] Multiple recipients per file
+- [ ] Signing to a recipient list (bind the whole set, inside the AEAD)
 - [ ] Signing a streamed file (a signature trailer over a rolling digest)
 - [ ] ML-KEM-1024 suite
 - [x] Known-answer test vectors checked into the repo

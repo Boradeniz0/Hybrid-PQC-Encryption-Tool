@@ -36,12 +36,22 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from helpers import seal  # noqa: E402
 
-from hpqc import hybrid, signing, streaming, suites, wrapping  # noqa: E402
+from hpqc import (  # noqa: E402
+    hybrid,
+    recipients,
+    signing,
+    streaming,
+    suites,
+    wrapping,
+)
 from hpqc.container import (  # noqa: E402
     FLAG_CHUNKED,
+    FLAG_RECIPIENTS,
     FLAG_SIGNED,
     encrypt,
+    encrypt_many,
     encrypt_stream,
+    encrypt_stream_many,
 )
 from hpqc.keys import PrivateKey, SigningPrivateKey  # noqa: E402
 
@@ -358,11 +368,125 @@ def build_v1_chunked() -> dict:
     return data
 
 
+def build_v1_recipients() -> dict:
+    """Containers with a recipient list, and the wrapping-key derivation.
+
+    Three things are recorded, and only the second of them pins the scheme.
+
+    * `containers` -- files with two and three recipients, each with every
+      recipient's private key, so the test can check that *each* of them opens
+      it and that a fourth identity does not. This is the end-to-end proof that
+      a file written today is still readable after a change.
+
+    * `wrappings` -- for fixed inputs, the derived wrapping key and the exact
+      sealed file key it produces. This is what a recorded container cannot do:
+      change the HKDF label, drop the salt, stop binding the recipient's own
+      public keys, and the writer and reader move together, so a recorded
+      container still round-trips. Only a recorded derivation notices. The
+      zero nonce is spelled out here for the same reason.
+
+    * `layout` -- the constants a reader has to agree on before it can find a
+      stanza at all.
+    """
+    identities = [PrivateKey.generate() for _ in range(3)]
+    publics = [k.public_key() for k in identities]
+    stranger = PrivateKey.generate()
+
+    data = {
+        "note": (
+            "Frozen known-answer vectors for hpqc containers with a recipient "
+            "list. " + TEST_KEY_WARNING
+        ),
+        "format_version": 1,
+        "flag_recipients": FLAG_RECIPIENTS,
+        "wrap_label": hybrid.WRAP_LABEL.decode("ascii"),
+        "layout": {
+            "max_recipients": recipients.MAX_RECIPIENTS,
+            "wrap_tag_len": recipients.WRAP_TAG_LEN,
+            "count_offset": 44,
+            "first_stanza_offset": 46,
+            "stanza_len": {
+                name: recipients.stanza_len(suite)
+                for name, suite in sorted(suites.BY_CLI_NAME.items())
+            },
+            "no_key_id": "00" * 8,
+        },
+        "identities": [k.encode() for k in identities],
+        "publics": [p.encode() for p in publics],
+        "key_ids": [p.key_id_hex for p in publics],
+        "stranger": stranger.encode(),
+        "containers": [],
+        "wrappings": [],
+    }
+
+    plaintext = b"hpqc recipient-list test vector v1\n"
+    for cli_name, suite in sorted(suites.BY_CLI_NAME.items()):
+        for count in (1, 2, 3):
+            data["containers"].append({
+                "suite": cli_name,
+                "suite_id": suite.id,
+                "recipients": count,
+                "hidden_single": count == 1,
+                "plaintext": plaintext.hex(),
+                "container": encrypt_many(
+                    plaintext,
+                    publics[:count],
+                    suite=suite,
+                    hide_recipients=count == 1,
+                ).hex(),
+            })
+
+    # One chunked file with a recipient list: the two flags are independent and
+    # a vector is the cheapest way to say so and keep saying so.
+    chunked_plaintext = _filler(b"hpqc-vector-recipients-chunked", streaming.CHUNK_SIZE + 1)
+    sink = io.BytesIO()
+    encrypt_stream_many(io.BytesIO(chunked_plaintext), sink, publics[:2])
+    data["chunked_container"] = {
+        "suite": "chacha20",
+        "recipients": 2,
+        "chunks": 2,
+        "flags": FLAG_RECIPIENTS | FLAG_CHUNKED,
+        "plaintext_len": len(chunked_plaintext),
+        "plaintext_sha256": hashlib.sha256(chunked_plaintext).hexdigest(),
+        "container": sink.getvalue().hex(),
+    }
+
+    for cli_name, suite in sorted(suites.BY_CLI_NAME.items()):
+        ikm = _filler(b"hpqc-vector-wrap-ikm", 2 * hybrid.SHARED_SECRET_LEN)
+        salt = _filler(b"hpqc-vector-wrap-salt", hybrid.SALT_LEN)
+        epk = _filler(b"hpqc-vector-wrap-epk", 32)
+        kem_ct = _filler(b"hpqc-vector-wrap-kemct", hybrid.MLKEM768_CIPHERTEXT_LEN)
+        file_key = _filler(b"hpqc-vector-file-key", suite.key_len)
+        wrapping_key = hybrid.derive_key(
+            ikm=ikm, salt=salt, suite=suite,
+            ephemeral_public=epk, kem_ciphertext=kem_ct,
+            recipient=publics[0], label=hybrid.WRAP_LABEL,
+        )
+        data["wrappings"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "ikm": ikm.hex(),
+            "salt": salt.hex(),
+            "ephemeral_public": epk.hex(),
+            "kem_ciphertext": kem_ct.hex(),
+            "recipient_index": 0,
+            "file_key": file_key.hex(),
+            "nonce": ("00" * suite.nonce_len),
+            "wrapping_key": wrapping_key.hex(),
+            "wrapped_key": suite.aead(wrapping_key)
+            .encrypt(b"\x00" * suite.nonce_len, file_key, None)
+            .hex(),
+        })
+
+    return data
+
+
 BUILDERS = {
     "v1.json": build_v1,
     "v1-signed.json": build_v1_signed,
     "v1-wrapped.json": build_v1_wrapped,
     "v1-chunked.json": build_v1_chunked,
+    "v1-recipients.json": build_v1_recipients,
 }
 
 

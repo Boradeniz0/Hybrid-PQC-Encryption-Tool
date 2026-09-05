@@ -868,3 +868,167 @@ def test_the_wrong_identity_is_refused_when_writing_to_dev_null(
     )
     assert result.exit_code != 0
     assert "encrypted for key id" in str(result.exception)
+
+
+# --------------------------------------------------------------------------
+# Several recipients
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def group(workspace, runner):
+    """alice (from `workspace`) plus bob and carol, all with key pairs."""
+    for name in ("bob", "carol"):
+        result = run(runner, "keygen", "-o", name)
+        assert result.exit_code == 0, shown(result)
+    (workspace / "msg.txt").write_bytes(b"minutes of the meeting\n")
+    return workspace
+
+
+class TestSeveralRecipients:
+    def test_every_recipient_can_decrypt(self, group, runner) -> None:
+        result = run(
+            runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+            "-r", "carol.pub", "msg.txt", "-o", "g.hpqc",
+        )
+        assert result.exit_code == 0, shown(result)
+        assert "encrypted to 3 recipients" in shown(result)
+
+        for name in ("alice", "bob", "carol"):
+            out = f"{name}.txt"
+            result = run(runner, "decrypt", "-k", f"{name}.key", "g.hpqc", "-o", out)
+            assert result.exit_code == 0, shown(result)
+            assert (group / out).read_bytes() == b"minutes of the meeting\n"
+
+    def test_info_reports_the_count_and_not_the_names(self, group, runner) -> None:
+        run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+            "msg.txt", "-o", "g.hpqc")
+        result = run(runner, "info", "g.hpqc")
+
+        assert "recipients:  2 (the file does not name them)" in shown(result)
+        for name in ("alice", "bob"):
+            key_id = PublicKey.read(group / f"{name}.pub").key_id_hex
+            assert key_id not in shown(result)
+
+    def test_one_recipient_still_names_its_recipient(self, group, runner) -> None:
+        """The older shape is not gone, and `info` still says who a file is for."""
+        run(runner, "encrypt", "-r", "alice.pub", "msg.txt", "-o", "one.hpqc")
+        result = run(runner, "info", "one.hpqc")
+
+        key_id = PublicKey.read(group / "alice.pub").key_id_hex
+        assert f"recipient:   key id {key_id}" in shown(result)
+
+    def test_hide_recipients_works_with_one(self, group, runner) -> None:
+        run(runner, "encrypt", "-r", "alice.pub", "--hide-recipients",
+            "msg.txt", "-o", "h.hpqc")
+        result = run(runner, "info", "h.hpqc")
+
+        assert "recipients:  1" in shown(result)
+        key_id = PublicKey.read(group / "alice.pub").key_id_hex
+        assert key_id not in shown(result)
+
+        result = run(runner, "decrypt", "-k", "alice.key", "h.hpqc", "-o", "back.txt")
+        assert result.exit_code == 0, shown(result)
+        assert (group / "back.txt").read_bytes() == b"minutes of the meeting\n"
+
+    def test_an_outsider_is_refused_and_nothing_is_written(
+        self, group, runner
+    ) -> None:
+        run(runner, "keygen", "-o", "dave")
+        run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+            "msg.txt", "-o", "g.hpqc")
+
+        result = runner.invoke(
+            cli, ["decrypt", "-k", "dave.key", "g.hpqc", "-o", "no.txt"]
+        )
+
+        assert result.exit_code != 0
+        assert "2 recipient slot" in str(result.exception)
+        assert not (group / "no.txt").exists()
+
+    def test_the_same_recipient_twice_is_refused(self, group, runner) -> None:
+        result = run(runner, "encrypt", "-r", "alice.pub", "-r", "alice.pub",
+                     "msg.txt", "-o", "x.hpqc")
+
+        assert result.exit_code != 0
+        assert "same key" in shown(result)
+        assert not (group / "x.hpqc").exists()
+
+    def test_a_copy_of_a_key_under_another_name_is_still_a_duplicate(
+        self, group, runner
+    ) -> None:
+        """The check is on the key, not the filename."""
+        (group / "alias.pub").write_text((group / "alice.pub").read_text())
+        result = run(runner, "encrypt", "-r", "alice.pub", "-r", "alias.pub",
+                     "msg.txt", "-o", "x.hpqc")
+
+        assert result.exit_code != 0
+        assert "same key" in shown(result)
+
+    def test_signing_to_several_recipients_is_refused(self, group, runner) -> None:
+        run(runner, "signgen", "-o", "signer")
+        result = run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+                     "msg.txt", "-o", "x.hpqc", "-s", "signer.key")
+
+        assert result.exit_code != 0
+        assert "cannot yet be combined with a recipient list" in shown(result)
+        assert not (group / "x.hpqc").exists()
+
+    def test_a_large_file_streams_to_several_recipients(self, group, runner) -> None:
+        big = b"\xa5" * (ONE_SHOT_LIMIT + 4096)
+        (group / "big.bin").write_bytes(big)
+
+        result = run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+                     "big.bin", "-o", "big.hpqc")
+        assert result.exit_code == 0, shown(result)
+        assert "streamed in" in shown(result)
+
+        info = shown(run(runner, "info", "big.hpqc"))
+        assert "chunked:     yes" in info
+        assert "recipients:  2" in info
+
+        result = run(runner, "decrypt", "-k", "bob.key", "big.hpqc", "-o", "back.bin")
+        assert result.exit_code == 0, shown(result)
+        assert (group / "back.bin").read_bytes() == big
+
+    def test_it_pipes(self, group, runner) -> None:
+        result = run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+                     stdin=b"piped to a group")
+        assert result.exit_code == 0, result.stderr
+        blob = result.stdout_bytes
+
+        (group / "p.hpqc").write_bytes(blob)
+        result = runner.invoke(cli, ["decrypt", "-k", "carol.key", "p.hpqc", "-o", "-"])
+        assert result.exit_code != 0
+        assert "recipient slot" in str(result.exception)
+
+        result = run(runner, "decrypt", "-k", "bob.key", "p.hpqc", "-o", "-")
+        assert result.stdout_bytes == b"piped to a group"
+
+    def test_the_recipient_notice_never_lands_on_stdout(self, group, runner) -> None:
+        """Same rule as the signature notice: stdout may be the ciphertext."""
+        result = run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+                     stdin=b"x")
+        assert "recipients" not in result.stdout_bytes.decode("latin-1")
+        assert "encrypted to 2 recipients" in result.stderr
+
+    def test_a_header_past_the_read_ahead_still_describes(
+        self, group, runner
+    ) -> None:
+        """`info` reads a header it cannot size in advance."""
+        names = [f"r{i}" for i in range(6)]
+        for name in names:
+            run(runner, "keygen", "-o", name)
+        args = []
+        for name in names:
+            args += ["-r", f"{name}.pub"]
+
+        result = run(runner, "encrypt", *args, "msg.txt", "-o", "many.hpqc")
+        assert result.exit_code == 0, shown(result)
+
+        header_len = len(parse_header((group / "many.hpqc").read_bytes())[1])
+        assert header_len > 4096
+
+        result = run(runner, "info", "many.hpqc")
+        assert f"header:      {header_len} bytes" in shown(result)
+        assert "recipients:  6" in shown(result)

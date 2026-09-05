@@ -9,7 +9,7 @@ changing the parser -- the header length-prefixes every variable-size field.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict
+from typing import Callable, Dict, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
@@ -61,6 +61,15 @@ BY_CLI_NAME: Dict[str, Suite] = {
     "chacha20": CHACHA20_POLY1305,
     "aes": AES_256_GCM,
 }
+
+
+def all_suites() -> Tuple[Suite, ...]:
+    """Every suite this build implements, in id order.
+
+    Exposed so that code sizing a buffer can ask "what is the largest any
+    registered suite could need" rather than hardcoding today's answer.
+    """
+    return tuple(_BY_ID[i] for i in sorted(_BY_ID))
 
 
 def by_id(suite_id: int) -> Suite:

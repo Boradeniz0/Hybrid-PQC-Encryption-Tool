@@ -15,6 +15,10 @@ byte string the signatures cover, which pins the construction, and one container
 that must never verify -- a signature made for a different recipient, re-sealed.
 tests/vectors/v1-chunked.json covers the streamed payload shape, and records the
 STREAM nonce table for the same reason the signed file records digests.
+tests/vectors/v1-recipients.json covers files written to a list of recipients,
+and records the derived wrapping key and the sealed file key for fixed inputs --
+because a recorded container would still round-trip after the wrapping label,
+the salt, or the recipient binding had been dropped from the derivation.
 
 The digests matter because a recorded *signature* cannot pin a construction. Drop
 the recipient from the signed message and the recorded signature stops verifying
@@ -39,9 +43,11 @@ from pathlib import Path
 
 import pytest
 
-from hpqc import hybrid, signing, streaming, suites, wrapping
+from hpqc import container as container_module
+from hpqc import hybrid, recipients, signing, streaming, suites, wrapping
 from hpqc.container import (
     FLAG_CHUNKED,
+    FLAG_RECIPIENTS,
     FLAG_SIGNED,
     FORMAT_VERSION,
     decrypt,
@@ -49,7 +55,12 @@ from hpqc.container import (
     open_container,
     parse_header,
 )
-from hpqc.errors import HpqcError, PassphraseError, SignatureError
+from hpqc.errors import (
+    HpqcError,
+    PassphraseError,
+    SignatureError,
+    WrongRecipientError,
+)
 from hpqc.keys import PrivateKey, PublicKey, SigningPrivateKey, SigningPublicKey
 
 
@@ -62,6 +73,7 @@ VECTORS = _load("v1.json")
 SIGNED = _load("v1-signed.json")
 WRAPPED = _load("v1-wrapped.json")
 CHUNKED = _load("v1-chunked.json")
+RECIPIENTS = _load("v1-recipients.json")
 
 
 @pytest.fixture(scope="module")
@@ -487,3 +499,211 @@ def test_a_recorded_multi_chunk_container_loses_its_last_chunk_and_fails(
 
     with pytest.raises(HpqcError):
         _open_chunked(cut, chunked_identity)
+
+
+# --------------------------------------------------------------------------
+# Recipient lists
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def listed_identities():
+    return [PrivateKey.decode(text) for text in RECIPIENTS["identities"]]
+
+
+@pytest.fixture(scope="module")
+def listed_stranger() -> PrivateKey:
+    return PrivateKey.decode(RECIPIENTS["stranger"])
+
+
+def test_the_recipient_vectors_target_this_format() -> None:
+    assert RECIPIENTS["format_version"] == FORMAT_VERSION
+    assert RECIPIENTS["flag_recipients"] == FLAG_RECIPIENTS
+
+
+def test_the_file_key_wrap_label_has_not_changed() -> None:
+    """A different label from the payload's, and the same one as yesterday's.
+
+    Change it and every stanza ever written becomes unopenable -- while every
+    round-trip test keeps passing, because both halves would move together.
+    """
+    assert hybrid.WRAP_LABEL.decode("ascii") == RECIPIENTS["wrap_label"]
+    assert hybrid.WRAP_LABEL != hybrid.HKDF_LABEL
+
+
+def test_the_stanza_layout_constants_have_not_changed() -> None:
+    """Nothing in a container states these; the reader counts on them."""
+    layout = RECIPIENTS["layout"]
+    assert layout["max_recipients"] == recipients.MAX_RECIPIENTS
+    assert layout["wrap_tag_len"] == recipients.WRAP_TAG_LEN
+    assert layout["no_key_id"] == container_module.NO_KEY_ID.hex()
+    for name, expected in layout["stanza_len"].items():
+        assert recipients.stanza_len(suites.BY_CLI_NAME[name]) == expected
+
+    # The two offsets, checked against a real header rather than restated.
+    blob = bytes.fromhex(RECIPIENTS["containers"][0]["container"])
+    header, header_bytes, _ = parse_header(blob)
+    assert header.multi
+    count_offset = layout["count_offset"]
+    assert int.from_bytes(
+        blob[count_offset : count_offset + 2], "big"
+    ) == header.recipient_count
+    assert layout["first_stanza_offset"] == count_offset + 2
+
+
+@pytest.mark.parametrize(
+    "vector",
+    RECIPIENTS["wrappings"],
+    ids=[v["suite"] for v in RECIPIENTS["wrappings"]],
+)
+def test_the_wrapping_derivation_is_unchanged(vector) -> None:
+    """The vector that actually pins the scheme.
+
+    Drop the salt, reuse the payload label, stop binding the recipient's public
+    keys -- a recorded container survives every one of those, because the
+    writer and the reader move together and the file still opens. Recording the
+    derived key and the sealed blob for fixed inputs is what notices.
+    """
+    suite = suites.BY_CLI_NAME[vector["suite"]]
+    recipient = PublicKey.decode(RECIPIENTS["publics"][vector["recipient_index"]])
+
+    wrapping_key = hybrid.derive_key(
+        ikm=bytes.fromhex(vector["ikm"]),
+        salt=bytes.fromhex(vector["salt"]),
+        suite=suite,
+        ephemeral_public=bytes.fromhex(vector["ephemeral_public"]),
+        kem_ciphertext=bytes.fromhex(vector["kem_ciphertext"]),
+        recipient=recipient,
+        label=hybrid.WRAP_LABEL,
+    )
+    assert wrapping_key.hex() == vector["wrapping_key"]
+
+    # And the sealing on top of it: the nonce is all zeros, deliberately.
+    nonce = bytes.fromhex(vector["nonce"])
+    assert nonce == b"\x00" * suite.nonce_len
+    sealed = suite.aead(wrapping_key).encrypt(
+        nonce, bytes.fromhex(vector["file_key"]), None
+    )
+    assert sealed.hex() == vector["wrapped_key"]
+    assert suite.aead(wrapping_key).decrypt(
+        nonce, bytes.fromhex(vector["wrapped_key"]), None
+    ) == bytes.fromhex(vector["file_key"])
+
+
+@pytest.mark.parametrize(
+    "vector",
+    RECIPIENTS["containers"],
+    ids=[f"{v['suite']}-{v['recipients']}to" for v in RECIPIENTS["containers"]],
+)
+class TestRecordedRecipientLists:
+    def test_every_recorded_recipient_still_opens_it(
+        self, vector, listed_identities
+    ) -> None:
+        blob = bytes.fromhex(vector["container"])
+        for identity in listed_identities[: vector["recipients"]]:
+            assert decrypt(blob, identity) == bytes.fromhex(vector["plaintext"])
+
+    def test_a_stranger_still_cannot(self, vector, listed_stranger) -> None:
+        blob = bytes.fromhex(vector["container"])
+        with pytest.raises(WrongRecipientError):
+            decrypt(blob, listed_stranger)
+
+    def test_its_header_still_parses_as_recorded(self, vector) -> None:
+        header, header_bytes, _ = parse_header(bytes.fromhex(vector["container"]))
+        suite = suites.BY_CLI_NAME[vector["suite"]]
+
+        assert header.version == FORMAT_VERSION
+        assert header.multi and not header.signed and not header.chunked
+        assert header.suite.id == vector["suite_id"]
+        assert header.key_id == container_module.NO_KEY_ID
+        assert header.recipient_count == vector["recipients"]
+        assert len(header_bytes) == 46 + vector["recipients"] * recipients.stanza_len(
+            suite
+        )
+
+    def test_it_still_names_nobody(self, vector) -> None:
+        blob = bytes.fromhex(vector["container"])
+        for key_id in RECIPIENTS["key_ids"]:
+            assert bytes.fromhex(key_id) not in blob
+
+PARTIAL_LISTS = [v for v in RECIPIENTS["containers"] if v["recipients"] < 3]
+SHAREABLE_LISTS = [v for v in RECIPIENTS["containers"] if v["recipients"] > 1]
+
+
+@pytest.mark.parametrize(
+    "vector", PARTIAL_LISTS,
+    ids=[f"{v['suite']}-{v['recipients']}to" for v in PARTIAL_LISTS],
+)
+def test_an_identity_left_off_a_recorded_list_still_cannot_open_it(
+    vector, listed_identities
+) -> None:
+    """The recipients are a prefix of three, so the rest must be refused.
+
+    A bug that opened any stanza with any key would sail past the stranger
+    test -- that key was never in the file at all -- and fail here.
+    """
+    blob = bytes.fromhex(vector["container"])
+    for identity in listed_identities[vector["recipients"] :]:
+        with pytest.raises(WrongRecipientError):
+            decrypt(blob, identity)
+
+
+@pytest.mark.parametrize(
+    "vector", SHAREABLE_LISTS,
+    ids=[f"{v['suite']}-{v['recipients']}to" for v in SHAREABLE_LISTS],
+)
+def test_dropping_a_stanza_from_a_recorded_list_is_still_refused(
+    vector, listed_identities
+) -> None:
+    """Cut on a stanza boundary and fix the count: nothing is corrupted.
+
+    Every remaining stanza is a genuine one and the header parses. Only the
+    payload's associated data covering the whole list catches it.
+    """
+    suite = suites.BY_CLI_NAME[vector["suite"]]
+    blob = bytes.fromhex(vector["container"])
+    _, header_bytes, payload = parse_header(blob)
+
+    shortened = bytearray(
+        header_bytes[: len(header_bytes) - recipients.stanza_len(suite)]
+    )
+    shortened[44:46] = (vector["recipients"] - 1).to_bytes(2, "big")
+    forged = bytes(shortened) + payload
+
+    assert parse_header(forged)[0].recipient_count == vector["recipients"] - 1
+    with pytest.raises(HpqcError):
+        decrypt(forged, listed_identities[0])
+
+
+def test_the_recorded_chunked_recipient_list_still_opens(listed_identities) -> None:
+    """Both flags at once, on a file written before this test existed."""
+    vector = RECIPIENTS["chunked_container"]
+    blob = bytes.fromhex(vector["container"])
+
+    header, _, _ = parse_header(blob)
+    assert header.flags == vector["flags"]
+    assert header.multi and header.chunked
+
+    for identity in listed_identities[: vector["recipients"]]:
+        sink = io.BytesIO()
+        opened = decrypt_stream(io.BytesIO(blob), sink, identity)
+        assert opened.chunks == vector["chunks"]
+        assert len(sink.getvalue()) == vector["plaintext_len"]
+        assert (
+            hashlib.sha256(sink.getvalue()).hexdigest()
+            == vector["plaintext_sha256"]
+        )
+
+
+def test_the_recorded_chunked_recipient_list_still_refuses_truncation(
+    listed_identities,
+) -> None:
+    vector = RECIPIENTS["chunked_container"]
+    blob = bytes.fromhex(vector["container"])
+
+    with pytest.raises(HpqcError):
+        decrypt_stream(
+            io.BytesIO(blob[: -streaming.WIRE_CHUNK_SIZE]),
+            io.BytesIO(),
+            listed_identities[0],
+        )

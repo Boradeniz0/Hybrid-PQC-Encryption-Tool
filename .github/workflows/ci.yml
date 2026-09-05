@@ -173,3 +173,63 @@ jobs:
           cat big.bin | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key > piped-big.bin
           cmp big.bin piped-big.bin
           echo "large stdin/stdout pipeline: ok"
+
+          # Several recipients. The point of the shape is that the file names
+          # nobody, so the checks are as much about what is absent as present.
+          hpqc keygen -o second
+          hpqc keygen -o third
+          hpqc encrypt -r ci.pub -r second.pub -r third.pub msg.txt -o group.hpqc
+          hpqc info group.hpqc | grep -q '^recipients:  3 (the file does not name them)'
+          for who in ci second third; do
+            hpqc decrypt -k "$who.key" group.hpqc -o "got-$who.txt"
+            cmp msg.txt "got-$who.txt"
+          done
+          echo "three recipients, three round trips: ok"
+          # Hex, not grep: a key id is binary and would never match as text.
+          # od rather than xxd, which is not guaranteed to be installed.
+          tohex() { od -An -v -tx1 "$1" | tr -d ' \n'; }
+          for who in ci second third; do
+            id="$(hpqc info "$who.pub" | sed -n 's/^key id: *//p')"
+            if tohex group.hpqc | grep -q "$id"; then
+              echo "FAIL: $who's key id appears in the container"; exit 1
+            fi
+          done
+          echo "no recipient is named in the file: ok"
+          # The same search against the shape that is supposed to contain it,
+          # so a broken search cannot make the check above pass for free.
+          ci_id="$(hpqc info ci.pub | sed -n 's/^key id: *//p')"
+          tohex msg.hpqc | grep -q "$ci_id"
+          echo "the single-recipient shape does name its recipient: ok"
+
+          hpqc keygen -o outsider
+          if hpqc decrypt -k outsider.key group.hpqc -o /dev/null 2>err.txt; then
+            echo "FAIL: an outsider opened a group file"; exit 1
+          fi
+          grep -q '3 recipient slot' err.txt
+          echo "outsider rejected: ok"
+          if hpqc encrypt -r ci.pub -r ci.pub msg.txt -o dup.hpqc 2>err.txt; then
+            echo "FAIL: the same recipient twice was accepted"; exit 1
+          fi
+          grep -q 'same key' err.txt
+          echo "duplicate recipient refused: ok"
+          if hpqc encrypt -r ci.pub -r second.pub msg.txt -o x.hpqc -s signer.key 2>err.txt; then
+            echo "FAIL: signed to a recipient list"; exit 1
+          fi
+          grep -q 'cannot yet be combined with a recipient list' err.txt
+          echo "signing to a list refused: ok"
+
+          hpqc encrypt -r ci.pub --hide-recipients msg.txt -o hidden.hpqc
+          hpqc info hidden.hpqc | grep -q '^recipients:  1'
+          hpqc decrypt -k ci.key hidden.hpqc -o hidden-out.txt
+          cmp msg.txt hidden-out.txt
+          echo "one hidden recipient: ok"
+
+          # Both flags at once, streamed, through a pipe on both ends.
+          cat big.bin | hpqc encrypt -r ci.pub -r second.pub \
+            | hpqc decrypt -k second.key > group-big.bin
+          cmp big.bin group-big.bin
+          echo "chunked + several recipients through a pipe: ok"
+          hpqc encrypt -r ci.pub -r second.pub big.bin -o group-big.hpqc
+          hpqc info group-big.hpqc | grep -q '^chunked:     yes'
+          hpqc info group-big.hpqc | grep -q '^recipients:  2'
+          echo "info reports both shapes at once: ok"

@@ -219,13 +219,13 @@ def test_an_unknown_suite_is_refused(alice, alice_pub) -> None:
         decrypt(bytes(blob), alice)
 
 
-@pytest.mark.parametrize("value", [0x04, 0x08, 0x80, 0xFC])
+@pytest.mark.parametrize("value", [0x08, 0x10, 0x80, 0xF8])
 def test_unknown_flag_bits_are_refused(value, alice, alice_pub) -> None:
     """Reserved bits are a forward-compatibility hook, not something to ignore.
 
-    Bits 0 and 1 are taken (FLAG_SIGNED, FLAG_CHUNKED); every other bit still
-    has to be refused by name, so a file written by a newer build fails loudly
-    here instead of being half understood.
+    Bits 0, 1 and 2 are taken (FLAG_SIGNED, FLAG_CHUNKED, FLAG_RECIPIENTS);
+    every other bit still has to be refused by name, so a file written by a
+    newer build fails loudly here instead of being half understood.
     """
     blob = bytearray(encrypt(b"secret", alice_pub))
     blob[OFF_FLAGS + 1] = value

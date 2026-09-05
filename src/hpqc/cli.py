@@ -3,6 +3,7 @@
     hpqc keygen  -o alice
     hpqc signgen -o alice-sign
     hpqc encrypt -r bob.pub secret.pdf -o secret.pdf.hpqc -s alice-sign.key
+    hpqc encrypt -r bob.pub -r carol.pub notes.txt -o notes.hpqc
     hpqc decrypt -k bob.key secret.pdf.hpqc -o secret.pdf --sender alice-sign.pub
     hpqc info    secret.pdf.hpqc
 
@@ -161,6 +162,29 @@ def _open_private(path: str, passphrase_file: Optional[str], cls):
         # this file is not protected, which is what the user needs to hear.
         passphrase = _read_passphrase_file(passphrase_file)
     return cls.decode(text, passphrase)
+
+
+def _read_recipients(paths) -> "list":
+    """Load every -r file, refusing a list that repeats someone.
+
+    A duplicate is harmless to the format -- two stanzas that both open for the
+    same person -- but it is far more likely to be a shell mistake than a plan,
+    and the case worth catching is the one where a *different* recipient was
+    meant and is now missing.
+    """
+    loaded = []
+    seen = {}
+    for path in paths:
+        public = PublicKey.read(path)
+        if public.key_id in seen:
+            raise click.ClickException(
+                f"{path} and {seen[public.key_id]} are the same key "
+                f"(key id {public.key_id_hex}); listing a recipient twice is "
+                "more often a mistake than a plan"
+            )
+        seen[public.key_id] = path
+        loaded.append(public)
+    return loaded
 
 
 def _read_input(path: str) -> bytes:
@@ -402,10 +426,20 @@ def signgen(
 @click.option(
     "-r",
     "--recipient",
-    "recipient_path",
+    "recipient_paths",
     required=True,
+    multiple=True,
     type=click.Path(exists=True, dir_okay=False),
-    help="Recipient's .pub file.",
+    help="Recipient's .pub file. Repeat it to encrypt to several people.",
+)
+@click.option(
+    "--hide-recipients",
+    is_flag=True,
+    help=(
+        "Leave the recipient unnamed in the header. This is automatic with "
+        "more than one recipient -- there is no single name to write -- and "
+        "the flag asks for the same treatment with exactly one."
+    ),
 )
 @click.option("-o", "--out", "output_path", default=STDIO, help="Output file.")
 @click.option(
@@ -439,14 +473,15 @@ def signgen(
 )
 def encrypt(
     input_path: str,
-    recipient_path: str,
+    recipient_paths: tuple,
+    hide_recipients: bool,
     output_path: str,
     aead: str,
     signing_key_path: Optional[str],
     chunked: Optional[bool],
     passphrase_file: Optional[str],
 ) -> None:
-    """Encrypt INPUT (default stdin) to a recipient's public key."""
+    """Encrypt INPUT (default stdin) to one or more public keys."""
     if signing_key_path is None and passphrase_file is not None:
         raise click.ClickException(
             "--passphrase-file only makes sense with --sign; there is no "
@@ -458,8 +493,16 @@ def encrypt(
             "statement about a whole message, so it cannot be produced until "
             "the whole message has been read"
         )
+    listed = len(recipient_paths) > 1 or hide_recipients
+    if listed and signing_key_path is not None:
+        raise click.ClickException(
+            "--sign cannot yet be combined with a recipient list: the "
+            "signature binds the recipient it was written for, which is what "
+            "stops one recipient passing it on as if you had addressed it to "
+            "somebody else. Binding a whole set is not implemented"
+        )
 
-    recipient = PublicKey.read(recipient_path)
+    to = _read_recipients(recipient_paths)
     sender = (
         _open_private(signing_key_path, passphrase_file, SigningPrivateKey)
         if signing_key_path is not None
@@ -486,11 +529,12 @@ def encrypt(
 
         if stream_it:
             with _output_stream(output_path) as sink:
-                chunks = container.encrypt_stream(
+                chunks = container.encrypt_stream_many(
                     streaming.PrefixedStream(head, source),
                     sink,
-                    recipient,
-                    suite,
+                    to,
+                    suite=suite,
+                    hide_recipients=hide_recipients,
                 )
             click.echo(
                 f"streamed in {chunks} chunks of "
@@ -498,12 +542,21 @@ def encrypt(
                 err=True,
             )
         else:
-            blob = container.encrypt(
-                head + source.read(), recipient, suite, sender=sender
+            blob = container.encrypt_many(
+                head + source.read(),
+                to,
+                suite=suite,
+                sender=sender,
+                hide_recipients=hide_recipients,
             )
             with _output_stream(output_path) as sink:
                 sink.write(blob)
 
+    if len(to) > 1:
+        click.echo(
+            f"encrypted to {len(to)} recipients; the file does not name them",
+            err=True,
+        )
     if sender is not None:
         click.echo(
             f"signed by key id {sender.public_key().key_id_hex}", err=True
@@ -681,18 +734,25 @@ def info(input_path: str) -> None:
     if input_path == STDIO:
         data = _read_input(input_path)
         front, total = data, len(data)
+        if front.startswith(container.MAGIC):
+            _describe_container(streaming.PrefixedStream(front), total)
+            return
     else:
         # Everything reported about a container lives in its header, and a
         # container can now be larger than memory, so read the front and take
         # the size from the filesystem rather than pulling it all in to print
         # nine lines.
-        with _input_stream(input_path) as source:
-            front = streaming.read_exactly(source, container.MAX_HEADER_LEN)
         total = Path(input_path).stat().st_size
-
-    if front.startswith(container.MAGIC):
-        _describe_container(front, total)
-        return
+        with _input_stream(input_path) as source:
+            front = streaming.read_exactly(source, container.HEADER_READ_AHEAD)
+            if front.startswith(container.MAGIC):
+                # Handed the still-open stream, not just the bytes: a long
+                # recipient list can push the header past the read-ahead, and
+                # read_header goes back for the rest itself.
+                _describe_container(
+                    streaming.PrefixedStream(front, source), total
+                )
+                return
 
     data = front if input_path == STDIO else _read_input(input_path)
     text = _as_text(data)
@@ -741,20 +801,33 @@ def _as_text(data: bytes) -> Optional[str]:
         return None
 
 
-def _describe_container(front: bytes, total: int) -> None:
+def _describe_container(source: BinaryIO, total: int) -> None:
     """Report on a container from its header plus the file's total size.
 
-    `front` need only be long enough to hold the header; the payload length is
-    arithmetic, not something that has to be read.
+    Only the header is read; the payload length is arithmetic, not something
+    that has to be pulled off disk.
     """
-    header, header_bytes, _ = container.parse_header(front)
+    header, header_bytes, _ = container.read_header(source)
     payload = total - len(header_bytes)
     click.echo("type:        hpqc container")
     click.echo(f"version:     {header.version}")
     click.echo(f"suite:       {header.suite.name} (0x{header.suite.id:02x})")
-    click.echo(f"recipient:   key id {header.key_id_hex}")
+    if header.multi:
+        # The count is all there is to report. Naming the recipients is what
+        # the list shape exists to avoid, so `info` on someone else's file
+        # reveals how many people can read it and not one of them.
+        click.echo(
+            f"recipients:  {header.recipient_count} (the file does not "
+            "name them)"
+        )
+    else:
+        click.echo(f"recipient:   key id {header.key_id_hex}")
     click.echo(f"header:      {len(header_bytes)} bytes (authenticated as AAD)")
-    click.echo(f"kem ct:      {len(header.kem_ciphertext)} bytes")
+    if header.multi:
+        kem_len = len(header.stanzas[0].kem_ciphertext)
+        click.echo(f"kem ct:      {kem_len} bytes x {header.recipient_count}")
+    else:
+        click.echo(f"kem ct:      {len(header.kem_ciphertext)} bytes")
     if header.chunked:
         chunks = streaming.chunk_count(payload)
         click.echo(f"payload:     {payload} bytes")
