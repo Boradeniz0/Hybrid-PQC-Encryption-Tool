@@ -67,15 +67,13 @@ been read, and it cannot be checked until the whole message has been received.
 Signing therefore uses the one-shot payload, and a container claiming to be
 both signed and chunked is refused as malformed.
 
-Signing is also, for now, mutually exclusive with a recipient list -- but for a
-reason that is an implementation gap rather than a law of nature. The signature
-binds the recipient's public keys into the signed message, which is what stops
-surreptitious forwarding (see signing.py); with several recipients it has to
-bind the whole set instead, and the set has to travel inside the AEAD so that
-an eavesdropper still cannot read it. Until that exists, the combination is
-refused rather than approximated: binding just one of the recipients would
-verify for that person and fail for everybody else, and binding none of them
-would quietly reopen the forwarding hole.
+Signing composes with a recipient list, but not by the obvious route. The
+signature normally binds the recipient's public keys into the signed message,
+which is what stops surreptitious forwarding (see signing.py) -- and a file
+with a recipient list names no recipients, so there is nothing there to bind.
+What gets bound instead is the header itself, stanzas and all: the delivery
+rather than a description of it. Which of the two constructions a file uses is
+decided by flag bit 2, and the reader knows it before it opens anything.
 """
 
 from __future__ import annotations
@@ -259,15 +257,6 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
             f"this build does not implement (known flags: 0x{_KNOWN_FLAGS:04x})"
         )
 
-    if flags & FLAG_SIGNED and flags & FLAG_RECIPIENTS:
-        # Never written by this build. Refusing is the fail-closed answer: the
-        # alternative is verifying a signature whose recipient binding cannot
-        # be reconstructed, which is a check that looks like it passed.
-        raise FormatError(
-            "header claims the payload is both signed and encrypted to a "
-            "recipient list; this build does not sign to several recipients"
-        )
-
     if flags & FLAG_SIGNED and flags & FLAG_CHUNKED:
         # Never written, so this can only be a doctored header. Refuse it here
         # rather than let a signature parser loose on chunk framing: the
@@ -366,7 +355,7 @@ def encrypt(
     suite: Suite = DEFAULT_SUITE,
     sender: Optional[SigningPrivateKey] = None,
 ) -> bytes:
-    """Encrypt to a recipient, optionally signing as `sender`.
+    """Encrypt to a single named recipient, optionally signing as `sender`.
 
     Signing happens *before* encryption: the signature block is prepended to
     the plaintext and the whole thing is sealed, so the signer's identity is
@@ -392,20 +381,24 @@ def encrypt_many(
     recipient list, which names nobody and adds one stanza per recipient.
     """
     flags = _recipient_flags(to, hide_recipients)
+    if sender is not None:
+        flags |= FLAG_SIGNED
 
-    if sender is not None and flags & FLAG_RECIPIENTS:
-        raise ValueError(
-            "signing to a recipient list is not implemented: the signature "
-            "binds the recipient, and binding one of several would verify for "
-            "that recipient and fail for the rest"
-        )
+    # The header is built first, because with a recipient list the signature is
+    # computed over it. Nothing circular in that: the stanzas depend on the
+    # file key, the header on the stanzas, and only then is the payload sealed.
+    header, header_bytes, key = _seal_setup(to, suite, flags)
 
     payload = plaintext
     if sender is not None:
-        payload = signing.sign_payload(plaintext, sender, to[0], suite)
-        flags |= FLAG_SIGNED
+        payload = (
+            signing.sign_payload_to_container(
+                plaintext, sender, header_bytes, suite
+            )
+            if header.multi
+            else signing.sign_payload(plaintext, sender, to[0], suite)
+        )
 
-    header, header_bytes, key = _seal_setup(to, suite, flags)
     ciphertext = suite.aead(key).encrypt(header.nonce, payload, header_bytes)
     return header_bytes + ciphertext
 
@@ -621,9 +614,17 @@ def open_container(
             )
         return Opened(plaintext=payload)
 
-    plaintext, signer = signing.open_payload(
-        payload, recipient, header.suite, expected_sender=sender
-    )
+    if header.multi:
+        # No recipient to bind, so the container was bound instead -- and the
+        # header handed over here is the one this reader parsed, never one the
+        # payload got to name. See signing.py.
+        plaintext, signer = signing.open_container_payload(
+            payload, header_bytes, header.suite, expected_sender=sender
+        )
+    else:
+        plaintext, signer = signing.open_payload(
+            payload, recipient, header.suite, expected_sender=sender
+        )
     return Opened(
         plaintext=plaintext, signer=signer, verified=sender is not None
     )

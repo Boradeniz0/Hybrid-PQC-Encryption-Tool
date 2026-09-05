@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 543 tests). This is
+The automated suite covers all of this and more (`pytest`, 593 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -278,6 +278,58 @@ still hers. It fails anyway, because the whole header is the payload's
 associated data — so cutting bob out of the conversation is a denial of
 service, not a silent edit.
 
+### Signing to a group
+
+There is no recipient named in the file, so the signature binds the header
+instead — the delivery rather than a description of it.
+
+```console
+hpqc signgen -o dave-sign
+hpqc signgen -o impostor
+
+hpqc encrypt -r alice.pub -r bob.pub -r carol.pub minutes.txt \
+  -o signed.hpqc -s dave-sign.key
+hpqc info signed.hpqc | grep -E 'recipients|signed'
+for who in alice bob carol; do
+  hpqc decrypt -k $who.key signed.hpqc -o /dev/null --sender dave-sign.pub
+done
+```
+
+```
+recipients:  3 (the file does not name them)
+signed:      yes (signer is encrypted; decrypt to see who)
+signature ok: signed by key id f8705c71fad8bb04
+signature ok: signed by key id f8705c71fad8bb04
+signature ok: signed by key id f8705c71fad8bb04
+```
+
+One signature, three recipients, and none of them learns who the others are.
+`info` still cannot see who signed, because the signature block is inside the
+AEAD.
+
+```console
+hpqc decrypt -k bob.key signed.hpqc -o /dev/null --sender impostor.pub
+echo "exit=$?"
+```
+
+That fails, naming both key ids rather than reporting a cryptographic error for
+what is really a key mix-up.
+
+The signature block costs the same as it does anywhere else — post-quantum
+signatures are simply large:
+
+```console
+hpqc encrypt -r alice.pub -r bob.pub -r carol.pub minutes.txt -o plain.hpqc
+stat -c '%n %s' plain.hpqc signed.hpqc
+```
+
+```
+plain.hpqc 3607
+signed.hpqc 8972
+```
+
+5365 bytes of it, of which ML-DSA-65's signature alone is 3309.
+
 ## 6. What has to fail
 
 This is the interesting part. Each of these must exit non-zero with a readable
@@ -326,7 +378,7 @@ transcript — so it cannot be used to steer a recipient onto a different cipher
 ## 7. The test suite
 
 ```console
-pytest -q                 # 543 passed
+pytest -q                 # 593 passed
 pytest -q -W error        # clean with warnings escalated to errors
 ```
 

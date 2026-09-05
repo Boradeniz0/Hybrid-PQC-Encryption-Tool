@@ -212,11 +212,12 @@ jobs:
           fi
           grep -q 'same key' err.txt
           echo "duplicate recipient refused: ok"
-          if hpqc encrypt -r ci.pub -r second.pub msg.txt -o x.hpqc -s signer.key 2>err.txt; then
-            echo "FAIL: signed to a recipient list"; exit 1
+          if hpqc encrypt -r ci.pub -r second.pub msg.txt -o x.hpqc \
+               -s signer.key --chunked 2>err.txt; then
+            echo "FAIL: signed and chunked at once"; exit 1
           fi
-          grep -q 'cannot yet be combined with a recipient list' err.txt
-          echo "signing to a list refused: ok"
+          grep -q 'cannot be combined' err.txt
+          echo "signing a chunked list refused: ok"
 
           hpqc encrypt -r ci.pub --hide-recipients msg.txt -o hidden.hpqc
           hpqc info hidden.hpqc | grep -q '^recipients:  1'
@@ -233,3 +234,34 @@ jobs:
           hpqc info group-big.hpqc | grep -q '^chunked:     yes'
           hpqc info group-big.hpqc | grep -q '^recipients:  2'
           echo "info reports both shapes at once: ok"
+
+          # Signing to a recipient list. There is no recipient to bind, so the
+          # header is bound instead -- every recipient verifies one signature.
+          hpqc encrypt -r ci.pub -r second.pub -r third.pub msg.txt \
+            -o signed-group.hpqc -s signer.key
+          hpqc info signed-group.hpqc | grep -q '^recipients:  3'
+          hpqc info signed-group.hpqc | grep -q '^signed:      yes'
+          for who in ci second third; do
+            hpqc decrypt -k "$who.key" signed-group.hpqc -o "sg-$who.txt" \
+              --sender signer.pub 2>"sg-$who.err"
+            cmp msg.txt "sg-$who.txt"
+            grep -q 'signature ok' "sg-$who.err"
+          done
+          echo "signed to three recipients, three verifications: ok"
+          if hpqc decrypt -k ci.key signed-group.hpqc -o /dev/null \
+               --sender impostor.pub 2>err.txt; then
+            echo "FAIL: verified a group file against the wrong sender"; exit 1
+          fi
+          grep -q 'but verification was requested against' err.txt
+          echo "wrong sender on a group file rejected: ok"
+          if hpqc decrypt -k outsider.key signed-group.hpqc -o /dev/null 2>err.txt; then
+            echo "FAIL: an outsider opened a signed group file"; exit 1
+          fi
+          grep -q 'recipient slot' err.txt
+          echo "outsider rejected on a signed group file: ok"
+          # The signer is inside the AEAD, so a header-only tool cannot see it.
+          signer_id="$(hpqc info signer.pub | sed -n 's/^key id: *//p')"
+          if tohex signed-group.hpqc | grep -q "$signer_id"; then
+            echo "FAIL: the signer's key id is visible in the container"; exit 1
+          fi
+          echo "the signer stays confidential: ok"

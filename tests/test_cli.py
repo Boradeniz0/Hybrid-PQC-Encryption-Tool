@@ -965,14 +965,73 @@ class TestSeveralRecipients:
         assert result.exit_code != 0
         assert "same key" in shown(result)
 
-    def test_signing_to_several_recipients_is_refused(self, group, runner) -> None:
+    def test_signing_to_several_recipients_round_trips(self, group, runner) -> None:
         run(runner, "signgen", "-o", "signer")
         result = run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
-                     "msg.txt", "-o", "x.hpqc", "-s", "signer.key")
+                     "-r", "carol.pub", "msg.txt", "-o", "s.hpqc", "-s", "signer.key")
+        assert result.exit_code == 0, shown(result)
+        assert "encrypted to 3 recipients" in shown(result)
+        assert "signed by key id" in shown(result)
 
+        info = shown(run(runner, "info", "s.hpqc"))
+        assert "recipients:  3" in info
+        assert "signed:      yes (signer is encrypted; decrypt to see who)" in info
+
+        for name in ("alice", "bob", "carol"):
+            result = run(runner, "decrypt", "-k", f"{name}.key", "s.hpqc",
+                         "-o", f"{name}-s.txt", "--sender", "signer.pub")
+            assert result.exit_code == 0, shown(result)
+            assert "signature ok" in shown(result)
+            assert (group / f"{name}-s.txt").read_bytes() == b"minutes of the meeting\n"
+
+    def test_signing_a_hidden_single_recipient_round_trips(
+        self, group, runner
+    ) -> None:
+        run(runner, "signgen", "-o", "signer")
+        result = run(runner, "encrypt", "-r", "alice.pub", "--hide-recipients",
+                     "msg.txt", "-o", "hs.hpqc", "-s", "signer.key")
+        assert result.exit_code == 0, shown(result)
+
+        result = run(runner, "decrypt", "-k", "alice.key", "hs.hpqc",
+                     "-o", "hs.txt", "--sender", "signer.pub")
+        assert result.exit_code == 0, shown(result)
+        assert (group / "hs.txt").read_bytes() == b"minutes of the meeting\n"
+
+    def test_verifying_a_group_file_against_the_wrong_sender_fails(
+        self, group, runner
+    ) -> None:
+        run(runner, "signgen", "-o", "signer")
+        run(runner, "signgen", "-o", "impostor")
+        run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+            "msg.txt", "-o", "s.hpqc", "-s", "signer.key")
+
+        result = runner.invoke(cli, ["decrypt", "-k", "bob.key", "s.hpqc",
+                                     "-o", "no.txt", "--sender", "impostor.pub"])
         assert result.exit_code != 0
-        assert "cannot yet be combined with a recipient list" in shown(result)
-        assert not (group / "x.hpqc").exists()
+        assert "but verification was requested against" in str(result.exception)
+        assert not (group / "no.txt").exists()
+
+    def test_signing_a_large_file_to_a_group_falls_back_to_one_shot(
+        self, group, runner
+    ) -> None:
+        run(runner, "signgen", "-o", "signer")
+        big = b"\xa5" * (ONE_SHOT_LIMIT + 4096)
+        (group / "big.bin").write_bytes(big)
+
+        result = run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
+                     "big.bin", "-o", "bs.hpqc", "-s", "signer.key")
+        assert result.exit_code == 0, shown(result)
+        assert "signing needs the whole file at once" in shown(result)
+
+        info = shown(run(runner, "info", "bs.hpqc"))
+        assert "chunked:     no" in info
+        assert "recipients:  2" in info
+        assert "signed:      yes" in info
+
+        result = run(runner, "decrypt", "-k", "bob.key", "bs.hpqc", "-o",
+                     "bs.bin", "--sender", "signer.pub")
+        assert result.exit_code == 0, shown(result)
+        assert (group / "bs.bin").read_bytes() == big
 
     def test_a_large_file_streams_to_several_recipients(self, group, runner) -> None:
         big = b"\xa5" * (ONE_SHOT_LIMIT + 4096)

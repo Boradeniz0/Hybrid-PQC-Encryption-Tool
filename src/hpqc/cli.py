@@ -493,15 +493,6 @@ def encrypt(
             "statement about a whole message, so it cannot be produced until "
             "the whole message has been read"
         )
-    listed = len(recipient_paths) > 1 or hide_recipients
-    if listed and signing_key_path is not None:
-        raise click.ClickException(
-            "--sign cannot yet be combined with a recipient list: the "
-            "signature binds the recipient it was written for, which is what "
-            "stops one recipient passing it on as if you had addressed it to "
-            "somebody else. Binding a whole set is not implemented"
-        )
-
     to = _read_recipients(recipient_paths)
     sender = (
         _open_private(signing_key_path, passphrase_file, SigningPrivateKey)

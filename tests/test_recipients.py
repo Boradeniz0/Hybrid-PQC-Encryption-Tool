@@ -29,7 +29,12 @@ from hpqc.container import (
     FLAG_SIGNED,
     NO_KEY_ID,
 )
-from hpqc.errors import DecryptionError, FormatError, WrongRecipientError
+from hpqc.errors import (
+    DecryptionError,
+    FormatError,
+    SignatureError,
+    WrongRecipientError,
+)
 from hpqc.keys import PrivateKey
 from hpqc.recipients import MAX_RECIPIENTS
 from hpqc.suites import AES_256_GCM, CHACHA20_POLY1305
@@ -244,21 +249,21 @@ class TestRefusals:
         with pytest.raises(ValueError, match=f"than the {MAX_RECIPIENTS}"):
             container.encrypt_many(b"x", [alice_pub] * (MAX_RECIPIENTS + 1))
 
-    def test_signing_to_a_list_is_refused(self, crowd_pub, carol):
-        with pytest.raises(ValueError, match="binds the recipient"):
-            container.encrypt_many(b"x", crowd_pub[:2], sender=carol)
-
-    def test_signing_to_a_hidden_single_recipient_is_refused(self, alice_pub, carol):
-        with pytest.raises(ValueError, match="binds the recipient"):
-            container.encrypt_many(
-                b"x", [alice_pub], sender=carol, hide_recipients=True
-            )
-
-    def test_a_header_claiming_both_signed_and_listed_is_refused(self, crowd_pub):
+    def test_claiming_the_signed_flag_on_an_unsigned_list_fails(
+        self, crowd, crowd_pub
+    ):
+        """Both bits are known, so only the tag stops this."""
         blob = bytearray(container.encrypt_many(b"x", crowd_pub[:2]))
         blob[OFF_FLAGS + 1] = FLAG_SIGNED | FLAG_RECIPIENTS
 
-        with pytest.raises(FormatError, match="both signed and encrypted to a"):
+        with pytest.raises(DecryptionError, match="authentication failed"):
+            container.decrypt(bytes(blob), crowd[0])
+
+    def test_signing_a_chunked_list_is_still_refused(self, crowd_pub):
+        blob = bytearray(container.encrypt_many(b"x", crowd_pub[:2]))
+        blob[OFF_FLAGS + 1] = FLAG_SIGNED | FLAG_RECIPIENTS | FLAG_CHUNKED
+
+        with pytest.raises(FormatError, match="both signed and chunked"):
             container.parse_header(bytes(blob))
 
     @pytest.mark.parametrize("count", [0, MAX_RECIPIENTS + 1, 0xFFFF])
@@ -528,3 +533,223 @@ class TestReadingTheHeader:
         nonce = max(s.nonce_len for s in suites.all_suites())
         biggest = 32 + nonce + U16.size + MAX_RECIPIENTS * stanza
         assert container.MAX_HEADER_LEN == biggest
+
+
+def reseal(header_bytes: bytes, payload: bytes, key: bytes, suite, nonce) -> bytes:
+    """Rebuild a container around arbitrary payload bytes.
+
+    The adversary for a signature on a shared file is a *recipient*: they hold
+    the file key, so they can seal whatever they like under the header they
+    received and the AEAD will be perfectly happy. Only the signature is in
+    their way, which is why these tests forge from the inside rather than by
+    flipping bits from the outside.
+    """
+    return header_bytes + suite.aead(key).encrypt(nonce, payload, header_bytes)
+
+
+def payload_of(blob: bytes, identity):
+    """(header, header_bytes, file key, decrypted payload) for a container."""
+    header, header_bytes, ciphertext = container.parse_header(blob)
+    _, key = container._open_setup(header, identity)
+    payload = header.suite.aead(key).decrypt(
+        header.nonce, ciphertext, header_bytes
+    )
+    return header, header_bytes, key, payload
+
+
+class TestSignedRecipientLists:
+    """A signature over a file that names none of its recipients.
+
+    The usual construction binds the recipient's public keys into the signed
+    message; here there are none to bind, so the header is bound instead --
+    every stanza of it. See signing.py.
+    """
+
+    @pytest.mark.parametrize("count", [1, 2, 3])
+    def test_every_recipient_verifies_the_same_signature(
+        self, crowd, crowd_pub, carol, carol_pub, count
+    ):
+        blob = container.encrypt_many(
+            b"minutes", crowd_pub[:count], sender=carol, hide_recipients=True
+        )
+        header, _, _ = container.parse_header(blob)
+        assert header.multi and header.signed
+
+        for identity in crowd[:count]:
+            opened = container.open_container(blob, identity, carol_pub)
+            assert opened.plaintext == b"minutes"
+            assert opened.verified
+            assert opened.signer == carol_pub
+
+    def test_it_is_still_confidential_who_signed(self, crowd_pub, carol):
+        """`info` reads the header; the signer is inside the AEAD."""
+        blob = container.encrypt_many(b"x", crowd_pub[:2], sender=carol)
+        assert carol.public_key().ed25519_bytes not in blob
+        assert carol.public_key().mldsa_bytes not in blob
+
+    def test_a_recipient_cannot_re_address_it(
+        self, crowd, crowd_pub, alice, alice_pub, carol, carol_pub
+    ):
+        """Surreptitious forwarding, run by somebody who really is a recipient.
+
+        crowd[0] opens the file, keeps the signature block byte for byte, and
+        seals it into a fresh container for alice. Alice's AEAD check passes --
+        the container is genuinely well-formed -- and the signature does not,
+        because it was computed over a header that no longer exists.
+        """
+        blob = container.encrypt_many(
+            b"for the committee", crowd_pub[:3], sender=carol
+        )
+        _, _, _, payload = payload_of(blob, crowd[0])
+
+        forged = container.encrypt_many(b"placeholder", [alice_pub])
+        header2, header2_bytes, key2 = container._seal_setup(
+            [alice_pub], CHACHA20_POLY1305, FLAG_RECIPIENTS | FLAG_SIGNED
+        )
+        forged = reseal(
+            header2_bytes, payload, key2, CHACHA20_POLY1305, header2.nonce
+        )
+
+        with pytest.raises(SignatureError, match="does not verify"):
+            container.open_container(forged, alice, carol_pub)
+        # And without a pinned sender either: the signature is checked anyway.
+        with pytest.raises(SignatureError, match="does not verify"):
+            container.open_container(forged, alice)
+
+    def test_a_recipient_cannot_change_the_message(
+        self, crowd, crowd_pub, carol, carol_pub
+    ):
+        """The case the AEAD cannot touch, because the forger has the key."""
+        blob = container.encrypt_many(b"transfer 100", crowd_pub[:2], sender=carol)
+        header, header_bytes, key, payload = payload_of(blob, crowd[0])
+
+        block = payload[: len(payload) - len(b"transfer 100")]
+        forged = reseal(
+            header_bytes,
+            block + b"transfer 900",
+            key,
+            header.suite,
+            header.nonce,
+        )
+        # The AEAD is content: the forger sealed it with the real file key.
+        assert container.parse_header(forged)[0].signed
+        with pytest.raises(SignatureError, match="does not verify"):
+            container.open_container(forged, crowd[1], carol_pub)
+
+    def test_the_original_recipients_can_still_read_it(
+        self, crowd, crowd_pub, carol, carol_pub
+    ):
+        """The pair to the two tests above, so they cannot pass by being broken."""
+        blob = container.encrypt_many(b"transfer 100", crowd_pub[:2], sender=carol)
+        for identity in crowd[:2]:
+            assert (
+                container.open_container(blob, identity, carol_pub).plaintext
+                == b"transfer 100"
+            )
+
+    def test_a_classic_signature_cannot_be_replayed_into_a_list(
+        self, alice, alice_pub, carol, carol_pub
+    ):
+        """The two constructions have different labels, and it shows.
+
+        Without distinct labels a signature made for a named recipient could be
+        presented as one made over a container, and the other way round.
+        """
+        classic = container.encrypt(b"one to one", alice_pub, sender=carol)
+        _, _, _, payload = payload_of(classic, alice)
+
+        header, header_bytes, key = container._seal_setup(
+            [alice_pub], CHACHA20_POLY1305, FLAG_RECIPIENTS | FLAG_SIGNED
+        )
+        forged = reseal(
+            header_bytes, payload, key, CHACHA20_POLY1305, header.nonce
+        )
+        with pytest.raises(SignatureError, match="does not verify"):
+            container.open_container(forged, alice, carol_pub)
+
+    def test_a_list_signature_cannot_be_replayed_into_a_classic_container(
+        self, alice, alice_pub, carol, carol_pub
+    ):
+        listed = container.encrypt_many(
+            b"one to one", [alice_pub], sender=carol, hide_recipients=True
+        )
+        _, _, _, payload = payload_of(listed, alice)
+
+        header, header_bytes, key = container._seal_setup(
+            [alice_pub], CHACHA20_POLY1305, FLAG_SIGNED
+        )
+        forged = reseal(
+            header_bytes, payload, key, CHACHA20_POLY1305, header.nonce
+        )
+        with pytest.raises(SignatureError, match="does not verify"):
+            container.open_container(forged, alice, carol_pub)
+
+    def test_the_wrong_sender_is_named_rather_than_failing_cryptographically(
+        self, crowd, crowd_pub, carol, mallory_pub
+    ):
+        blob = container.encrypt_many(b"x", crowd_pub[:2], sender=carol)
+        with pytest.raises(SignatureError, match="but verification was requested"):
+            container.open_container(blob, crowd[0], mallory_pub)
+
+    def test_verification_of_an_unsigned_list_fails_closed(self, crowd, crowd_pub, carol_pub):
+        blob = container.encrypt_many(b"x", crowd_pub[:2])
+        with pytest.raises(SignatureError, match="not signed"):
+            container.open_container(blob, crowd[0], carol_pub)
+
+    def test_an_unpinned_signature_is_returned_but_not_verified(
+        self, crowd, crowd_pub, carol_pub, carol
+    ):
+        blob = container.encrypt_many(b"x", crowd_pub[:2], sender=carol)
+        opened = container.open_container(blob, crowd[0])
+        assert opened.signer == carol_pub
+        assert not opened.verified
+
+    @pytest.mark.parametrize("offset", [OFF_FLAGS + 1, OFF_SALT, OFF_FIRST_STANZA + 5])
+    def test_editing_the_header_breaks_it(self, crowd, crowd_pub, carol, offset):
+        blob = bytearray(container.encrypt_many(b"x", crowd_pub[:2], sender=carol))
+        blob[offset] ^= 0x01
+        with pytest.raises(
+            (DecryptionError, FormatError, WrongRecipientError, SignatureError)
+        ):
+            container.decrypt(bytes(blob), crowd[0])
+
+    def test_the_signed_message_is_length_prefixed(self, alice_pub, carol_pub):
+        """A byte cannot move between the header and the plaintext.
+
+        They are the only two variable-length fields in the message, and
+        without the length prefix `header || plaintext` would be the same
+        string for a header one byte shorter and a plaintext one byte longer.
+        """
+        from hpqc import signing
+
+        first = signing.container_signed_message(
+            b"BC", carol_pub, b"A", CHACHA20_POLY1305
+        )
+        second = signing.container_signed_message(
+            b"C", carol_pub, b"AB", CHACHA20_POLY1305
+        )
+        assert first != second
+
+
+def test_the_two_signing_constructions_use_different_labels() -> None:
+    """A direct assertion, and it has to be, which is worth saying out loud.
+
+    Everywhere else in this suite a domain-separation label is pinned by
+    something behavioural: break it and a forgery goes through. Not here.
+    Sharing one label between the two constructions passes all 557 other
+    tests, because the messages already differ structurally -- the classic one
+    carries 1216 bytes of recipient public keys where the container one carries
+    a 4-byte length and a header, and no legal header is 1212 bytes long, so
+    the two can never line up.
+
+    That is an accident of two constants, not a property anyone should rely on.
+    Add a suite with a larger ML-KEM public key, or a field to the header, and
+    the accident can stop holding while every test still passes. So the label
+    is pinned here directly, and the frozen vectors record it too.
+    """
+    from hpqc import signing
+    from hpqc.keys import MLKEM768_PUBLIC_LEN, X25519_KEY_LEN
+
+    assert signing.SIG_CONTAINER_LABEL != signing.SIG_LABEL
+    # The coincidence this test exists to outlive: 4 + header == 32 + 1184.
+    assert X25519_KEY_LEN + MLKEM768_PUBLIC_LEN - 4 == 1212

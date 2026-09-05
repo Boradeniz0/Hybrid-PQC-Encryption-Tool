@@ -15,6 +15,8 @@ import struct
 from .errors import FormatError, TruncatedError
 
 U16 = struct.Struct(">H")
+#: For a length that can exceed 65535 -- a header with a recipient list can.
+U32 = struct.Struct(">I")
 
 
 class Reader:

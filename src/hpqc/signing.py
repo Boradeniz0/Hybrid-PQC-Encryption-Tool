@@ -30,6 +30,30 @@ is to put the recipient's public keys inside what gets signed, so Alice's
 signature is valid only for the recipient she chose. Carol recomputes the
 signed message with her own keys and verification fails.
 
+**3b. With a recipient list there is no recipient to bind, so the container is
+bound instead.** A file written to several people names none of them -- that is
+the point of the shape (see recipients.py) -- so there are no recipient public
+keys to put in the signed message, and the reader has none to recompute with.
+Binding one of the recipients would verify for that person and fail for all the
+rest. Binding a *list* of them, carried inside the AEAD so an eavesdropper
+still cannot read it, would work and costs 1216 bytes per recipient -- and it
+would tell every recipient who the others were, undoing the shape's whole
+purpose. It would also be a claim rather than a fact: nothing would stop a
+sender listing two recipients and wrapping the file key for three.
+
+What actually gets bound is the header, all of it, including every stanza. That
+is the delivery itself rather than a description of it. Bob cannot re-address
+the file, because doing so means new stanzas, a new salt and a new nonce, and
+Carol recomputes the signed message over the header she received. He cannot
+strip a recipient, because that changes the header too. And a recipient still
+learns nothing about the others. The signature stops meaning "Alice wrote this
+to these people" and starts meaning "Alice wrote this, into this exact
+container" -- a narrower claim, and the one that can actually be checked.
+
+The header is already the AEAD's associated data, which is not the same thing:
+that binds it to the file key, which every recipient holds. This binds it to
+Alice's signing key, which none of them do.
+
 Payload layout inside the AEAD when the signed flag is set:
 
     offset  size   field
@@ -63,11 +87,16 @@ from .keys import (
     SigningPublicKey,
 )
 from .suites import Suite
-from .wire import U16, Reader
+from .wire import U16, U32, Reader
 
 # Domain separation. Distinct from the HKDF label so a signature and a derived
 # key can never be computed over the same byte string.
 SIG_LABEL = b"hpqc-v1 sender authentication"
+
+# A separate label for the container-bound construction, so the two can never
+# be computed over the same byte string and a signature made under one can
+# never be presented as one made under the other.
+SIG_CONTAINER_LABEL = b"hpqc-v1 sender authentication to a container"
 
 ED25519_SIGNATURE_LEN = 64
 MLDSA65_SIGNATURE_LEN = 3309
@@ -109,23 +138,44 @@ def signed_message(
     )
 
 
-def sign_payload(
+def container_signed_message(
     plaintext: bytes,
-    sender: SigningPrivateKey,
-    recipient: PublicKey,
+    sender: SigningPublicKey,
+    header_bytes: bytes,
     suite: Suite,
 ) -> bytes:
-    """Return `signature block || plaintext` for the AEAD to seal."""
-    backend.require_mldsa()
-    public = sender.public_key()
-    message = signed_message(plaintext, public, recipient, suite)
+    """The byte string signed when the container has a recipient list.
 
-    ed_signature = sender.ed25519().sign(message)
-    try:
-        mldsa_signature = sender.mldsa().sign(message)
-    except UnsupportedAlgorithm as exc:  # pragma: no cover - stack dependent
-        raise backend.wrap_unsupported(exc, "ML-DSA-65") from None
+    The header is length-prefixed rather than merely concatenated. It is the
+    first variable-length field this project signs over, and `header ||
+    plaintext` alone would let a byte move across the boundary between them and
+    produce the same message from a different container.
+    """
+    return b"".join(
+        (
+            SIG_CONTAINER_LABEL,
+            bytes([suite.id]),
+            sender.ed25519_bytes,
+            sender.mldsa_bytes,
+            U32.pack(len(header_bytes)),
+            header_bytes,
+            plaintext,
+        )
+    )
 
+
+def _block(
+    public: SigningPublicKey,
+    ed_signature: bytes,
+    mldsa_signature: bytes,
+    plaintext: bytes,
+) -> bytes:
+    """Serialise the signature block. Identical for both constructions.
+
+    Only the message the signatures are computed over differs, so the payload
+    layout does not have to know which one was used -- the header's flags say
+    that, and the reader has them before it opens anything.
+    """
     return b"".join(
         (
             U16.pack(len(public.ed25519_bytes)),
@@ -139,6 +189,40 @@ def sign_payload(
             plaintext,
         )
     )
+
+
+def _sign(message: bytes, sender: SigningPrivateKey) -> Tuple[bytes, bytes]:
+    backend.require_mldsa()
+    ed_signature = sender.ed25519().sign(message)
+    try:
+        mldsa_signature = sender.mldsa().sign(message)
+    except UnsupportedAlgorithm as exc:  # pragma: no cover - stack dependent
+        raise backend.wrap_unsupported(exc, "ML-DSA-65") from None
+    return ed_signature, mldsa_signature
+
+
+def sign_payload(
+    plaintext: bytes,
+    sender: SigningPrivateKey,
+    recipient: PublicKey,
+    suite: Suite,
+) -> bytes:
+    """Return `signature block || plaintext` for the AEAD to seal."""
+    public = sender.public_key()
+    message = signed_message(plaintext, public, recipient, suite)
+    return _block(public, *_sign(message, sender), plaintext=plaintext)
+
+
+def sign_payload_to_container(
+    plaintext: bytes,
+    sender: SigningPrivateKey,
+    header_bytes: bytes,
+    suite: Suite,
+) -> bytes:
+    """The same, for a container whose header carries a recipient list."""
+    public = sender.public_key()
+    message = container_signed_message(plaintext, public, header_bytes, suite)
+    return _block(public, *_sign(message, sender), plaintext=plaintext)
 
 
 def open_payload(
@@ -156,6 +240,48 @@ def open_payload(
     generated it a second earlier. Pass the sender's public key, obtained
     through some channel you trust, and a mismatch is an error.
     """
+    signer, ed_signature, mldsa_signature, plaintext = _parse_block(
+        payload, expected_sender
+    )
+    _verify(
+        signer,
+        signed_message(plaintext, signer, recipient, suite),
+        ed_signature,
+        mldsa_signature,
+    )
+    return plaintext, signer
+
+
+def open_container_payload(
+    payload: bytes,
+    header_bytes: bytes,
+    suite: Suite,
+    *,
+    expected_sender: Optional[SigningPublicKey] = None,
+) -> Tuple[bytes, SigningPublicKey]:
+    """The same, for a container whose header carries a recipient list.
+
+    `header_bytes` comes from the reader's own parse of the file in front of
+    it, never from the payload. That is what makes the check mean anything: a
+    forwarded file is verified against the header it actually arrived in, not
+    against one its sender got to choose.
+    """
+    signer, ed_signature, mldsa_signature, plaintext = _parse_block(
+        payload, expected_sender
+    )
+    _verify(
+        signer,
+        container_signed_message(plaintext, signer, header_bytes, suite),
+        ed_signature,
+        mldsa_signature,
+    )
+    return plaintext, signer
+
+
+def _parse_block(
+    payload: bytes, expected_sender: Optional[SigningPublicKey]
+) -> Tuple[SigningPublicKey, bytes, bytes, bytes]:
+    """Split a signed payload, and check the claimed signer before anything else."""
     reader = Reader(payload, noun="signature block")
     ed25519_public = reader.take_prefixed(
         "sender Ed25519 verifying key", ED25519_KEY_LEN
@@ -181,10 +307,20 @@ def open_payload(
             f"but verification was requested against {expected_sender.key_id_hex}"
         )
 
-    message = signed_message(plaintext, signer, recipient, suite)
+    return signer, ed_signature, mldsa_signature, plaintext
 
-    # Both must verify. Requiring only one would silently reduce the scheme to
-    # whichever algorithm an attacker had broken.
+
+def _verify(
+    signer: SigningPublicKey,
+    message: bytes,
+    ed_signature: bytes,
+    mldsa_signature: bytes,
+) -> None:
+    """Check both signatures over `message`, or raise.
+
+    Both must verify. Requiring only one would silently reduce the scheme to
+    whichever algorithm an attacker had broken.
+    """
     try:
         signer.ed25519().verify(ed_signature, message)
     except InvalidSignature:
@@ -202,5 +338,3 @@ def open_payload(
             f"key id {signer.key_id_hex}, or it was signed for a different "
             "recipient"
         ) from None
-
-    return plaintext, signer

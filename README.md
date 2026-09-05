@@ -288,6 +288,20 @@ Carol recomputes that with her own keys, gets a different message, and
 verification fails. The sender's own keys are in there too, so a signature
 cannot be lifted onto a different claimed identity.
 
+When the file has a [recipient list](#several-recipients) there is no recipient
+in it to bind, so the header is bound instead:
+
+```
+signed message = "hpqc-v1 sender authentication to a container" || suite
+              || sender_ed25519_pk || sender_mldsa_pk
+              || u32(len(header))  || header
+              || plaintext
+```
+
+Two labels, so a signature made under one can never be presented as one made
+under the other, and the header carries a length because it and the plaintext
+are the only variable-length fields in the message.
+
 ### What a valid signature actually proves
 
 **Nothing about identity, unless you supplied the sender's public key.** The
@@ -524,19 +538,50 @@ is silent.
 
 ### What it does not defend against
 
-**Any recipient can re-send the file as if it came from you.** Everyone who can
-open the file has the file key, so any of them can decrypt it, wrap the same
-key to somebody new, and produce a container indistinguishable from one you
-wrote. This is inherent to multi-recipient encryption, and sender
-authentication is the only answer to it.
+**Any recipient can re-send the file as if it came from you** — unless you sign
+it. Everyone who can open the file has the file key, so any of them can decrypt
+it, wrap the same key to somebody new, and produce a container the AEAD is
+perfectly happy with. That is inherent to multi-recipient encryption; sender
+authentication is the answer, and the next section is how it works when the
+file names nobody.
 
-**Signing to a list is not implemented yet.** The signature binds the
-recipient's public keys into the signed message, which is what stops
-surreptitious forwarding; with several recipients it has to bind the whole set,
-and the set has to travel inside the AEAD so that an eavesdropper still cannot
-read it. Until that exists the combination is refused rather than approximated
-— binding one of the recipients would verify for that person and fail for
-everybody else, and binding none would quietly reopen the hole.
+### Signing a file that names no recipients
+
+The usual anti-forwarding construction puts the recipient's public keys inside
+the signed message (see [Sender authentication](#sender-authentication)). With
+a recipient list there are none to put there, and the reader has none to
+recompute with. Three things could go in their place:
+
+- **One of the recipients.** Verifies for that person, fails for everybody
+  else. Not a scheme.
+- **The whole set, carried inside the AEAD.** Works, costs 1216 bytes per
+  recipient, and tells every recipient who the others are — undoing the point
+  of the shape. It is also only a *claim*: nothing would stop a sender listing
+  two recipients and wrapping the file key for three.
+- **The header itself, every stanza of it.** That is the delivery rather than a
+  description of it, it costs nothing, and it cannot be a lie.
+
+hpqc binds the header. Bob cannot re-address the file, because that means new
+stanzas, a new salt and a new nonce, and Carol recomputes the signed message
+over the header she actually received. He cannot strip a recipient, for the
+same reason. And no recipient learns anything about the others.
+
+The signature stops meaning "Alice wrote this to these people" and starts
+meaning "**Alice wrote this, into this exact container**" — a narrower claim,
+and the one that can actually be checked. The header is already the AEAD's
+associated data, which is not the same thing: that binds it to the file key,
+which every recipient holds. This binds it to Alice's signing key, which none
+of them do.
+
+```console
+$ hpqc encrypt -r alice.pub -r bob.pub -r carol.pub minutes.txt \
+    -o minutes.hpqc -s dave-sign.key
+encrypted to 3 recipients; the file does not name them
+signed by key id 1322446e7dc517ec
+
+$ hpqc decrypt -k bob.key minutes.hpqc -o minutes.txt --sender dave-sign.pub
+signature ok: signed by key id 1322446e7dc517ec
+```
 
 **Trial decryption is not constant time.** The loop stops at the first stanza
 that opens, so how long a decryption takes reveals *which* slot is yours to
@@ -601,7 +646,9 @@ quadratic in a count the file's writer chooses.
 Bits 0 and 1 together are refused as malformed rather than parsed: a signature
 covers a whole message, so this build never writes one, and letting a signature
 parser loose on chunk framing is a worse answer than saying no. Bits 0 and 2
-together are refused for the reason in the section above.
+together are perfectly legal and change which byte string the signatures cover
+— the recipient's public keys for a named recipient, the whole header for a
+list.
 
 Sender authentication claimed bit 0 of the reserved `flags` field, streaming
 claimed bit 1 and the recipient list claimed bit 2, which is what they were
@@ -719,7 +766,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-543 passed
+592 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -788,6 +835,15 @@ actually fails. Among them:
   to Alice byte for byte, must not verify — with or without a pinned sender
   key. Paired with a test that the original recipient *can* verify the same
   bytes, so it cannot pass because something is merely broken.
+- **And blocked on a file that names nobody, where the forger is a real
+  recipient.** They hold the file key, so they can seal whatever they like
+  under the header they received and the AEAD will not object — the test builds
+  the forgery from the inside rather than by flipping bits. Two of them: the
+  same signature re-addressed to somebody new, and a different message sealed
+  under the original header. Both must fail; the original recipients must still
+  succeed.
+- **A signature cannot cross between the two constructions.** A classic
+  signature replayed into a listed container, and the reverse.
 - **The signature block is fuzzed separately.** Corrupting a finished signed
   container trips the AEAD tag first, so those mutations never reach the
   signature parser. Mutating the payload *before* sealing it does — and that is
@@ -937,6 +993,19 @@ same was true of reordering the stanza fields on the wire. That is the whole
 argument for recording a derivation rather than a container — a container that
 stops opening tells you something changed, and never which thing.
 
+**A domain-separation label that nothing behavioural pins.** hpqc gives the
+two signing constructions different labels, which is the standard hygiene. I
+went to check the tests caught a shared label and they did not — all 557 other
+tests passed with the two labels set equal. The reason is that the messages
+already differ structurally: one carries 1216 bytes of recipient public keys
+where the other carries a 4-byte length and a header, and no legal header is
+1212 bytes long, so the two can never line up. That is an accident of two
+constants, not a property to rely on — add a suite with a larger ML-KEM key and
+it can stop holding while every test still passes. So the label is pinned by
+direct assertion, next to a comment saying why it has to be. The honest version
+of "the tests catch it" is sometimes "they cannot, and here is what I did
+instead".
+
 **The declared Python floor was wrong.** `requires-python = ">=3.9"` looked
 fine and was not: `cryptography>=46` declares `!=3.9.0,!=3.9.1`, so on those
 releases `pip install` fails in the resolver rather than with a useful message.
@@ -968,9 +1037,8 @@ What it does **not** do, by design in v1:
 - **A recipient list is not padded, and trial decryption is not constant
   time.** The file reveals how many people can open it, and the time taken to
   open it reveals which slot is yours to anyone who can measure it.
-- **Any recipient of a file can re-send it as if it came from you.** They hold
-  the file key. Sender authentication is the only answer, and it does not yet
-  work with a recipient list.
+- **Any recipient of an unsigned file can re-send it as if it came from you.**
+  They hold the file key. Signing is the answer; an unsigned file has no answer.
 - **Not audited.** This is a learning and portfolio project, written against
   the standards below. Read the code before trusting it with anything real.
 
@@ -980,7 +1048,7 @@ What it does **not** do, by design in v1:
 - [x] Streaming / chunked AEAD for large files
 - [x] Passphrase-wrapped private keys (scrypt + AEAD)
 - [x] Multiple recipients per file
-- [ ] Signing to a recipient list (bind the whole set, inside the AEAD)
+- [x] Signing to a recipient list (bind the container, not the recipient)
 - [ ] Signing a streamed file (a signature trailer over a rolling digest)
 - [ ] ML-KEM-1024 suite
 - [x] Known-answer test vectors checked into the repo

@@ -22,9 +22,10 @@ A file can be addressed to several recipients at once. It is sealed under one
 random file key, and each recipient gets a copy of that key wrapped under their
 own hybrid KEM output. The header names none of them -- a reader finds its own
 copy by trying each in turn -- so the file reveals how many people can open it
-and not who they are.
+and not who they are. Signing such a file binds the header itself rather than a
+recipient, because there is no recipient in it to bind.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = ["__version__"]

@@ -74,6 +74,7 @@ SIGNED = _load("v1-signed.json")
 WRAPPED = _load("v1-wrapped.json")
 CHUNKED = _load("v1-chunked.json")
 RECIPIENTS = _load("v1-recipients.json")
+SIGNED_RECIPIENTS = _load("v1-signed-recipients.json")
 
 
 @pytest.fixture(scope="module")
@@ -707,3 +708,134 @@ def test_the_recorded_chunked_recipient_list_still_refuses_truncation(
             io.BytesIO(),
             listed_identities[0],
         )
+
+
+# --------------------------------------------------------------------------
+# Signed recipient lists
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def signed_list_identities():
+    return [PrivateKey.decode(t) for t in SIGNED_RECIPIENTS["identities"]]
+
+
+@pytest.fixture(scope="module")
+def signed_list_signer() -> SigningPublicKey:
+    return SigningPublicKey.decode(SIGNED_RECIPIENTS["signer_public"])
+
+
+def test_the_signed_recipient_vectors_target_this_format() -> None:
+    assert SIGNED_RECIPIENTS["format_version"] == FORMAT_VERSION
+    assert SIGNED_RECIPIENTS["flags"] == FLAG_SIGNED | FLAG_RECIPIENTS
+
+
+def test_the_container_signature_label_has_not_changed() -> None:
+    """Distinct from the classic one, and the same as yesterday's.
+
+    Nothing behavioural pins the separation today -- the two messages already
+    differ structurally -- so it is pinned here and in test_recipients.py.
+    """
+    assert signing.SIG_CONTAINER_LABEL.decode("ascii") == SIGNED_RECIPIENTS[
+        "sig_container_label"
+    ]
+    assert signing.SIG_LABEL.decode("ascii") == SIGNED_RECIPIENTS["sig_label"]
+    assert signing.SIG_CONTAINER_LABEL != signing.SIG_LABEL
+
+
+@pytest.mark.parametrize(
+    "vector",
+    SIGNED_RECIPIENTS["signed_messages"],
+    ids=[v["suite"] for v in SIGNED_RECIPIENTS["signed_messages"]],
+)
+def test_the_container_signed_message_construction_is_unchanged(
+    vector, signed_list_signer
+) -> None:
+    """The vector that pins the construction rather than one run of it.
+
+    Drop the header from the signed message and surreptitious forwarding works
+    again. Drop its length prefix and a byte can move between the header and
+    the plaintext. Either way every round trip still passes and every recorded
+    signature stops verifying for a reason nobody can name. The digest names it.
+    """
+    message = signing.container_signed_message(
+        bytes.fromhex(vector["plaintext"]),
+        signed_list_signer,
+        bytes.fromhex(vector["header_bytes"]),
+        suites.BY_CLI_NAME[vector["suite"]],
+    )
+    assert len(message) == vector["message_len"]
+    assert hashlib.sha256(message).hexdigest() == vector["message_sha256"]
+
+
+@pytest.mark.parametrize(
+    "vector",
+    SIGNED_RECIPIENTS["containers"],
+    ids=[f"{v['suite']}-{v['recipients']}to" for v in SIGNED_RECIPIENTS["containers"]],
+)
+class TestRecordedSignedRecipientLists:
+    def test_every_recipient_still_verifies_it(
+        self, vector, signed_list_identities, signed_list_signer
+    ) -> None:
+        blob = bytes.fromhex(vector["container"])
+        for identity in signed_list_identities[: vector["recipients"]]:
+            opened = open_container(blob, identity, signed_list_signer)
+            assert opened.plaintext == bytes.fromhex(vector["plaintext"])
+            assert opened.verified
+            assert opened.signer == signed_list_signer
+
+    def test_its_header_still_says_signed_and_listed(self, vector) -> None:
+        header, _, _ = parse_header(bytes.fromhex(vector["container"]))
+        assert header.signed and header.multi and not header.chunked
+        assert header.suite.id == vector["suite_id"]
+        assert header.recipient_count == vector["recipients"]
+
+    def test_it_still_hides_who_signed(self, vector, signed_list_signer) -> None:
+        blob = bytes.fromhex(vector["container"])
+        assert signed_list_signer.ed25519_bytes not in blob
+        assert signed_list_signer.mldsa_bytes not in blob
+
+    def test_a_stranger_still_cannot_open_it(self, vector) -> None:
+        stranger = PrivateKey.decode(SIGNED_RECIPIENTS["stranger"])
+        with pytest.raises(HpqcError):
+            decrypt(bytes.fromhex(vector["container"]), stranger)
+
+
+def test_a_recorded_forwarded_signature_still_does_not_verify(
+    signed_list_identities, signed_list_signer
+) -> None:
+    """Surreptitious forwarding, frozen exactly as a recipient would build it.
+
+    The signature was made over one container's header and the payload sealed
+    into another. The AEAD is perfectly happy -- whoever built it held the file
+    key -- so only the header binding stands between this and a file that
+    verifies as "the signer wrote this to me".
+    """
+    vector = SIGNED_RECIPIENTS["forwarded"]
+    blob = bytes.fromhex(vector["container"])
+    identity = signed_list_identities[vector["opens_for"]]
+
+    with pytest.raises(SignatureError):
+        open_container(blob, identity, signed_list_signer)
+    # And with no pinned sender either: the signature is checked regardless.
+    with pytest.raises(SignatureError):
+        open_container(blob, identity)
+
+
+def test_the_forwarded_vector_is_a_real_container(signed_list_identities) -> None:
+    """Otherwise the test above could pass because the file is simply broken.
+
+    The header parses, the AEAD verifies, and the payload comes out. Only the
+    signature is wrong, which is the whole point.
+    """
+    vector = SIGNED_RECIPIENTS["forwarded"]
+    blob = bytes.fromhex(vector["container"])
+    identity = signed_list_identities[vector["opens_for"]]
+
+    header, header_bytes, ciphertext = parse_header(blob)
+    assert header.signed and header.multi
+    _, key = container_module._open_setup(header, identity)
+    payload = header.suite.aead(key).decrypt(header.nonce, ciphertext, header_bytes)
+    assert payload.endswith(
+        bytes.fromhex(SIGNED_RECIPIENTS["containers"][0]["plaintext"])
+    )

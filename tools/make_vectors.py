@@ -48,6 +48,7 @@ from hpqc.container import (  # noqa: E402
     FLAG_CHUNKED,
     FLAG_RECIPIENTS,
     FLAG_SIGNED,
+    _seal_setup,
     encrypt,
     encrypt_many,
     encrypt_stream,
@@ -481,12 +482,126 @@ def build_v1_recipients() -> dict:
     return data
 
 
+def build_v1_signed_recipients() -> dict:
+    """Signed containers with a recipient list, where the header is what is bound.
+
+    A file with a recipient list names no recipients, so the usual construction
+    -- put the recipient's public keys inside the signed message -- has nothing
+    to work with. The header is bound instead, every stanza of it. Three things
+    are recorded:
+
+    * `signed_messages` -- the SHA-256 of the exact byte string the signatures
+      cover, for fixed inputs. This is what pins the construction: drop the
+      header, drop its length prefix, change the label, and the digest moves.
+      A recorded signature cannot do that job, because it stops verifying under
+      any change at all and so names none of them.
+
+    * `containers` -- signed files to one, two and three recipients. Every
+      recipient must verify the same signature, and a fourth identity must not
+      be able to open the file at all.
+
+    * `forwarded` -- a signature made over one header, re-sealed into a
+      different container addressed to the same identity. It must keep failing.
+      This is surreptitious forwarding as a recipient would actually run it,
+      frozen, so a build that stopped binding the header fails here.
+    """
+    identities = [PrivateKey.generate() for _ in range(3)]
+    publics = [k.public_key() for k in identities]
+    stranger = PrivateKey.generate()
+    signer = SigningPrivateKey.generate()
+    signer_public = signer.public_key()
+
+    data = {
+        "note": (
+            "Frozen known-answer vectors for hpqc containers that are both "
+            "signed and written to a recipient list. " + TEST_KEY_WARNING
+        ),
+        "format_version": 1,
+        "flags": FLAG_SIGNED | FLAG_RECIPIENTS,
+        "sig_container_label": signing.SIG_CONTAINER_LABEL.decode("ascii"),
+        "sig_label": signing.SIG_LABEL.decode("ascii"),
+        "identities": [k.encode() for k in identities],
+        "publics": [p.encode() for p in publics],
+        "stranger": stranger.encode(),
+        "signer": signer.encode(),
+        "signer_public": signer_public.encode(),
+        "signer_key_id": signer_public.key_id_hex,
+        "signed_messages": [],
+        "containers": [],
+    }
+
+    plaintext = b"hpqc signed recipient-list test vector v1\n"
+
+    for cli_name, suite in sorted(suites.BY_CLI_NAME.items()):
+        for count in (1, 2, 3):
+            data["containers"].append({
+                "suite": cli_name,
+                "suite_id": suite.id,
+                "recipients": count,
+                "plaintext": plaintext.hex(),
+                "container": encrypt_many(
+                    plaintext,
+                    publics[:count],
+                    suite=suite,
+                    sender=signer,
+                    hide_recipients=count == 1,
+                ).hex(),
+            })
+
+        # Fixed header bytes, so the digest is a known answer rather than a
+        # record of one random run. They never have to parse: the signed
+        # message is a byte string, and this pins the byte string.
+        header_bytes = _filler(b"hpqc-vector-signed-header", 1220)
+        message = signing.container_signed_message(
+            plaintext, signer_public, header_bytes, suite
+        )
+        data["signed_messages"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "header_bytes": header_bytes.hex(),
+            "header_len": len(header_bytes),
+            "plaintext": plaintext.hex(),
+            "message_len": len(message),
+            "message_sha256": hashlib.sha256(message).hexdigest(),
+        })
+
+    # Surreptitious forwarding, frozen. The signature is made over one header
+    # and the payload is then sealed into a different container -- exactly what
+    # a recipient can build, since they hold the file key.
+    victim = identities[0]
+    suite = suites.DEFAULT_SUITE
+    elsewhere, elsewhere_bytes, _ = _seal_setup(
+        [publics[1]], suite, FLAG_RECIPIENTS | FLAG_SIGNED
+    )
+    payload = signing.sign_payload_to_container(
+        plaintext, signer, elsewhere_bytes, suite
+    )
+    header, header_bytes, key = _seal_setup(
+        [victim.public_key()], suite, FLAG_RECIPIENTS | FLAG_SIGNED
+    )
+    data["forwarded"] = {
+        "note": (
+            "signed for one container, re-sealed into another addressed to "
+            "identities[0]; opening it must raise SignatureError"
+        ),
+        "suite": "chacha20",
+        "container": (
+            header_bytes
+            + suite.aead(key).encrypt(header.nonce, payload, header_bytes)
+        ).hex(),
+        "opens_for": 0,
+    }
+
+    return data
+
+
 BUILDERS = {
     "v1.json": build_v1,
     "v1-signed.json": build_v1_signed,
     "v1-wrapped.json": build_v1_wrapped,
     "v1-chunked.json": build_v1_chunked,
     "v1-recipients.json": build_v1_recipients,
+    "v1-signed-recipients.json": build_v1_signed_recipients,
 }
 
 

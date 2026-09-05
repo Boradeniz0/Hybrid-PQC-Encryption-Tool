@@ -336,3 +336,44 @@ def test_a_recipient_list_read_from_a_stream_never_escapes(
             )
         else:
             pytest.fail("a corrupted recipient list decrypted successfully")
+
+
+def test_a_mutated_signature_block_in_a_listed_container_never_verifies(
+    alice, alice_pub, bob_pub, carol, carol_pub
+) -> None:
+    """The same pass, over the construction that binds the header.
+
+    Each mutation is sealed into a real container, so the AEAD is satisfied and
+    the signature parser and verifier are what have to hold. The forger here is
+    a recipient: someone who legitimately holds the file key and is trying to
+    make a block say something the signer did not.
+    """
+    from hpqc.container import FLAG_RECIPIENTS, FLAG_SIGNED, _seal_setup
+    from hpqc.signing import sign_payload_to_container
+
+    header, header_bytes, key = _seal_setup(
+        [alice_pub, bob_pub], DEFAULT_SUITE, FLAG_RECIPIENTS | FLAG_SIGNED
+    )
+    payload = sign_payload_to_container(
+        b"pay 100", carol, header_bytes, DEFAULT_SUITE
+    )
+    rng = random.Random(SEED + 7)
+
+    for _ in range(ITERATIONS):
+        mutated = _mutate(rng, payload)
+        if mutated == payload:
+            continue
+        blob = header_bytes + DEFAULT_SUITE.aead(key).encrypt(
+            header.nonce, mutated, header_bytes
+        )
+        try:
+            open_container(blob, alice, carol_pub)
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"{type(exc).__name__} escaped the signature parser: {exc}\n"
+                f"payload prefix: {mutated[:48].hex()}"
+            )
+        else:
+            pytest.fail("a mutated signature block verified successfully")
