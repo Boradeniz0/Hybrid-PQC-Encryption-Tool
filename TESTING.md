@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 676 tests). This is
+The automated suite covers all of this and more (`pytest`, 742 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -166,17 +166,58 @@ grown.hpqc`), and with two chunks swapped. All refused.
 ### Signing a large file
 
 ```console
+hpqc signgen -o bob-sign
+hpqc signgen -o impostor
 hpqc encrypt -r alice.pub big.bin -o big-signed.hpqc -s bob-sign.key
-hpqc info big-signed.hpqc | grep chunked
+hpqc info big-signed.hpqc | grep -E 'chunked|signed'
+hpqc decrypt -k alice.key big-signed.hpqc -o back.bin --sender bob-sign.pub
 ```
 
-It prints a note on stderr and writes a one-shot container. A signature is a
-statement about a whole message, so it cannot be made until the whole message
-has been read; hpqc keeps the signature and gives up the streaming rather than
-the other way round. Asking for both explicitly is refused outright:
+```
+streamed in 77 chunks of 64 KiB
+signed by key id 62e867ac623c8929
+chunked:     yes, 77 chunk(s) of up to 64 KiB (+16-byte tag each)
+signed:      yes (signer is encrypted; decrypt to see who)
+signature ok: signed by key id 62e867ac623c8929
+```
+
+It streams *and* it is signed. A signature is still a statement about the whole
+message, so hpqc reads the file twice: once to digest it, once to seal it. The
+cost moved from memory to I/O.
+
+The signature block goes in front of the plaintext, so a wrong `--sender` is
+caught before a single byte is released:
 
 ```console
-hpqc encrypt -r alice.pub big.bin -o x.hpqc -s bob-sign.key --chunked
+rm -f out.bin
+hpqc decrypt -k alice.key big-signed.hpqc -o out.bin --sender impostor.pub
+echo "exit=$?"; ls out.bin
+```
+
+```
+error: this file was signed by key id 62e867ac623c8929, but verification was
+requested against b5cabaa4fc81de22
+exit=1
+ls: cannot access 'out.bin': No such file or directory
+```
+
+With the signature in a trailer that file would already have been written. What
+*cannot* be caught early is whether the signature is valid, and the temporary
+file plus rename is what keeps that from mattering.
+
+One input cannot be read twice, and it says so rather than guessing:
+
+```console
+cat big.bin | hpqc encrypt -r alice.pub -s bob-sign.key -o piped.hpqc
+cat big.bin | hpqc encrypt -r alice.pub -s bob-sign.key -o x.hpqc --chunked
+```
+
+```
+note: signing a stream reads the input twice and stdin arrives once;
+writing a one-shot container instead
+Error: --chunked and --sign need an input that can be read twice: the
+signature covers a digest of the whole plaintext and has to exist before
+the first chunk is written. Give INPUT as a file rather than on stdin
 ```
 
 ## 5. Several recipients
@@ -439,7 +480,7 @@ transcript — so it cannot be used to steer a recipient onto a different cipher
 ## 8. The test suite
 
 ```console
-pytest -q                 # 676 passed
+pytest -q                 # 742 passed
 pytest -q -W error        # clean with warnings escalated to errors
 tools/ci-local.sh         # the same, on all four Pythons CI uses, in docker
 ```
@@ -482,6 +523,25 @@ to watch a 3-chunk file quietly turn into a 2-chunk one:
 ```console
 pytest -q -k without_the_final_marker
 ```
+
+Then the streamed signature. In `src/hpqc/signing.py`, stop feeding the digest
+into the signed message:
+
+```python
+def stream_signed_message(digest, sender, header_bytes, suite):
+    return b"".join((
+        SIG_STREAM_LABEL, bytes([suite.id]),
+        sender.ed25519_bytes, sender.mldsa_bytes,
+        U32.pack(len(header_bytes)), header_bytes,
+        # digest,          <- removed
+    ))
+```
+
+That fails **3 tests in `tests/test_stream_signing.py` and 6 in
+`tests/test_vectors.py`**, and the three are the ones that matter: a recipient
+re-sealing a changed, a shorter, or a longer plaintext. Every chunk in those
+forgeries is genuine and properly framed, so nothing else in the tool has a
+word to say about them.
 
 Now the one that breaks every file ever written and changes no behaviour at
 all. In `src/hpqc/hybrid.py`, edit the label the wrapping key is derived under:

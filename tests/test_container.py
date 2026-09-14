@@ -257,17 +257,23 @@ def test_claiming_the_signed_flag_on_an_unsigned_file_fails(alice, alice_pub) ->
         decrypt(bytes(blob), alice)
 
 
-def test_claiming_both_signed_and_chunked_is_refused(alice, alice_pub) -> None:
-    """The one flag combination this build never writes.
+def test_claiming_both_signed_and_chunked_on_a_one_shot_file_fails(
+    alice, alice_pub
+) -> None:
+    """That pair is legal now, so only the tag stands between it and a parse.
 
-    Both bits are individually known, so the allow-list lets the pair through;
-    it takes a rule of its own to stop a header that would send a signature
-    parser walking into chunk framing.
+    It used to be refused outright, back when a signature could not be streamed.
+    Every combination of the three flags is writable today, which means the
+    allow-list has nothing left to say about them -- and the header being
+    associated data is what catches a file whose flags do not match its shape.
     """
     blob = bytearray(encrypt(b"secret", alice_pub))
     blob[OFF_FLAGS + 1] = container.FLAG_SIGNED | container.FLAG_CHUNKED
 
-    with pytest.raises(FormatError, match="both signed and chunked"):
+    header, _, _ = parse_header(bytes(blob))
+    assert header.signed and header.chunked
+
+    with pytest.raises((DecryptionError, FormatError)):
         decrypt(bytes(blob), alice)
 
 

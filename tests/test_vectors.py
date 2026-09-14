@@ -76,6 +76,7 @@ CHUNKED = _load("v1-chunked.json")
 RECIPIENTS = _load("v1-recipients.json")
 SIGNED_RECIPIENTS = _load("v1-signed-recipients.json")
 MLKEM1024 = _load("v1-mlkem1024.json")
+SIGNED_STREAM = _load("v1-signed-stream.json")
 
 
 @pytest.fixture(scope="module")
@@ -1000,3 +1001,178 @@ def test_the_recorded_1024_chunked_container_still_opens(big_identities) -> None
             io.BytesIO(),
             big_identities[0],
         )
+
+
+# --------------------------------------------------------------------------
+# Signed streams
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def stream_identities():
+    return [PrivateKey.decode(t) for t in SIGNED_STREAM["identities"]]
+
+
+@pytest.fixture(scope="module")
+def stream_signer() -> SigningPublicKey:
+    return SigningPublicKey.decode(SIGNED_STREAM["signer_public"])
+
+
+def test_the_signed_stream_vectors_target_this_format() -> None:
+    assert SIGNED_STREAM["format_version"] == FORMAT_VERSION
+    assert SIGNED_STREAM["flags"] == FLAG_SIGNED | FLAG_CHUNKED
+    assert SIGNED_STREAM["signature_block_len"] == signing.SIGNATURE_BLOCK_LEN
+
+
+def test_the_stream_signature_labels_have_not_changed() -> None:
+    assert signing.SIG_STREAM_LABEL.decode("ascii") == SIGNED_STREAM[
+        "sig_stream_label"
+    ]
+    assert signing.STREAM_DIGEST_LABEL.decode("ascii") == SIGNED_STREAM[
+        "stream_digest_label"
+    ]
+    assert signing.STREAM_DIGEST_LEN == SIGNED_STREAM["stream_digest_len"]
+    assert len({
+        signing.SIG_LABEL,
+        signing.SIG_CONTAINER_LABEL,
+        signing.SIG_STREAM_LABEL,
+    }) == 3
+
+
+@pytest.mark.parametrize(
+    "vector", SIGNED_STREAM["digests"], ids=[v["name"] for v in SIGNED_STREAM["digests"]]
+)
+def test_the_stream_digest_construction_is_unchanged(vector) -> None:
+    """What the signature is actually a statement about.
+
+    Change the hash, change its label, or start feeding it the signature block
+    along with the plaintext, and every signature ever made over a stream stops
+    verifying -- while every round trip in the suite keeps passing, because the
+    writer and the reader would move together.
+    """
+    if "plaintext" in vector:
+        plaintext = bytes.fromhex(vector["plaintext"])
+    else:
+        plaintext = None
+
+    if plaintext is not None:
+        assert signing.digest_stream(io.BytesIO(plaintext)).hex() == vector["digest"]
+        assert len(bytes.fromhex(vector["digest"])) == signing.STREAM_DIGEST_LEN
+    else:
+        # The long one is recorded by length and hash rather than inline.
+        assert vector["plaintext_len"] > streaming.CHUNK_SIZE
+        assert len(bytes.fromhex(vector["digest"])) == signing.STREAM_DIGEST_LEN
+
+
+@pytest.mark.parametrize(
+    "vector",
+    SIGNED_STREAM["signed_messages"],
+    ids=[v["suite"] for v in SIGNED_STREAM["signed_messages"]],
+)
+def test_the_stream_signed_message_construction_is_unchanged(
+    vector, stream_signer
+) -> None:
+    message = signing.stream_signed_message(
+        bytes.fromhex(vector["digest"]),
+        stream_signer,
+        bytes.fromhex(vector["header_bytes"]),
+        suites.BY_CLI_NAME[vector["suite"]],
+    )
+    assert len(message) == vector["message_len"]
+    assert hashlib.sha256(message).hexdigest() == vector["message_sha256"]
+
+
+@pytest.mark.parametrize(
+    "vector",
+    SIGNED_STREAM["containers"],
+    ids=[
+        f"{v['suite']}-{v['shape'].replace(' ', '-')}"
+        for v in SIGNED_STREAM["containers"]
+    ],
+)
+class TestRecordedSignedStreams:
+    def test_every_recipient_still_verifies_it(
+        self, vector, stream_identities, stream_signer
+    ) -> None:
+        blob = bytes.fromhex(vector["container"])
+        for identity in stream_identities[: vector["recipients"]]:
+            sink = io.BytesIO()
+            opened = decrypt_stream(io.BytesIO(blob), sink, identity, stream_signer)
+            assert opened.verified and opened.signer == stream_signer
+            assert opened.chunks == vector["chunks"]
+            assert len(sink.getvalue()) == vector["plaintext_len"]
+            assert (
+                hashlib.sha256(sink.getvalue()).hexdigest()
+                == vector["plaintext_sha256"]
+            )
+
+    def test_its_header_still_says_signed_and_chunked(self, vector) -> None:
+        header, _, _ = parse_header(bytes.fromhex(vector["container"]))
+        assert header.signed and header.chunked
+        assert header.suite.id == vector["suite_id"]
+        assert header.recipient_count == vector["recipients"]
+
+    def test_it_still_hides_who_signed(self, vector, stream_signer) -> None:
+        blob = bytes.fromhex(vector["container"])
+        assert stream_signer.ed25519_bytes not in blob
+        assert stream_signer.mldsa_bytes not in blob
+
+    def test_a_stranger_still_cannot_open_it(self, vector) -> None:
+        stranger = PrivateKey.decode(SIGNED_STREAM["stranger"])
+        with pytest.raises(HpqcError):
+            decrypt_stream(
+                io.BytesIO(bytes.fromhex(vector["container"])),
+                io.BytesIO(),
+                stranger,
+            )
+
+    def test_truncating_it_is_still_refused(self, vector, stream_identities) -> None:
+        blob = bytes.fromhex(vector["container"])
+        with pytest.raises(HpqcError):
+            decrypt_stream(
+                io.BytesIO(blob[: -streaming.WIRE_CHUNK_SIZE]),
+                io.BytesIO(),
+                stream_identities[0],
+            )
+
+
+def test_a_recorded_forwarded_stream_still_does_not_verify(
+    stream_identities, stream_signer
+) -> None:
+    """Surreptitious forwarding over a stream, frozen.
+
+    The block was signed over one container's header and the stream re-sealed
+    under another. The AEAD is content -- whoever built it held the file key --
+    so only the header binding is between this and a file that verifies as
+    "the signer wrote this to me".
+    """
+    vector = SIGNED_STREAM["forwarded"]
+    blob = bytes.fromhex(vector["container"])
+    identity = stream_identities[vector["opens_for"]]
+
+    with pytest.raises(SignatureError):
+        decrypt_stream(io.BytesIO(blob), io.BytesIO(), identity, stream_signer)
+    with pytest.raises(SignatureError):
+        decrypt_stream(io.BytesIO(blob), io.BytesIO(), identity)
+
+
+def test_the_forwarded_stream_vector_is_a_real_container(stream_identities) -> None:
+    """Otherwise the test above could pass because the file is simply broken."""
+    vector = SIGNED_STREAM["forwarded"]
+    blob = bytes.fromhex(vector["container"])
+    identity = stream_identities[vector["opens_for"]]
+
+    header, header_bytes, _ = parse_header(blob)
+    assert header.signed and header.chunked
+    _, key = container_module._open_setup(header, identity)
+
+    # Every chunk opens; it is the signature over them that does not.
+    plain = io.BytesIO()
+    streaming.open_stream(
+        io.BytesIO(blob[len(header_bytes) :]), plain, key, header.suite,
+        header.nonce_prefix, header_bytes,
+    )
+    assert plain.getvalue().endswith(bytes.fromhex(vector["plaintext"]))
+    assert len(plain.getvalue()) == (
+        signing.SIGNATURE_BLOCK_LEN + len(bytes.fromhex(vector["plaintext"]))
+    )

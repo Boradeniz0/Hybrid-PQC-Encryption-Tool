@@ -173,10 +173,38 @@ jobs:
           fi
           echo "no partial plaintext left behind: ok"
 
+          # A signed stream: the writer reads the input twice to digest it,
+          # so the plaintext never exists as one object on either side.
           hpqc encrypt -r ci.pub big.bin -o big-signed.hpqc -s signer.key
-          says '^chunked:     no' hpqc info big-signed.hpqc
+          says '^chunked:     yes' hpqc info big-signed.hpqc
           says '^signed:      yes' hpqc info big-signed.hpqc
-          echo "signing a large file falls back to one-shot: ok"
+          hpqc decrypt -k ci.key big-signed.hpqc -o big-signed.bin \
+            --sender signer.pub 2>bs.err
+          cmp big.bin big-signed.bin
+          grep -q 'signature ok' bs.err
+          echo "a large file is streamed and signed: ok"
+          # The signer is checked before a byte is released, which is why the
+          # block goes in front of the plaintext rather than in a trailer.
+          rm -f nothing.bin
+          if hpqc decrypt -k ci.key big-signed.hpqc -o nothing.bin \
+               --sender impostor.pub 2>err.txt; then
+            echo "FAIL: verified a stream against the wrong sender"; exit 1
+          fi
+          grep -q 'but verification was requested against' err.txt
+          if [ -e nothing.bin ]; then
+            echo "FAIL: a rejected stream wrote output anyway"; exit 1
+          fi
+          echo "wrong sender on a stream writes nothing: ok"
+          # stdin arrives once, so this one case cannot stream.
+          if cat big.bin | hpqc encrypt -r ci.pub -s signer.key --chunked \
+               -o x.hpqc 2>err.txt; then
+            echo "FAIL: signed a stream from stdin"; exit 1
+          fi
+          grep -q 'read twice' err.txt
+          cat big.bin | hpqc encrypt -r ci.pub -s signer.key -o piped-signed.hpqc 2>err.txt
+          grep -q 'stdin arrives once' err.txt
+          says '^chunked:     no' hpqc info piped-signed.hpqc
+          echo "signing from stdin falls back to one-shot: ok"
 
           cat big.bin | hpqc encrypt -r ci.pub | hpqc decrypt -k ci.key > piped-big.bin
           cmp big.bin piped-big.bin
@@ -224,12 +252,6 @@ jobs:
           fi
           grep -q 'same key' err.txt
           echo "duplicate recipient refused: ok"
-          if hpqc encrypt -r ci.pub -r second.pub msg.txt -o x.hpqc \
-               -s signer.key --chunked 2>err.txt; then
-            echo "FAIL: signed and chunked at once"; exit 1
-          fi
-          grep -q 'cannot be combined' err.txt
-          echo "signing a chunked list refused: ok"
 
           hpqc encrypt -r ci.pub --hide-recipients msg.txt -o hidden.hpqc
           says '^recipients:  1' hpqc info hidden.hpqc

@@ -456,12 +456,53 @@ temporary file and renames it over the target only once the last chunk has
 verified. A truncated file leaves no output at all. Decrypting to a pipe is the
 case where the caveat still bites, and the tool says so on stderr.
 
-**Signing and streaming are mutually exclusive.** A signature is a statement
-about a whole message: it cannot be produced until the whole message has been
-read, and it cannot be checked until all of it has arrived. So `--sign` uses
-the one-shot payload. Asking for both explicitly is an error; signing a large
-file falls back to one shot and says so, because silently dropping the
-signature would be worse than using the memory.
+**Signing a stream costs a second read, not the memory.** A signature is a
+statement about a whole message, and a chunked writer never holds one. So it
+signs a *digest* of the plaintext, computed in a first pass over the input —
+which means the input has to be one that can be read twice:
+
+| 200 MB, signed | encrypt peak RSS | decrypt + verify peak RSS |
+| --- | ---: | ---: |
+| streamed | **35 MB** | **34 MB** |
+| `--one-shot` | 816 MB | 1010 MB |
+
+The signature block goes **in front of** the plaintext, not in a trailer, and
+that is the decision worth defending. A trailer buys a single pass and costs
+the reader everything it could have known early: the claimed signer would
+arrive only after the last chunk had already been written out, so `--sender`
+could not refuse a file until the file had been delivered. With the block in
+front, a reader checks the claimed identity before releasing a single byte:
+
+```console
+$ hpqc decrypt -k alice.key big.hpqc -o out.bin --sender impostor.pub
+error: this file was signed by key id 94cb82d7..., but verification was
+requested against d8fd44dc...
+$ ls out.bin
+ls: cannot access 'out.bin': No such file or directory
+```
+
+What still waits for the end is unavoidable, and it is the honest cost of
+streaming anything: **plaintext is released before the signature over it has
+been checked.** The mitigation is the one streaming already needed — decryption
+writes to a temporary file and renames it only on success, so an unverified
+stream never appears under the name you asked for. A pipe is where the caveat
+bites, and the tool says so.
+
+The digest is **SHA-512**, and that is deliberate. Signing a digest makes the
+signature only as collision-resistant as the hash: find two plaintexts sharing
+one digest and a single signature covers both. SHA-256 would put that at 2¹²⁸
+classically and lower against a quantum collision search — a quiet halving of
+the security of a scheme whose whole premise is being conservative about the
+future.
+
+**stdin is the one input that cannot be signed as a stream**, because it
+arrives once:
+
+```console
+$ cat disk.img | hpqc encrypt -r bob.pub -s alice.key -o out.hpqc
+note: signing a stream reads the input twice and stdin arrives once;
+writing a one-shot container instead
+```
 
 ## Several recipients
 
@@ -841,7 +882,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-676 passed
+742 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -941,6 +982,14 @@ actually fails. Among them:
   looked up from one table copied out of FIPS 203; a typo there produces a
   format that agrees with itself and with nothing else. The test generates a
   key of each parameter set and asserts the real sizes match the table.
+- **A recipient cannot forge a signed stream.** They hold the file key, so the
+  three attacks are built from the inside: re-seal a changed message, a shorter
+  one, or a longer one, each properly re-chunked so the final-chunk marker has
+  nothing to say. Only the digest catches them. Paired with a test that the
+  untouched container still opens.
+- **A wrong `--sender` on a stream writes nothing at all.** The whole reason
+  the signature block goes in front rather than in a trailer, asserted on a
+  300 KB file where a trailer would have released every byte first.
 - **A reader that stops early is not an error.** `hpqc decrypt big.hpqc | head`
   runs as a real subprocess against a real pipe, and must die of SIGPIPE with
   an empty stderr rather than exiting 1 in silence.
@@ -1163,13 +1212,15 @@ What it does **not** do, by design in v1:
   signing public key, obtained some other way. There is no web of trust, no
   TOFU store, no directory. A signature checked only against the key inside the
   file proves consistency, not identity, and the tool says so.
-- **Signed files are not streamed.** A signature covers a whole message, so
-  signing holds the plaintext in memory however large it is. Everything
-  unsigned streams.
-- **A stream releases plaintext before the file is fully authenticated.**
-  Inherent to streaming. Decrypting to a file is safe — the output is renamed
-  into place only on success — but decrypting to a pipe hands partial data
-  downstream before the end is checked.
+- **Signing a stream needs an input that can be read twice.** The signature
+  covers a digest of the whole plaintext and has to exist before the first
+  chunk is written. A file is fine; stdin falls back to a one-shot container
+  and says so.
+- **A stream releases plaintext before the file is fully authenticated** — and,
+  when it is signed, before the signature over it has been checked. Inherent to
+  streaming. Decrypting to a file is safe, because the output is renamed into
+  place only on success; decrypting to a pipe hands data downstream before the
+  end is checked.
 - **No memory hygiene.** Passphrases and private keys are ordinary Python
   objects: they are not pinned, not zeroed after use, and may be copied by the
   interpreter or swapped to disk. A passphrase raises the cost of a stolen key
@@ -1192,7 +1243,7 @@ What it does **not** do, by design in v1:
 - [x] Multiple recipients per file
 - [x] Signing to a recipient list (bind the container, not the recipient)
 - [x] ML-KEM-1024 suite (with X448, so both halves move together)
-- [ ] Signing a streamed file (a signature trailer over a rolling digest)
+- [x] Signing a streamed file — a digest signed up front, not a trailer
 - [x] Known-answer test vectors checked into the repo
 
 ## References

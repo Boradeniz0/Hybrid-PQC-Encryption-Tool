@@ -367,11 +367,24 @@ class TestBothShapes:
         with pytest.raises(FormatError, match="chunked"):
             container.open_container(blob, alice)
 
-    def test_a_header_claiming_both_shapes_is_refused(self, alice_pub) -> None:
+    def test_claiming_a_signature_a_chunked_file_does_not_have(
+        self, alice, alice_pub
+    ) -> None:
+        """The flags are parsed, and then the payload has to agree with them.
+
+        A chunked file really can be signed now, so the header parses. What it
+        cannot do is produce a signature block out of a payload that has none:
+        the first bytes of chunk 0 are plaintext, and reading them as a block
+        fails on a length that is not 32.
+        """
         blob = bytearray(seal_stream(b"x" * 100, alice_pub))
         blob[7] = FLAG_SIGNED | FLAG_CHUNKED
-        with pytest.raises(FormatError, match="both signed and chunked"):
-            container.parse_header(bytes(blob))
+
+        header, _, _ = container.parse_header(bytes(blob))
+        assert header.signed and header.chunked
+
+        with pytest.raises((DecryptionError, FormatError, SignatureError)):
+            open_bytes(bytes(blob), alice)
 
 
 class TestReadingPrimitives:

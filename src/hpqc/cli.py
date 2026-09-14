@@ -34,6 +34,7 @@ from . import (
     backend,
     container,
     kems,
+    signing,
     streaming,
     suites,
     wrapping,
@@ -497,7 +498,8 @@ def signgen(
     help=(
         "Force the payload shape. The default picks it from the input size: "
         f"up to {ONE_SHOT_LIMIT // 1024} KiB is sealed in one piece, anything "
-        "larger is streamed in chunks so it never has to fit in memory."
+        "larger is streamed in chunks so it never has to fit in memory. "
+        "Streaming with --sign reads the input twice, so it needs a file."
     ),
 )
 @click.option(
@@ -521,12 +523,6 @@ def encrypt(
             "--passphrase-file only makes sense with --sign; there is no "
             "private key to open otherwise"
         )
-    if chunked and signing_key_path is not None:
-        raise click.ClickException(
-            "--chunked and --sign cannot be combined: a signature is a "
-            "statement about a whole message, so it cannot be produced until "
-            "the whole message has been read"
-        )
     to = _read_recipients(recipient_paths)
     sender = (
         _open_private(signing_key_path, passphrase_file, SigningPrivateKey)
@@ -543,16 +539,30 @@ def encrypt(
         head = streaming.read_exactly(source, ONE_SHOT_LIMIT + 1)
         stream_it = len(head) > ONE_SHOT_LIMIT if chunked is None else chunked
 
-        if stream_it and sender is not None:
-            # Reached only on the automatic path -- the explicit combination is
-            # refused above. Signing wins, because dropping the signature
-            # silently would be worse than using more memory than we would like.
+        if stream_it and sender is not None and input_path == STDIO:
+            # Signing a stream means digesting the plaintext before the first
+            # chunk is written, which means reading the input twice, and stdin
+            # arrives once. A file is fine; a pipe is not.
+            if chunked:
+                raise click.ClickException(
+                    "--chunked and --sign need an input that can be read "
+                    "twice: the signature covers a digest of the whole "
+                    "plaintext and has to exist before the first chunk is "
+                    "written. Give INPUT as a file rather than on stdin"
+                )
             stream_it = False
             click.echo(
-                "note: signing needs the whole file at once; writing a "
-                "one-shot container instead of streaming",
+                "note: signing a stream reads the input twice and stdin "
+                "arrives once; writing a one-shot container instead",
                 err=True,
             )
+
+        digest = None
+        if stream_it and sender is not None:
+            # The first of the two passes. A separate handle, because the one
+            # above is already a megabyte into the file.
+            with _input_stream(input_path) as first_pass:
+                digest = signing.digest_stream(first_pass)
 
         if stream_it:
             with _output_stream(output_path) as sink:
@@ -562,6 +572,8 @@ def encrypt(
                     to,
                     suite=suite,
                     hide_recipients=hide_recipients,
+                    sender=sender,
+                    digest=digest,
                 )
             click.echo(
                 f"streamed in {chunks} chunks of "

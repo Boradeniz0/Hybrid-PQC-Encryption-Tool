@@ -54,6 +54,40 @@ The header is already the AEAD's associated data, which is not the same thing:
 that binds it to the file key, which every recipient holds. This binds it to
 Alice's signing key, which none of them do.
 
+**3c. A streamed payload signs a digest, because the signer never holds the
+message.** Chunking exists so that a file larger than memory can be encrypted;
+a signature is a statement about all of it. The two are reconciled by signing a
+digest of the plaintext rather than the plaintext, which moves the cost from
+memory to I/O: the writer reads its input twice, once to digest and once to
+seal. That is not a shortcut. The signature has to exist before the first chunk
+is written, because it goes *in front of* the plaintext.
+
+Putting it in front rather than in a trailer is the decision worth defending. A
+trailer buys a single pass, and it costs the reader everything it could have
+known early: the claimed signer would arrive only after the last chunk had
+already been written out, so `--sender` could not refuse a file until the file
+had been delivered. With the block in front, a reader checks the claimed
+identity before releasing a single byte, and only the *validity* of the
+signature has to wait for the end.
+
+What still waits for the end is unavoidable and is the honest cost of streaming
+anything: plaintext is released before the signature over it has been checked.
+The mitigation is the one streaming already needed -- the CLI decrypts to a
+temporary file and renames it only on success, so an unverified stream never
+appears under the name the caller asked for. Decrypting to a pipe is the case
+where the caveat bites, and the tool says so.
+
+So there are three constructions, selected by flags the reader has before it
+opens anything:
+
+    flags                    signed message binds
+    (none)                   the recipient's public keys, and the plaintext
+    FLAG_RECIPIENTS          the header, and the plaintext
+    FLAG_CHUNKED             the header, and a digest of the plaintext
+
+Each has its own label, so a signature made under one can never be presented as
+one made under another.
+
 Payload layout inside the AEAD when the signed flag is set:
 
     offset  size   field
@@ -69,11 +103,16 @@ Payload layout inside the AEAD when the signed flag is set:
 
 That is 5365 bytes of overhead on top of the header's 1184. Post-quantum
 signatures are simply large; ML-DSA-65 alone is 3309 bytes of it.
+
+A streamed payload has the same block in the same place, with the plaintext
+following it in the stream rather than inside it -- so the chunking code never
+learns that signatures exist, and the framing does not change at all.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import hashlib
+from typing import BinaryIO, Optional, Tuple
 
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 
@@ -97,6 +136,25 @@ SIG_LABEL = b"hpqc-v1 sender authentication"
 # be computed over the same byte string and a signature made under one can
 # never be presented as one made under the other.
 SIG_CONTAINER_LABEL = b"hpqc-v1 sender authentication to a container"
+
+# And a third, for a container whose payload is streamed. Its signed message
+# holds a digest where the other two hold the message itself, which is a
+# different claim about a different thing and so gets a label of its own.
+SIG_STREAM_LABEL = b"hpqc-v1 sender authentication over a chunked container"
+
+# Domain separation for the digest itself, so these 64 bytes cannot be mistaken
+# for any other SHA-512 in the system.
+STREAM_DIGEST_LABEL = b"hpqc-v1 stream digest"
+
+#: SHA-512, not SHA-256, and the reason is worth stating. Signing a digest
+#: replaces the message with a hash of it, so the signature is from then on only
+#: as collision-resistant as that hash: find two plaintexts with the same digest
+#: and one signature covers both. SHA-256 would put that at 2**128 classically
+#: and lower still against a quantum collision search -- a quiet halving of the
+#: security of a scheme whose entire premise is being conservative about the
+#: future. SHA-512 costs nothing here and keeps the bound where Ed25519 already
+#: puts it internally.
+STREAM_DIGEST_LEN = 64
 
 ED25519_SIGNATURE_LEN = 64
 MLDSA65_SIGNATURE_LEN = 3309
@@ -162,6 +220,151 @@ def container_signed_message(
             plaintext,
         )
     )
+
+
+def stream_digest():
+    """A fresh, domain-separated hash for the plaintext of a stream.
+
+    Fed the plaintext and nothing else: not the signature block in front of it,
+    and not the header, which the signed message binds separately.
+    """
+    digest = hashlib.sha512()
+    digest.update(STREAM_DIGEST_LABEL)
+    return digest
+
+
+def stream_signed_message(
+    digest: bytes,
+    sender: SigningPublicKey,
+    header_bytes: bytes,
+    suite: Suite,
+) -> bytes:
+    """The byte string signed when the payload is streamed.
+
+    The header is bound exactly as it is for a recipient list -- it carries the
+    recipients, the flags, and everything else about the delivery -- and the
+    plaintext appears only as its digest, because the signer never has all of
+    it at once. Everything after the length-prefixed header is fixed-length.
+    """
+    if len(digest) != STREAM_DIGEST_LEN:
+        raise ValueError(
+            f"stream digest must be {STREAM_DIGEST_LEN} bytes, got {len(digest)}"
+        )
+    return b"".join(
+        (
+            SIG_STREAM_LABEL,
+            bytes([suite.id]),
+            sender.ed25519_bytes,
+            sender.mldsa_bytes,
+            U32.pack(len(header_bytes)),
+            header_bytes,
+            digest,
+        )
+    )
+
+
+def sign_stream_prologue(
+    digest: bytes,
+    sender: SigningPrivateKey,
+    header_bytes: bytes,
+    suite: Suite,
+) -> bytes:
+    """The signature block that goes in front of a streamed plaintext.
+
+    Same block as the one-shot format, with nothing after it: the plaintext
+    follows in the stream rather than inside the block. Putting it at the front
+    rather than in a trailer is what lets a reader learn who *claims* to have
+    signed -- and refuse a `--sender` that does not match -- before it writes a
+    single byte. Only whether the signature is *valid* has to wait for the end.
+    """
+    public = sender.public_key()
+    message = stream_signed_message(digest, public, header_bytes, suite)
+    return _block(public, *_sign(message, sender), plaintext=b"")
+
+
+#: How much to read at a time when digesting a file. It affects only how often
+#: read() is called; the digest is the same whatever the size.
+_DIGEST_READ = 1 << 16
+
+
+def digest_stream(source: BinaryIO) -> bytes:
+    """Digest a plaintext without holding it. This is the writer's first pass.
+
+    Signing a stream costs a second read of the input, and that is not an
+    implementation shortcut: a signature is a statement about the whole file,
+    so the whole file has to be seen before the first chunk can be written. The
+    alternative is a trailer, which buys a single pass at the price of telling
+    the reader who signed only after it has already written everything out.
+    """
+    digest = stream_digest()
+    while True:
+        block = source.read(_DIGEST_READ)
+        if not block:
+            return digest.digest()
+        digest.update(block)
+
+
+class StreamVerifier:
+    """A sink that peels the signature block off the front and hashes the rest.
+
+    Wrapping the caller's sink rather than teaching streaming.py about
+    signatures: the chunking code stays a chunking code, and the two concerns
+    compose the way the flags that select them do.
+
+    Nothing reaches the real sink until the whole block has arrived and the
+    claimed signer has been checked against `expected_sender`. So asking to
+    verify against the wrong key writes no output at all, which is the one part
+    of this that does not have to wait for the end of the file.
+    """
+
+    def __init__(
+        self,
+        sink: BinaryIO,
+        *,
+        expected_sender: Optional[SigningPublicKey] = None,
+    ) -> None:
+        self._sink = sink
+        self._expected = expected_sender
+        self._prologue = bytearray()
+        self._digest = stream_digest()
+        self._parsed: Optional[Tuple[SigningPublicKey, bytes, bytes]] = None
+
+    def write(self, data: bytes) -> int:
+        if self._parsed is None:
+            want = SIGNATURE_BLOCK_LEN - len(self._prologue)
+            self._prologue += data[:want]
+            if len(self._prologue) < SIGNATURE_BLOCK_LEN:
+                return len(data)
+            signer, ed_sig, mldsa_sig, rest = _parse_block(
+                bytes(self._prologue), self._expected
+            )
+            # `rest` is empty by construction: the block is exactly
+            # SIGNATURE_BLOCK_LEN bytes and that is all that was handed over.
+            assert not rest
+            self._parsed = (signer, ed_sig, mldsa_sig)
+            data = data[want:]
+
+        self._digest.update(data)
+        self._sink.write(data)
+        return len(data)
+
+    def finish(self, header_bytes: bytes, suite: Suite) -> SigningPublicKey:
+        """Check the signature over everything that was written. Raises or returns."""
+        if self._parsed is None:
+            raise SignatureError(
+                "this container claims to be signed, but it ended before the "
+                f"{SIGNATURE_BLOCK_LEN}-byte signature block was complete"
+            )
+        signer, ed_signature, mldsa_signature = self._parsed
+        _verify(
+            signer,
+            stream_signed_message(
+                self._digest.digest(), signer, header_bytes, suite
+            ),
+            ed_signature,
+            mldsa_signature,
+        )
+        return signer
 
 
 def _block(

@@ -67,12 +67,12 @@ Two properties matter more than the exact offsets:
   own nonce, and neither side has to hold more than one chunk. See streaming.py
   for why the chunked shape needs an explicit final-chunk marker.
 
-The chunked shape is mutually exclusive with signing, and that is a property of
-signatures rather than an implementation shortcut: a signature is a statement
-about a whole message, so it cannot be produced until the whole message has
-been read, and it cannot be checked until the whole message has been received.
-Signing therefore uses the one-shot payload, and a container claiming to be
-both signed and chunked is refused as malformed.
+All three flags are independent, and every combination of them is a shape this
+build writes. Signed-and-chunked took some doing, because a signature is a
+statement about a whole message and a chunked writer never holds one: it is
+reconciled by signing a *digest*, computed in a first pass over the input, with
+the signature block written in front of the plaintext so that a reader meets it
+before anything is released. See signing.py.
 
 Signing composes with a recipient list, but not by the obvious route. The
 signature normally binds the recipient's public keys into the signed message,
@@ -261,15 +261,6 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
         raise FormatError(
             f"unknown header flags 0x{unknown:04x}; the file uses a feature "
             f"this build does not implement (known flags: 0x{_KNOWN_FLAGS:04x})"
-        )
-
-    if flags & FLAG_SIGNED and flags & FLAG_CHUNKED:
-        # Never written, so this can only be a doctored header. Refuse it here
-        # rather than let a signature parser loose on chunk framing: the
-        # signature block would be read out of what is really a sealed chunk.
-        raise FormatError(
-            "header claims the payload is both signed and chunked; a signature "
-            "covers a whole message, so signed containers are never chunked"
         )
 
     nonce = reader.take(suite.nonce_len, "AEAD nonce")
@@ -519,16 +510,42 @@ def encrypt_stream_many(
     *,
     suite: Suite = DEFAULT_SUITE,
     hide_recipients: bool = False,
+    sender: Optional[SigningPrivateKey] = None,
+    digest: Optional[bytes] = None,
 ) -> int:
     """Chunk-encrypt to one or more recipients. Returns the number of chunks.
 
-    Chunking and the recipient list are independent: one is about the payload,
-    the other about the header, and they compose without either knowing about
-    the other. That they do is the payoff of putting both in the flags field
-    rather than in the format version.
+    All three flags are independent and compose: one is about the payload
+    shape, one about the header's recipients, one about authentication. That
+    they do is the payoff of putting each in the flags field rather than in the
+    format version, which has still never moved.
+
+    Signing needs `digest`, which is `signing.digest_stream` over the same
+    plaintext this call is about to seal. The caller supplies it rather than
+    this function computing it, because computing it means reading the input a
+    second time and only the caller knows how to get another reader for it.
     """
+    if (sender is None) != (digest is None):
+        raise ValueError(
+            "sender and digest go together: signing a stream needs the digest "
+            "of the plaintext, taken before the first chunk is written"
+        )
+
     flags = _recipient_flags(to, hide_recipients) | FLAG_CHUNKED
+    if sender is not None:
+        flags |= FLAG_SIGNED
+
     header, header_bytes, key = _seal_setup(to, suite, flags)
+
+    if sender is not None:
+        # The block goes in front of the plaintext, inside the AEAD, exactly as
+        # it does in a one-shot container -- so the framing does not change at
+        # all, and neither does the signer's confidentiality.
+        source = streaming.PrefixedStream(
+            signing.sign_stream_prologue(digest, sender, header_bytes, suite),
+            source,
+        )
+
     sink.write(header_bytes)
     return streaming.seal(
         source, sink, key, suite, header.nonce_prefix, header_bytes
@@ -701,21 +718,33 @@ def decrypt_stream(
         sink.write(opened.plaintext)
         return opened
 
-    if sender is not None:
-        # Same fail-closed rule as the one-shot path: a chunked file is never
-        # signed, so an authentication request it cannot satisfy is an error
-        # rather than a plaintext with a caveat.
+    if sender is not None and not header.signed:
+        # Same fail-closed rule as the one-shot path: an authentication request
+        # this file cannot satisfy is an error, not a plaintext with a caveat.
         raise SignatureError(
             "sender verification was requested, but this file is not signed"
         )
 
     _, key = _open_setup(header, identity)
+    payload = streaming.PrefixedStream(leftover, source)
+
+    if not header.signed:
+        chunks = streaming.open_stream(
+            payload, sink, key, header.suite, header.nonce_prefix, header_bytes
+        )
+        return Opened(plaintext=b"", chunks=chunks)
+
+    # The verifier sits between the chunk reader and the caller's sink: it
+    # takes the signature block off the front, holds everything back until the
+    # claimed signer has been checked, and digests what it passes on.
+    verifier = signing.StreamVerifier(sink, expected_sender=sender)
     chunks = streaming.open_stream(
-        streaming.PrefixedStream(leftover, source),
-        sink,
-        key,
-        header.suite,
-        header.nonce_prefix,
-        header_bytes,
+        payload, verifier, key, header.suite, header.nonce_prefix, header_bytes
     )
-    return Opened(plaintext=b"", chunks=chunks)
+    signer = verifier.finish(header_bytes, header.suite)
+    return Opened(
+        plaintext=b"",
+        signer=signer,
+        verified=sender is not None,
+        chunks=chunks,
+    )

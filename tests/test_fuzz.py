@@ -447,3 +447,87 @@ def test_every_suite_byte_against_every_container(alice, alice_pub) -> None:
                 continue
             with pytest.raises(HpqcError):
                 decrypt(bytes(doctored), identity)
+
+
+def test_random_corruption_of_a_signed_stream_never_escapes(
+    alice, alice_pub, carol, carol_pub
+) -> None:
+    """A signed stream has two parsers stacked and a hash between them.
+
+    The chunk reader hands plaintext to the verifier, which peels a fixed-size
+    block off the front and digests the rest. Corrupting the container exercises
+    every layer, and none of them may turn a malformed file into a traceback.
+    """
+    from hpqc import signing as signing_module
+
+    plaintext = b"the quick brown fox" * 500
+    sink = io.BytesIO()
+    container_module.encrypt_stream_many(
+        io.BytesIO(plaintext), sink, [alice_pub], sender=carol,
+        digest=signing_module.digest_stream(io.BytesIO(plaintext)),
+    )
+    blob = sink.getvalue()
+    rng = random.Random(SEED + 9)
+
+    for _ in range(ITERATIONS):
+        corrupted = _mutate(rng, blob)
+        if corrupted == blob:
+            continue
+        try:
+            container_module.decrypt_stream(
+                io.BytesIO(corrupted), io.BytesIO(), alice, carol_pub
+            )
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"{type(exc).__name__} escaped: {exc}\n"
+                f"input prefix: {corrupted[:48].hex()}"
+            )
+        else:
+            pytest.fail("a corrupted signed stream verified successfully")
+
+
+def test_a_mutated_stream_prologue_never_verifies(alice, alice_pub, carol, carol_pub):
+    """Fuzz the block parser through the streaming path, sealed each time.
+
+    The forger here is a recipient: they hold the file key, so the AEAD has
+    nothing to say about what they seal. Only the signature does.
+    """
+    from hpqc import signing as signing_module
+    from hpqc import streaming as streaming_module
+    from hpqc.container import FLAG_CHUNKED, FLAG_SIGNED, _seal_setup
+
+    plaintext = b"pay 100" * 200
+    digest = signing_module.digest_stream(io.BytesIO(plaintext))
+    header, header_bytes, key = _seal_setup(
+        [alice_pub], DEFAULT_SUITE, FLAG_SIGNED | FLAG_CHUNKED
+    )
+    prologue = signing_module.sign_stream_prologue(
+        digest, carol, header_bytes, DEFAULT_SUITE
+    )
+    rng = random.Random(SEED + 10)
+
+    for _ in range(ITERATIONS):
+        mutated = _mutate(rng, prologue)
+        if mutated == prologue:
+            continue
+        sealed = io.BytesIO()
+        streaming_module.seal(
+            io.BytesIO(mutated + plaintext), sealed, key, DEFAULT_SUITE,
+            header.nonce_prefix, header_bytes,
+        )
+        blob = header_bytes + sealed.getvalue()
+        try:
+            container_module.decrypt_stream(
+                io.BytesIO(blob), io.BytesIO(), alice, carol_pub
+            )
+        except HpqcError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"{type(exc).__name__} escaped the block parser: {exc}\n"
+                f"prologue prefix: {mutated[:48].hex()}"
+            )
+        else:
+            pytest.fail("a mutated stream prologue verified successfully")

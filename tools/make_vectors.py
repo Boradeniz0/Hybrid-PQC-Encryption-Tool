@@ -744,6 +744,145 @@ def build_v1_mlkem1024() -> dict:
     return data
 
 
+def build_v1_signed_stream() -> dict:
+    """Signed containers whose payload is streamed, where a digest is signed.
+
+    The signer never holds the whole plaintext, so the signed message carries a
+    digest of it instead of the message itself. That makes three things worth
+    freezing, and only the first two are things a container cannot stand in for.
+
+    * `digests` -- the domain-separated SHA-512 of fixed plaintexts. Change the
+      label, change the algorithm, or start hashing the signature block along
+      with the plaintext, and every signature ever made stops verifying while
+      every round trip keeps working.
+
+    * `signed_messages` -- the SHA-256 of the exact byte string the signatures
+      cover, for fixed inputs. Drop the header from it and surreptitious
+      forwarding comes back; drop the digest and the plaintext stops being
+      covered at all.
+
+    * `containers` -- streamed signed files, one recipient and a list, both
+      suites. Each must still verify, and a fourth identity must not open it.
+
+    * `forwarded` -- a signature made over one header, re-sealed into another
+      addressed to the same identity. It must keep failing.
+    """
+    identities = [PrivateKey.generate() for _ in range(2)]
+    publics = [k.public_key() for k in identities]
+    stranger = PrivateKey.generate()
+    signer = SigningPrivateKey.generate()
+    signer_public = signer.public_key()
+
+    data = {
+        "note": (
+            "Frozen known-answer vectors for hpqc containers that are both "
+            "signed and chunked. " + TEST_KEY_WARNING
+        ),
+        "format_version": 1,
+        "flags": FLAG_SIGNED | FLAG_CHUNKED,
+        "sig_stream_label": signing.SIG_STREAM_LABEL.decode("ascii"),
+        "stream_digest_label": signing.STREAM_DIGEST_LABEL.decode("ascii"),
+        "stream_digest_len": signing.STREAM_DIGEST_LEN,
+        "signature_block_len": signing.SIGNATURE_BLOCK_LEN,
+        "identities": [k.encode() for k in identities],
+        "publics": [p.encode() for p in publics],
+        "stranger": stranger.encode(),
+        "signer": signer.encode(),
+        "signer_public": signer_public.encode(),
+        "digests": [],
+        "signed_messages": [],
+        "containers": [],
+    }
+
+    # The digest construction, over inputs small enough to spell out.
+    for label, plaintext in (
+        ("empty", b""),
+        ("short", b"hpqc streamed signature test vector v1\n"),
+        ("binary", bytes(range(256))),
+    ):
+        data["digests"].append({
+            "name": label,
+            "plaintext": plaintext.hex(),
+            "digest": signing.digest_stream(io.BytesIO(plaintext)).hex(),
+        })
+
+    # And one that crosses a chunk boundary, recorded by length and hash.
+    crossing = _filler(b"hpqc-vector-stream-signed", streaming.CHUNK_SIZE + 1)
+    data["digests"].append({
+        "name": "crosses a chunk boundary",
+        "plaintext_len": len(crossing),
+        "plaintext_sha256": hashlib.sha256(crossing).hexdigest(),
+        "digest": signing.digest_stream(io.BytesIO(crossing)).hex(),
+    })
+
+    def sealed(plaintext, to, suite):
+        sink = io.BytesIO()
+        encrypt_stream_many(
+            io.BytesIO(plaintext), sink, to, suite=suite, sender=signer,
+            digest=signing.digest_stream(io.BytesIO(plaintext)),
+        )
+        return sink.getvalue()
+
+    for cli_name, suite in sorted(suites.BY_CLI_NAME.items()):
+        for count, shape in ((1, "one recipient"), (2, "recipient list")):
+            data["containers"].append({
+                "suite": cli_name,
+                "suite_id": suite.id,
+                "shape": shape,
+                "recipients": count,
+                "plaintext_len": len(crossing),
+                "plaintext_sha256": hashlib.sha256(crossing).hexdigest(),
+                "chunks": 2,
+                "container": sealed(crossing, publics[:count], suite).hex(),
+            })
+
+        header_bytes = _filler(b"hpqc-vector-stream-header", 1168)
+        digest = signing.digest_stream(io.BytesIO(crossing))
+        message = signing.stream_signed_message(
+            digest, signer_public, header_bytes, suite
+        )
+        data["signed_messages"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "header_bytes": header_bytes.hex(),
+            "digest": digest.hex(),
+            "message_len": len(message),
+            "message_sha256": hashlib.sha256(message).hexdigest(),
+        })
+
+    # Surreptitious forwarding, streamed and frozen: the block is signed over
+    # one header and the stream re-sealed under another.
+    suite = suites.DEFAULT_SUITE
+    plaintext = b"hpqc streamed forwarding vector v1\n"
+    digest = signing.digest_stream(io.BytesIO(plaintext))
+    _, elsewhere_bytes, _ = _seal_setup(
+        [publics[1]], suite, FLAG_SIGNED | FLAG_CHUNKED
+    )
+    prologue = signing.sign_stream_prologue(
+        digest, signer, elsewhere_bytes, suite
+    )
+    header, header_bytes, key = _seal_setup(
+        [publics[0]], suite, FLAG_SIGNED | FLAG_CHUNKED
+    )
+    sink = io.BytesIO()
+    streaming.seal(
+        streaming.PrefixedStream(prologue, io.BytesIO(plaintext)),
+        sink, key, suite, header.nonce_prefix, header_bytes,
+    )
+    data["forwarded"] = {
+        "note": (
+            "signed over one container's header, re-sealed into another "
+            "addressed to identities[0]; opening it must raise SignatureError"
+        ),
+        "suite": "chacha20",
+        "opens_for": 0,
+        "plaintext": plaintext.hex(),
+        "container": (header_bytes + sink.getvalue()).hex(),
+    }
+
+    return data
+
+
 BUILDERS = {
     "v1.json": build_v1,
     "v1-signed.json": build_v1_signed,
@@ -752,6 +891,7 @@ BUILDERS = {
     "v1-recipients.json": build_v1_recipients,
     "v1-signed-recipients.json": build_v1_signed_recipients,
     "v1-mlkem1024.json": build_v1_mlkem1024,
+    "v1-signed-stream.json": build_v1_signed_stream,
 }
 
 

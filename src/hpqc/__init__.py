@@ -19,8 +19,10 @@ around the secret -- rather than relying on file permissions alone.
 
 Files past a megabyte are sealed as a chunked stream (the STREAM construction:
 a counter nonce per chunk and an explicit final-chunk marker), so the memory
-cost is one chunk rather than the whole file. Signed files are the exception,
-because a signature covers a whole message and so needs one.
+cost is one chunk rather than the whole file. Signing one costs a second read
+of the input instead of the memory: a signature covers the whole message, so
+the plaintext is digested before the first chunk is written and the signature
+travels in front of it.
 
 A file can be addressed to several recipients at once. It is sealed under one
 random file key, and each recipient gets a copy of that key wrapped under their
@@ -30,6 +32,6 @@ and not who they are. Signing such a file binds the header itself rather than a
 recipient, because there is no recipient in it to bind.
 """
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = ["__version__"]

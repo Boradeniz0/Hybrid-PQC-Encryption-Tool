@@ -771,20 +771,46 @@ class TestStreaming:
         run(runner, "encrypt", "-r", "alice.pub", "small.bin", "-o", "small.hpqc")
         assert "chunked:     no" in shown(run(runner, "info", "small.hpqc"))
 
-    def test_chunked_and_sign_are_refused_together(self, workspace, runner) -> None:
+    def test_chunked_and_sign_work_together_on_a_file(self, workspace, runner) -> None:
         run(runner, "signgen", "-o", "signer")
         (workspace / "small.bin").write_bytes(b"x" * 100)
 
+        result = run(
+            runner, "encrypt", "-r", "alice.pub", "small.bin", "-o", "x.hpqc",
+            "--chunked", "-s", "signer.key",
+        )
+        assert result.exit_code == 0, shown(result)
+
+        header, _, _ = parse_header((workspace / "x.hpqc").read_bytes())
+        assert header.signed and header.chunked
+
+        result = run(runner, "decrypt", "-k", "alice.key", "x.hpqc",
+                     "-o", "back.bin", "--sender", "signer.pub")
+        assert result.exit_code == 0, shown(result)
+        assert "signature ok" in shown(result)
+        assert (workspace / "back.bin").read_bytes() == b"x" * 100
+
+    def test_chunked_and_sign_are_refused_on_stdin(self, workspace, runner) -> None:
+        """Two passes over the plaintext, and stdin only arrives once."""
+        run(runner, "signgen", "-o", "signer")
+
         result = runner.invoke(
             cli,
-            ["encrypt", "-r", "alice.pub", "small.bin", "-o", "x.hpqc",
+            ["encrypt", "-r", "alice.pub", "-o", "x.hpqc",
              "--chunked", "-s", "signer.key"],
+            input=b"x" * 100,
         )
         assert result.exit_code != 0
-        assert "cannot be combined" in shown(result)
+        assert "read twice" in shown(result)
+        assert not (workspace / "x.hpqc").exists()
 
-    def test_signing_a_large_file_falls_back_to_one_shot(self, workspace, runner) -> None:
-        """Signing wins over streaming, and says so rather than doing it quietly."""
+    def test_signing_a_large_file_now_streams(self, workspace, runner) -> None:
+        """It used to fall back to one shot, because a signature needs it all.
+
+        It still needs it all -- it just reads the file twice to get it, rather
+        than holding it. The plaintext never exists as one object on either
+        side, which for a signed disk image is the whole difference.
+        """
         run(runner, "signgen", "-o", "signer")
         self._big(workspace)
 
@@ -793,7 +819,28 @@ class TestStreaming:
             "-s", "signer.key",
         )
         assert result.exit_code == 0
-        assert "one-shot container instead of streaming" in shown(result)
+        assert "streamed in" in shown(result)
+        assert "signed by key id" in shown(result)
+
+        header, _, _ = parse_header((workspace / "big.hpqc").read_bytes())
+        assert header.signed and header.chunked
+
+        result = run(runner, "decrypt", "-k", "alice.key", "big.hpqc",
+                     "-o", "back.bin", "--sender", "signer.pub")
+        assert result.exit_code == 0, shown(result)
+        assert (workspace / "back.bin").read_bytes() == (workspace / "big.bin").read_bytes()
+
+    def test_signing_a_large_pipe_still_falls_back(self, workspace, runner) -> None:
+        """The one case that cannot stream, and it says why rather than failing."""
+        run(runner, "signgen", "-o", "signer")
+        big = b"\xa5" * (ONE_SHOT_LIMIT + 4096)
+
+        result = runner.invoke(
+            cli, ["encrypt", "-r", "alice.pub", "-o", "big.hpqc", "-s", "signer.key"],
+            input=big,
+        )
+        assert result.exit_code == 0, shown(result)
+        assert "stdin arrives once" in shown(result)
 
         header, _, _ = parse_header((workspace / "big.hpqc").read_bytes())
         assert header.signed and not header.chunked
@@ -1011,9 +1058,10 @@ class TestSeveralRecipients:
         assert "but verification was requested against" in str(result.exception)
         assert not (group / "no.txt").exists()
 
-    def test_signing_a_large_file_to_a_group_falls_back_to_one_shot(
+    def test_a_large_file_to_a_group_streams_and_is_signed(
         self, group, runner
     ) -> None:
+        """All three flags at once, from the command line."""
         run(runner, "signgen", "-o", "signer")
         big = b"\xa5" * (ONE_SHOT_LIMIT + 4096)
         (group / "big.bin").write_bytes(big)
@@ -1021,17 +1069,22 @@ class TestSeveralRecipients:
         result = run(runner, "encrypt", "-r", "alice.pub", "-r", "bob.pub",
                      "big.bin", "-o", "bs.hpqc", "-s", "signer.key")
         assert result.exit_code == 0, shown(result)
-        assert "signing needs the whole file at once" in shown(result)
+        assert "streamed in" in shown(result)
 
         info = shown(run(runner, "info", "bs.hpqc"))
-        assert "chunked:     no" in info
+        assert "chunked:     yes" in info
         assert "recipients:  2" in info
         assert "signed:      yes" in info
 
-        result = run(runner, "decrypt", "-k", "bob.key", "bs.hpqc", "-o",
-                     "bs.bin", "--sender", "signer.pub")
-        assert result.exit_code == 0, shown(result)
-        assert (group / "bs.bin").read_bytes() == big
+        for name in ("alice", "bob", "carol"):
+            expected = name in ("alice", "bob")
+            result = runner.invoke(
+                cli, ["decrypt", "-k", f"{name}.key", "bs.hpqc",
+                      "-o", f"{name}.bin", "--sender", "signer.pub"]
+            )
+            assert (result.exit_code == 0) is expected, shown(result)
+            if expected:
+                assert (group / f"{name}.bin").read_bytes() == big
 
     def test_a_large_file_streams_to_several_recipients(self, group, runner) -> None:
         big = b"\xa5" * (ONE_SHOT_LIMIT + 4096)

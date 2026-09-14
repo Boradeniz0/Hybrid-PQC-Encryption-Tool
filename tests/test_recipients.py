@@ -259,12 +259,15 @@ class TestRefusals:
         with pytest.raises(DecryptionError, match="authentication failed"):
             container.decrypt(bytes(blob), crowd[0])
 
-    def test_signing_a_chunked_list_is_still_refused(self, crowd_pub):
+    def test_all_three_flags_together_are_a_shape_this_build_writes(
+        self, crowd_pub
+    ):
+        """Signed, chunked, and addressed to a list: legal, and parses."""
         blob = bytearray(container.encrypt_many(b"x", crowd_pub[:2]))
         blob[OFF_FLAGS + 1] = FLAG_SIGNED | FLAG_RECIPIENTS | FLAG_CHUNKED
 
-        with pytest.raises(FormatError, match="both signed and chunked"):
-            container.parse_header(bytes(blob))
+        header, _, _ = container.parse_header(bytes(blob))
+        assert header.signed and header.multi and header.chunked
 
     @pytest.mark.parametrize("count", [0, MAX_RECIPIENTS + 1, 0xFFFF])
     def test_an_out_of_range_recipient_count_is_refused(self, crowd_pub, count):
