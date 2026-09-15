@@ -186,6 +186,54 @@ prevent. Then the first version of its workflow parser handled only `run: |` and
 not `run: mypy`, so two steps ran as empty scripts and reported success. It now
 refuses to run if a step comes out empty.
 
+## The format document was the one file nothing checked
+
+The tests check the code against itself. The frozen vectors check it against
+yesterday. FORMAT.md sat beside both, describing byte offsets, and nothing
+anywhere read it.
+
+So I wrote a checker and pointed it at the document, and the first thing it
+said was that the wrapped private key header is 37 bytes, not the 39 the prose
+claimed. The table directly underneath that sentence was right, and had been
+all along: its rows run 0, 1, 2, 3, 4, 5, 6, 7, 23, 35, and the sealed blob
+starts at 37. I had written the sentence from memory a few days earlier and got
+it wrong by the width of the length field I had just finished describing.
+
+The tests that now catch it *parse the tables out of FORMAT.md* rather than
+restating them. That distinction is the whole value. A test holding its own
+copy of the offsets would have agreed with the document on the day it was
+written and then drifted alongside it, which is the same shape as a round trip
+that agrees with itself.
+
+Seventeen checks, and I confirmed each one by corrupting the document on
+purpose: a nonce size, a key id length, a flag bit number, a suite's AEAD, a
+stanza size, the recipient cap, the ML-DSA signature length, a key blob total,
+the STREAM final-chunk marker, the per-chunk overhead, the scrypt bound, the
+fixed overhead, and a renamed heading. Twelve of the thirteen failed. The
+thirteenth did not, and it was the interesting one: changing the last-chunk
+marker in the table from 0x01 to 0x02 changed nothing, because that test was
+checking the code against the code and never read the byte out of the row. It
+reads the row now.
+
+## A restored file that was not restored
+
+Proving the checks above meant editing a constant, running the suite, and
+copying the file back. Twice in a row the "restored" run still failed, on a
+file `git diff` said was identical to HEAD, importing from a path Python itself
+named as the one I had just restored.
+
+The cached bytecode was hash-based and unchecked, so the interpreter never
+revalidated it against the source. `MAX_RECIPIENTS = 1024` on disk and 2048 in
+the running process, with nothing visibly wrong anywhere.
+
+It matters more than the ten seconds it cost. One of the mutations I had just
+"confirmed" was never applied at all: the pattern did not match the file, the
+sed changed nothing, and the failure I recorded as proof came from the previous
+mutation still live in the cache. A vacuous check that reports success is the
+thing this whole project keeps circling, and here it was inside the procedure I
+use to rule them out. Every mutation is now checked with `git diff` for having
+actually changed the file, and the cache is cleared between runs.
+
 ## A full disk was eight frames of Python
 
 `hpqc keygen -o k` on a filesystem with no room left printed a traceback ending

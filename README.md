@@ -155,7 +155,7 @@ signed:      no
 
 ```console
 $ pytest --cov
-801 passed
+818 passed
 TOTAL   1419 statements, 282 branches, 100% coverage
 $ mypy
 Success: no issues found in 16 source files
@@ -165,6 +165,9 @@ Line and branch coverage of the package, enforced in CI at 97%. CI type-checks
 and runs the suite on Python 3.9, 3.11, 3.13 and 3.14, then drives the installed
 binary through 44 checks against the real command line. `tools/ci-local.sh` runs
 all of that, on every Python in the matrix, in docker.
+
+FORMAT.md is not prose the tests ignore: seventeen of them parse its offset
+tables and hold every row to what the code writes.
 
 Nine files of frozen known-answer vectors are checked into the repository. They
 record derivations, digests and nonce tables, not just containers, because a

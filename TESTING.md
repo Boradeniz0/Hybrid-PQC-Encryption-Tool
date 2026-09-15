@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 801 tests). This is
+The automated suite covers all of this and more (`pytest`, 818 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -528,7 +528,7 @@ transcript, so it cannot be used to steer a recipient onto a different cipher.
 ## 8. The test suite
 
 ```console
-pytest -q                 # 801 passed
+pytest -q                 # 818 passed
 pytest -q -W error        # clean with warnings escalated to errors
 pytest --cov              # 100% of lines and branches, gated at 97% in CI
 mypy                      # clean on every matrix Python
@@ -689,6 +689,12 @@ Mostly negative tests, because that is where a crypto tool fails.
   empty stderr rather than exiting 1 in silence.
 - **Three tests drive the real binary against a real pty**, because a test
   runner has no terminal to be wrong about.
+- **FORMAT.md is parsed and checked against the code.** Seventeen tests read the
+  offset tables out of the document and hold them to what the library writes:
+  contiguous offsets, sizes that sum to a real container, and every constant a
+  row names. They read the document rather than restating it, because a test
+  holding its own copy of the offsets drifts alongside the document instead of
+  catching it. The first run found a sentence claiming a 37-byte header was 39.
 
 Several of these exist because the thing they check was once broken. See
 [NOTES.md](NOTES.md).

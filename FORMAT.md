@@ -175,7 +175,7 @@ writing over an existing key cannot inherit its permissions.
 
 ## Wrapped private keys
 
-A passphrase-wrapped key is `hpqc-wsk1` plus a 39-byte header and a sealed blob:
+A passphrase-wrapped key is `hpqc-wsk1` plus a 37-byte header and a sealed blob:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
