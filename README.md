@@ -129,6 +129,10 @@ $ echo "meet me at dawn" | hpqc encrypt -r alice.pub | hpqc decrypt -k alice.key
 meet me at dawn
 ```
 
+Decryption writes wherever you point it, a terminal included — the plaintext is
+your own file and you are the one who knows what it is. Encryption to a terminal
+is refused, because a container is binary whatever went into it.
+
 `hpqc info` reads a container's header without needing the private key:
 
 ```console
@@ -933,7 +937,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest --cov
-788 passed
+793 passed
 TOTAL   1407 statements, 278 branches, 100% coverage
 $ mypy
 Success: no issues found in 16 source files
@@ -1240,6 +1244,20 @@ was about. Reading `head.stdout` directly works everywhere. What the episode
 actually produced is `tools/ci-local.sh`: the repository is private, so the CI
 logs are not readable from a terminal, and a matrix you cannot run is a matrix
 you find out about afterwards.
+
+**The test suite could not see a terminal, so a guard sat in the wrong place
+for months.** `hpqc` refused to write binary data to a tty — a good rule, applied
+to the wrong command. It fired on *decryption*, so `hpqc decrypt -k k.key f.hpqc`
+failed on every real terminal, and so did the pipeline this README leads with,
+whose last stage writes to one. 789 tests said everything was fine, because
+`CliRunner` hands the command a StringIO and `isatty()` is False in every test
+ever written here. I found it by watching someone run the manual pass — they hit
+it seven times in one sitting, following my own guide, which had the same blind
+spot for the same reason. The guard now applies to containers, which are binary
+by construction; a decrypted plaintext is the caller's own file, and refusing to
+hand it over in case it is untidy is a guess about a file they already know.
+There are now three tests that run the real binary against a real pty, because
+that is the only way to have a terminal to be wrong about.
 
 **Three pieces of code turned out to be unreachable, and the tests are how.**
 Writing the last of the error-path tests found a `cannot read X` handler that

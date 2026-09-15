@@ -20,6 +20,7 @@ in the package.
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 from pathlib import Path
@@ -46,7 +47,16 @@ def workspace(runner, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(cli_group, ["keygen", "-o", "alice"])
     assert result.exit_code == 0, shown(result)
-    return tmp_path
+    yield tmp_path
+    # Some tests below chmod a file to 0000 to make it unreadable. Put the
+    # mode back: pytest keeps the last few tmp directories and prunes the
+    # older ones on a later run, and a tree it cannot walk is a failure that
+    # surfaces in some unrelated run days later.
+    for child in tmp_path.rglob("*"):
+        try:
+            child.chmod(0o600 if child.is_file() else 0o700)
+        except OSError:  # pragma: no cover - nothing to do about it here
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -77,11 +87,14 @@ def test_an_unreadable_input_is_a_message(workspace, runner) -> None:
     if os.access(secret, os.R_OK):
         pytest.skip("running as a user that ignores file modes")
 
-    result = runner.invoke(
-        cli_group, ["encrypt", "-r", "alice.pub", "locked.bin", "-o", "out.hpqc"]
-    )
-    assert result.exit_code != 0
-    assert "Permission denied" in shown(result)
+    try:
+        result = runner.invoke(
+            cli_group, ["encrypt", "-r", "alice.pub", "locked.bin", "-o", "out.hpqc"]
+        )
+        assert result.exit_code != 0
+        assert "Permission denied" in shown(result)
+    finally:
+        secret.chmod(0o600)
 
 
 def test_a_passphrase_file_that_is_a_directory_is_a_message(
@@ -156,21 +169,43 @@ def test_writing_to_an_unwritable_device_is_a_message(workspace, runner) -> None
     assert "Traceback" not in shown(result)
 
 
-def test_refusing_to_write_binary_to_a_terminal(monkeypatch) -> None:
-    """stdout is a tty, so the ciphertext would be sprayed across it.
+class Terminal:
+    """A stdout that says it is a tty, with a buffer to write into."""
+
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_refusing_to_write_a_container_to_a_terminal(monkeypatch) -> None:
+    """A .hpqc file is binary whatever was encrypted, so this one is refused.
 
     Driven against `_output_stream` rather than through the runner, because the
     runner replaces sys.stdout with something of its own and the check is about
     the real one.
     """
-    class Terminal:
-        def isatty(self) -> bool:
-            return True
-
     monkeypatch.setattr(cli.sys, "stdout", Terminal())
-    with pytest.raises(click.ClickException, match="refusing to write binary"):
-        with cli._output_stream("-"):
+    with pytest.raises(click.ClickException, match="refusing to write a container"):
+        with cli._output_stream("-", container=True):
             pass  # pragma: no cover - the context manager raises on entry
+
+
+def test_plaintext_is_written_to_a_terminal(monkeypatch) -> None:
+    """And decryption is not refused, which it was.
+
+    `hpqc decrypt -k k.key f.hpqc` is the most ordinary command the tool has,
+    and it failed on every real terminal -- as did the pipeline in the README,
+    whose last stage writes to one. What comes out of a decrypt is the caller's
+    own file; refusing to hand it over in case it is untidy is a guess about a
+    file they already know. gpg, age and openssl all just write it.
+    """
+    terminal = Terminal()
+    monkeypatch.setattr(cli.sys, "stdout", terminal)
+    with cli._output_stream("-") as sink:
+        sink.write(b"attack at dawn\n")
+    assert terminal.buffer.getvalue() == b"attack at dawn\n"
 
 
 # --------------------------------------------------------------------------
@@ -336,10 +371,13 @@ def test_an_unreadable_file_is_refused_by_click_before_it_is_opened(
     if os.access(workspace / path, os.R_OK):
         pytest.skip("running as a user that ignores file modes")
 
-    result = runner.invoke(cli_group, args)
-    assert result.exit_code != 0
-    assert "is not readable" in shown(result)
-    assert "Traceback" not in shown(result)
+    try:
+        result = runner.invoke(cli_group, args)
+        assert result.exit_code != 0
+        assert "is not readable" in shown(result)
+        assert "Traceback" not in shown(result)
+    finally:
+        (workspace / path).chmod(0o600)
 
 
 def test_a_directory_as_the_output_is_a_message(workspace, runner) -> None:
@@ -436,3 +474,113 @@ def test_info_recognises_a_key_file_on_stdin(workspace, runner) -> None:
     assert result.exit_code == 0, shown(result)
     assert "type:       hpqc public key" in shown(result)
     assert "X25519 + ML-KEM-768" in shown(result)
+
+
+# --------------------------------------------------------------------------
+# On a real terminal
+# --------------------------------------------------------------------------
+
+
+def on_a_terminal(args, cwd):
+    """Run `python -m hpqc ...` with stdout attached to a real pty.
+
+    The reason this exists: `CliRunner` gives the command a StringIO, which is
+    not a tty, so `sys.stdout.isatty()` was False in every test ever written
+    and the terminal guard never once ran. It was in the wrong place for
+    months -- it refused *decryption*, so the most ordinary command the tool
+    has, and the pipeline printed in the README, both failed on any real
+    terminal while 789 tests said everything was fine.
+
+    The pty is read to EOF and only then is stderr collected, and `wait` is
+    used rather than `communicate`. That is not fussiness: `communicate` on a
+    process whose stdin has already been closed raises `ValueError: flush of
+    closed file` before Python 3.12, which is the second time in this file's
+    history that exact call has broken the two oldest jobs in the matrix. The
+    child here needs no stdin at all, so it gets none.
+    """
+    import os
+    import pty
+    import subprocess
+    import sys
+
+    primary, secondary = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "hpqc", *args],
+            cwd=cwd, stdin=subprocess.DEVNULL,
+            stdout=secondary, stderr=subprocess.PIPE,
+        )
+        os.close(secondary)
+        secondary = -1
+
+        seen = b""
+        while True:
+            try:
+                block = os.read(primary, 4096)
+            except OSError:  # the pty reports EIO once the child is gone
+                break
+            if not block:
+                break
+            seen += block
+
+        # The child has exited, so its stderr is complete and this cannot block.
+        stderr = proc.stderr.read()
+        proc.stderr.close()
+        proc.wait()
+        return proc.returncode, seen, stderr
+    finally:
+        os.close(primary)
+        if secondary != -1:  # pragma: no cover - only on an early failure
+            os.close(secondary)
+
+
+@pytest.fixture
+def a_container(workspace, runner):
+    (workspace / "msg.txt").write_bytes(b"attack at dawn\n")
+    result = runner.invoke(
+        cli_group, ["encrypt", "-r", "alice.pub", "msg.txt", "-o", "msg.hpqc"]
+    )
+    assert result.exit_code == 0, shown(result)
+    return workspace
+
+
+def test_decrypting_to_a_terminal_prints_the_plaintext(a_container) -> None:
+    """`hpqc decrypt -k k.key f.hpqc`, with nowhere else for it to go."""
+    code, out, err = on_a_terminal(
+        ["decrypt", "-k", "alice.key", "msg.hpqc"], a_container
+    )
+    assert code == 0, err
+    assert b"attack at dawn" in out
+
+
+def test_encrypting_to_a_terminal_is_refused(a_container) -> None:
+    """A container is binary whatever was encrypted, so this one is refused."""
+    code, out, err = on_a_terminal(
+        ["encrypt", "-r", "alice.pub", "msg.txt"], a_container
+    )
+    assert code != 0
+    assert b"refusing to write a container to a terminal" in err
+    assert b"HPQC" not in out
+
+
+def test_the_readme_pipeline_ends_on_a_terminal(a_container) -> None:
+    """The example the README leads with, run the way a reader would run it.
+
+    Its last stage writes to the terminal, so the guard in the wrong place
+    broke it -- and no test noticed, because no test had a terminal.
+    """
+    import subprocess
+    import sys
+
+    encrypted = subprocess.run(
+        [sys.executable, "-m", "hpqc", "encrypt", "-r", "alice.pub"],
+        cwd=a_container, input=b"meet me at dawn\n", capture_output=True,
+    )
+    assert encrypted.returncode == 0, encrypted.stderr
+    (a_container / "piped.hpqc").write_bytes(encrypted.stdout)
+
+    code, out, err = on_a_terminal(
+        ["decrypt", "-k", "alice.key", "piped.hpqc"], a_container
+    )
+    assert code == 0, err
+    assert b"meet me at dawn" in out

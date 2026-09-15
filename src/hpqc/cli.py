@@ -262,7 +262,9 @@ def _default_file_mode() -> int:
 
 
 @contextmanager
-def _output_stream(path: str, *, private: bool = False) -> Iterator[IO[bytes]]:
+def _output_stream(
+    path: str, *, private: bool = False, container: bool = False
+) -> Iterator[IO[bytes]]:
     """Open an output for writing, replacing it atomically on success.
 
     Streaming makes atomicity matter in a way it did not before. A one-shot
@@ -275,11 +277,21 @@ def _output_stream(path: str, *, private: bool = False) -> Iterator[IO[bytes]]:
 
     `private` asks for mode 0600: it is set for decrypted plaintext, which is
     the secret, and not for ciphertext, which is meant to be handed around.
+
+    `container` says the bytes about to be written are a .hpqc file, which is
+    binary whatever the plaintext was, and a terminal is never where one should
+    go. It is *not* set for decryption. What comes out of a decrypt is the
+    caller's own file: it may be a PDF, and spraying one at a terminal is
+    untidy, but refusing to hand somebody their own plaintext because it might
+    be untidy is a guess made on their behalf about a file they already know.
+    `gpg -d`, `age -d` and `openssl enc -d` all simply write it, and the
+    alternative here broke the most ordinary command the tool has --
+    `hpqc decrypt -k k.key f.hpqc` -- along with the pipeline in the README.
     """
     if path == STDIO:
-        if sys.stdout.isatty():
+        if container and sys.stdout.isatty():
             raise click.ClickException(
-                "refusing to write binary data to a terminal; "
+                "refusing to write a container to a terminal; "
                 "use -o FILE or pipe the output"
             )
         yield sys.stdout.buffer
@@ -581,7 +593,7 @@ def encrypt(
                 digest = signing.digest_stream(first_pass)
 
         if stream_it:
-            with _output_stream(output_path) as sink:
+            with _output_stream(output_path, container=True) as sink:
                 chunks = container.encrypt_stream_many(
                     streaming.PrefixedStream(head, source),
                     sink,
@@ -604,7 +616,7 @@ def encrypt(
                 sender=sender,
                 hide_recipients=hide_recipients,
             )
-            with _output_stream(output_path) as sink:
+            with _output_stream(output_path, container=True) as sink:
                 sink.write(blob)
 
     if len(to) > 1:
