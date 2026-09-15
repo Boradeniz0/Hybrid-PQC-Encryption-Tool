@@ -1374,3 +1374,48 @@ def test_a_group_file_from_before_commitments_is_refused_clearly(
     assert result.exit_code != 0
     assert "cannot be opened" in str(result.exception)
     assert not (workspace / "out.bin").exists()
+
+
+def test_info_does_not_count_the_signature_block_as_plaintext(
+    workspace, runner
+) -> None:
+    """A signed stream seals `signature block || plaintext` as one stream.
+
+    Subtracting the tags alone leaves the block in the figure, so `info` used
+    to report a signed file as 5365 bytes larger than it is -- a number that
+    looks right until you compare it with `ls`.
+    """
+    from hpqc.signing import SIGNATURE_BLOCK_LEN
+
+    run(runner, "signgen", "-o", "signer")
+    plaintext = b"\xc3" * (ONE_SHOT_LIMIT + 4096)
+    (workspace / "big.bin").write_bytes(plaintext)
+
+    for name, args in (
+        ("plain.hpqc", []),
+        ("signed.hpqc", ["-s", "signer.key"]),
+    ):
+        result = run(
+            runner, "encrypt", "-r", "alice.pub", "big.bin", "-o", name, *args
+        )
+        assert result.exit_code == 0, shown(result)
+        assert "streamed in" in shown(result)
+
+        info = shown(run(runner, "info", name))
+        assert f"plaintext:   {len(plaintext)} bytes" in info, info
+
+    # And the two containers really do differ by the block, so the test is not
+    # passing because the subtraction is a no-op. The block can also push the
+    # stream over a chunk boundary, which costs one more tag, so that is
+    # accounted for rather than assumed away.
+    def shape(name):
+        blob = (workspace / name).read_bytes()
+        _, header_bytes, _ = parse_header(blob)
+        payload = len(blob) - len(header_bytes)
+        return len(blob), streaming.chunk_count(payload)
+
+    signed_size, signed_chunks = shape("signed.hpqc")
+    plain_size, plain_chunks = shape("plain.hpqc")
+    assert signed_size - plain_size == (
+        SIGNATURE_BLOCK_LEN + streaming.TAG_LEN * (signed_chunks - plain_chunks)
+    )

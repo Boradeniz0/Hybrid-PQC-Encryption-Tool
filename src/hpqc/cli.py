@@ -898,7 +898,13 @@ def _describe_container(source: streaming.Source, total: int) -> None:
         )
         # Exact, because every chunk but the last is full: the tags are the
         # only overhead, and there are exactly as many as there are chunks.
-        click.echo(f"plaintext:   {payload - chunks * streaming.TAG_LEN} bytes")
+        # A signed stream carries the signature block in front of the
+        # plaintext, inside the same sealed stream, so that comes off too --
+        # otherwise `info` reports a file 5365 bytes longer than it is.
+        sealed = payload - chunks * streaming.TAG_LEN
+        if header.signed:
+            sealed -= signing.SIGNATURE_BLOCK_LEN
+        click.echo(f"plaintext:   {sealed} bytes")
     else:
         click.echo(
             f"payload:     {payload} bytes (ciphertext + 16-byte tag)"
