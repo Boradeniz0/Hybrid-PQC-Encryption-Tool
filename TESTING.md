@@ -138,8 +138,8 @@ Watch the memory, which is the whole point:
 /usr/bin/time -f 'one-shot:  %M KB' hpqc encrypt -r alice.pub big.bin -o o.hpqc --one-shot
 ```
 
-On a 200 MB file the difference is roughly 35 MB against 620 MB. On 5 MB it is
-35 MB against about 50 MB. The streamed figure does not move with the input,
+On a 200 MB file the difference is 36 MB against 621 MB. On 5 MB it is 36 MB
+against 50 MB. The streamed figure does not move with the input,
 which is what "streaming" is supposed to buy.
 
 ### Cut one chunk off the end
@@ -178,6 +178,7 @@ streamed in 77 chunks of 64 KiB
 signed by key id 62e867ac623c8929
 chunked:     yes, 77 chunk(s) of up to 64 KiB (+16-byte tag each)
 signed:      yes (signer is encrypted; decrypt to see who)
+streamed 77 chunks
 signature ok: signed by key id 62e867ac623c8929
 ```
 
@@ -367,8 +368,8 @@ stat -c '%n %s' plain.hpqc signed.hpqc
 ```
 
 ```
-plain.hpqc 3607
-signed.hpqc 8972
+plain.hpqc 3639
+signed.hpqc 9004
 ```
 
 5365 bytes of it, of which ML-DSA-65's signature alone is 3309.

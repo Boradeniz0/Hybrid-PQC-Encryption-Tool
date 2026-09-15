@@ -46,7 +46,13 @@ To also answer "who sent this":
 
 ```console
 $ hpqc signgen -o bob-sign
+signing private key: bob-sign.key  (mode 0600 only)
+signing public key:  bob-sign.pub   (give this to recipients)
+key id:              1322446e7dc517ec
+
 $ hpqc encrypt -r alice.pub report.pdf -o report.hpqc -s bob-sign.key
+signed by key id 1322446e7dc517ec
+
 $ hpqc decrypt -k alice.key report.hpqc -o report.pdf --sender bob-sign.pub
 signature ok: signed by key id 1322446e7dc517ec
 ```
@@ -109,15 +115,16 @@ Hybrid takes neither bet.
 
 ```
 hpqc keygen  [-o BASENAME] [--force] [--kem mlkem768|mlkem1024]
-                                     [-p | --passphrase-file F]
-hpqc signgen [-o BASENAME] [--force] [-p | --passphrase-file F]
+                                     [-p | --passphrase-file F] [--scrypt-log-n N]
+hpqc signgen [-o BASENAME] [--force] [-p | --passphrase-file F] [--scrypt-log-n N]
 hpqc encrypt -r RECIPIENT.pub [-r ...] [INPUT] [-o OUT]
                                      [--aead chacha20|aes] [-s SIGNING.key]
                                      [--chunked | --one-shot]
                                      [--hide-recipients] [--passphrase-file F]
 hpqc decrypt -k IDENTITY.key [INPUT] [-o OUT] [--sender SIGNER.pub]
                                      [--passphrase-file F]
-hpqc passwd  KEYFILE [--remove] [--passphrase-file F] [--new-passphrase-file F]
+hpqc passwd  KEYFILE [--remove] [--scrypt-log-n N]
+                                     [--passphrase-file F] [--new-passphrase-file F]
 hpqc info    [INPUT]                 describe a container or a key file
 ```
 
