@@ -615,3 +615,79 @@ Two more worth trying the same way, both in `src/hpqc/signing.py`:
   `test_the_signed_message_construction_is_unchanged` names it.
 - Skip the `signer.mldsa().verify(...)` call and the scheme quietly stops being
   hybrid. `test_the_ed25519_signature_alone_is_not_enough` catches it.
+
+## 9. What the suite checks
+
+Mostly negative tests, because that is where a crypto tool fails.
+
+- **Both shared secrets reach the key.** Flip a bit in either half of the keying
+  material and the derived key must change. This catches a "hybrid" that
+  computes the post-quantum secret, stores it in the header, and leaves it out
+  of the derivation.
+- **A valid foreign KEM ciphertext cannot be spliced in.** Substituting another
+  legitimate encapsulation to the same recipient decapsulates cleanly, so
+  nothing upstream complains. Only the transcript binding makes it fail.
+- **Downgrading the suite byte fails**, covered by both the associated data and
+  the HKDF transcript.
+- **One flipped bit anywhere is caught**, at every header field and in the
+  payload.
+- **Low-order X25519 and X448 points are refused cleanly.** OpenSSL rejects the
+  points that force an all-zero shared secret with a bare `ValueError`. A
+  crafted header must produce an ordinary error message, not a traceback. Both
+  the header field and a hostile `.pub` file are covered.
+- **Mutation fuzzing.** Randomly corrupted and truncated containers must always
+  fail as an `HpqcError` and never decrypt. This catches a future header field
+  parsed without a bounds check, which passes every hand-written test while
+  turning a malformed file into a crash.
+- **Every value of the suite byte and the flags field**, all 256 and all 65536,
+  against containers of both parameter sets and both payload shapes. The suite
+  byte decides how every field after it is read and arrives unauthenticated, so
+  a relabelled file has to fail on arithmetic before a key operation runs. The
+  test asserts decapsulation is never reached, and asserts it *is* reached on
+  the untouched file so it cannot pass by never getting there.
+- **Nothing is written on failure.** A rejected file leaves no partial plaintext
+  behind, including a stream that fails on its last chunk after writing
+  everything before it.
+- **Cut, paste and reorder a chunked file.** Truncating, extending, swapping two
+  chunks, repeating one, and splicing in a chunk from a different file encrypted
+  to the same recipient. Five attacks that need no key and no cryptanalysis,
+  only a text editor.
+- **Short reads are handled.** A pipe may return fewer bytes than asked for
+  without being at EOF. The tests feed the reader seven bytes at a time, because
+  a `BytesIO` would hide the bug and the symptom is a chunk split down the
+  middle, which looks exactly like corruption.
+- **Surreptitious forwarding is blocked**, in all three signing constructions.
+  Paired with a test that the original recipient *can* verify the same bytes, so
+  it cannot pass because something is merely broken.
+- **A recipient cannot forge a signed stream.** They hold the file key, so the
+  forgeries are built from the inside: re-seal a changed message, a shorter one,
+  or a longer one, each properly re-chunked so the final-chunk marker has
+  nothing to say. Only the digest catches them.
+- **A sender cannot hand two recipients two different file keys.** The container
+  is assembled from the pieces, because the library refuses to build one. What
+  the tests do not build is the ciphertext that opens under both keys. That is
+  real work in GF(2^130 - 5) and is not the property being checked. What is
+  checked is the step that makes building it pointless.
+- **A recipient list names nobody, and the same search finds the name in the
+  shape that does publish it.** Asserting that eight bytes are absent from a
+  container passes just as readily when the search itself is broken.
+- **Twenty-one frozen containers that must now be refused**, kept byte for byte
+  from before the file key commitment was required, with a test that the list of
+  them has not silently become empty.
+- **Frozen known-answer vectors**, nine files of them. They record derivations,
+  digests and nonce tables, not just containers.
+- **The messages a user actually sees.** A path that is a directory, a key file
+  that is binary, a passphrase file saved on Windows, an output that cannot be
+  opened, and `run()` itself, which every other test bypasses because they drive
+  click in-process.
+- **A machine with no post-quantum support.** The classes are set to None, as an
+  import failure would leave them, and the message has to name the algorithm,
+  state the requirement, and carry the underlying error.
+- **A reader that stops early is not an error.** `hpqc decrypt big.hpqc | head`
+  runs as a real subprocess against a real pipe and must die of SIGPIPE with an
+  empty stderr rather than exiting 1 in silence.
+- **Three tests drive the real binary against a real pty**, because a test
+  runner has no terminal to be wrong about.
+
+Several of these exist because the thing they check was once broken. See
+[NOTES.md](NOTES.md).
