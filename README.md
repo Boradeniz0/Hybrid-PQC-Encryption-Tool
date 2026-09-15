@@ -77,7 +77,8 @@ private key: alice.key  (passphrase-protected -- keep it secret)
 - **Hybrid sender authentication.** Ed25519 with ML-DSA-65, both required,
   signed before encryption so who signed a file is itself confidential.
 - **Large files.** Past a megabyte the payload is sealed in 64 KiB chunks. A
-  200 MB file costs 35 MB of memory instead of 620 MB, signed or not.
+  200 MB file costs 36 MB of memory instead of 621 MB, and stays there when it
+  is signed, where holding it whole would cost 817 MB.
 - **Several recipients per file.** One file key, wrapped once per recipient,
   and the header names none of them. It also commits to that key, so a sender
   cannot hand two recipients two different messages.
@@ -147,8 +148,8 @@ signed:      no
 
 ```console
 $ pytest --cov
-799 passed
-TOTAL   1410 statements, 280 branches, 100% coverage
+801 passed
+TOTAL   1419 statements, 282 branches, 100% coverage
 $ mypy
 Success: no issues found in 16 source files
 ```

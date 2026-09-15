@@ -186,6 +186,25 @@ prevent. Then the first version of its workflow parser handled only `run: |` and
 not `run: mypy`, so two steps ran as empty scripts and reported success. It now
 refuses to run if a step comes out empty.
 
+## A full disk was eight frames of Python
+
+`hpqc keygen -o k` on a filesystem with no room left printed a traceback ending
+in `OSError: [Errno 122] Disk quota exceeded`. The tool has a careful error path
+for every way a *file* can be wrong, and none at all for the machine underneath
+it being full, read-only, or gone.
+
+That is the same mistake in both directions. `HpqcError` covers what the input
+says; `OSError` covers what the disk says; only the first had a handler, so the
+second reached the user as a stack trace with the one useful line buried at the
+bottom. It surfaced when the user's disk filled up, which is to say by accident,
+on a machine that happened to be out of space that afternoon.
+
+`run()` now catches `OSError` too and prints `error: <strerror> while writing
+<path>`, which is the same information the last line of the traceback had. The
+two tests make the write fail from inside, because a test cannot fill a disk;
+what confirms the real thing is `bash -c 'ulimit -f 0; hpqc keygen -o k'`, which
+produces a genuine `OSError` from the kernel and now prints one line.
+
 ## A stat() one line too early
 
 While tidying `hpqc info` to read headers from a stream, I moved the `stat()`

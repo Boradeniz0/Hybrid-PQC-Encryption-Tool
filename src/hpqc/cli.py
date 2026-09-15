@@ -977,6 +977,17 @@ def run() -> int:
         return 130
     except BrokenPipeError:  # pragma: no cover - only where SIGPIPE is absent
         return 0
+    except OSError as exc:
+        # A full disk, a read-only mount, a vanished directory, an I/O error on
+        # the device. None of these is a bug in the file being read, so none of
+        # them is an HpqcError, and every one of them used to reach the user as
+        # a traceback. `hpqc keygen` on a full disk printed eight frames of
+        # Python ending in "OSError: [Errno 122] Disk quota exceeded" -- which
+        # says the same thing as the line below and buries it.
+        detail = exc.strerror or str(exc)
+        where = f" while writing {exc.filename}" if exc.filename else ""
+        click.echo(f"error: {detail}{where}", err=True)
+        return 1
     return result if isinstance(result, int) else 0
 
 

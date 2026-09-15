@@ -584,3 +584,65 @@ def test_the_readme_pipeline_ends_on_a_terminal(a_container) -> None:
     )
     assert code == 0, err
     assert b"meet me at dawn" in out
+
+
+def test_a_full_disk_is_a_message_not_a_traceback(
+    workspace, monkeypatch, capsys
+) -> None:
+    """The one class of failure that used to escape run() entirely.
+
+    A full disk, a read-only mount, a vanished directory, an I/O error on the
+    device: none of these is a bug in the file being read, so none of them is
+    an HpqcError, and run() caught only HpqcError, ClickException, Abort and
+    BrokenPipeError. `hpqc keygen` on a full disk printed eight frames of
+    Python ending in "OSError: [Errno 122] Disk quota exceeded".
+
+    Reproduced here by making the write fail. In a real shell,
+    `bash -c 'ulimit -f 0; hpqc keygen -o k'` does the same thing.
+    """
+    from hpqc import keys as keys_module
+
+    def no_space(fd, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(keys_module.os, "write", no_space)
+    monkeypatch.setattr(sys, "argv", ["hpqc", "keygen", "-o", "doomed"])
+
+    assert run() == 1
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "error: No space left on device"
+    assert "Traceback" not in captured.err
+    assert not (workspace / "doomed.key").exists()
+    assert list(workspace.glob(".doomed.key.*")) == []
+
+
+def test_the_message_names_the_file_when_the_error_carries_one(
+    workspace, monkeypatch, capsys
+) -> None:
+    """OSError sometimes knows the path and sometimes does not.
+
+    A failed write does not: it surfaces from a buffered flush with no
+    filename. The rename at the end of an atomic write does. Both have to come
+    out as one readable line, without a dangling "while writing None".
+
+    Opening the temporary file is *not* one of these: `_output_stream` catches
+    that itself and says "cannot write out.hpqc", naming the path the caller
+    typed rather than the internal one, which is the better message.
+    """
+    from hpqc import cli as cli_module
+
+    def refuse(_src, dst):
+        raise OSError(18, "Invalid cross-device link", str(dst))
+
+    monkeypatch.setattr(cli_module.os, "replace", refuse)
+    (workspace / "in.txt").write_bytes(b"x")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["hpqc", "encrypt", "-r", "alice.pub", "in.txt", "-o", "out.hpqc"],
+    )
+
+    assert run() == 1
+    assert capsys.readouterr().err.strip() == (
+        "error: Invalid cross-device link while writing out.hpqc"
+    )
+    assert not (workspace / "out.hpqc").exists()

@@ -162,8 +162,8 @@ either way.
 
 | 200 MB file | encrypt peak RSS | decrypt peak RSS |
 | --- | ---: | ---: |
-| streamed | **35 MB** | **34 MB** |
-| `--one-shot` | 620 MB | 620 MB |
+| streamed | **36 MB** | **35 MB** |
+| `--one-shot` | 621 MB | 620 MB |
 
 The streamed figure does not change with the file size.
 
@@ -213,8 +213,12 @@ the input. That means the input has to be one that can be read twice.
 
 | 200 MB, signed | encrypt peak RSS | decrypt and verify peak RSS |
 | --- | ---: | ---: |
-| streamed | **35 MB** | **35 MB** |
-| `--one-shot` | 816 MB | 620 MB |
+| streamed | **37 MB** | **35 MB** |
+| `--one-shot` | 817 MB | 1011 MB |
+
+Signing costs the one-shot path another 200 MB on the way in and 390 MB on the
+way out, because the signature is computed over a copy of the plaintext that has
+to exist alongside it. The streamed path does not notice.
 
 The signature block goes in front of the plaintext, not in a trailer. A trailer
 buys back the single pass and costs the reader everything it could have known
