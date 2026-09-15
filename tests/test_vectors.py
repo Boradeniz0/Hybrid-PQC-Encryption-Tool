@@ -47,6 +47,7 @@ from hpqc import container as container_module
 from hpqc import hybrid, kems, recipients, signing, streaming, suites, wrapping
 from hpqc.container import (
     FLAG_CHUNKED,
+    FLAG_COMMITTED,
     FLAG_RECIPIENTS,
     FLAG_SIGNED,
     FORMAT_VERSION,
@@ -56,6 +57,7 @@ from hpqc.container import (
     parse_header,
 )
 from hpqc.errors import (
+    FormatError,
     HpqcError,
     PassphraseError,
     SignatureError,
@@ -76,12 +78,33 @@ CHUNKED = _load("v1-chunked.json")
 RECIPIENTS = _load("v1-recipients.json")
 SIGNED_RECIPIENTS = _load("v1-signed-recipients.json")
 MLKEM1024 = _load("v1-mlkem1024.json")
+COMMITTED = _load("v1-committed.json")
 SIGNED_STREAM = _load("v1-signed-stream.json")
 
 
 @pytest.fixture(scope="module")
 def identity() -> PrivateKey:
     return PrivateKey.decode(VECTORS["identity"])
+
+
+def is_listed(container_hex: str) -> bool:
+    """Whether a recorded container uses the recipient list, from its flags.
+
+    Read straight out of the bytes rather than by parsing, because parsing is
+    exactly what these containers no longer survive.
+    """
+    flags = int.from_bytes(bytes.fromhex(container_hex)[6:8], "big")
+    return bool(flags & FLAG_RECIPIENTS)
+
+
+def named(entries):
+    """The recorded containers with a single named recipient."""
+    return [e for e in entries if not is_listed(e["container"])]
+
+
+def listed(entries):
+    """The recorded containers whose recipients are a list."""
+    return [e for e in entries if is_listed(e["container"])]
 
 
 def _ids(entries):
@@ -535,7 +558,13 @@ def test_the_file_key_wrap_label_has_not_changed() -> None:
 
 
 def test_the_stanza_layout_constants_have_not_changed() -> None:
-    """Nothing in a container states these; the reader counts on them."""
+    """Nothing in a container states these; the reader counts on them.
+
+    The offsets this file recorded moved when the commitment was added, and
+    that is the point of it being a separate 32-byte field rather than a
+    reinterpretation of one already there. They are checked against a real
+    header in the committed vectors instead.
+    """
     layout = RECIPIENTS["layout"]
     assert layout["max_recipients"] == recipients.MAX_RECIPIENTS
     assert layout["wrap_tag_len"] == recipients.WRAP_TAG_LEN
@@ -543,15 +572,9 @@ def test_the_stanza_layout_constants_have_not_changed() -> None:
     for name, expected in layout["stanza_len"].items():
         assert recipients.stanza_len(suites.BY_CLI_NAME[name]) == expected
 
-    # The two offsets, checked against a real header rather than restated.
-    blob = bytes.fromhex(RECIPIENTS["containers"][0]["container"])
-    header, header_bytes, _ = parse_header(blob)
-    assert header.multi
-    count_offset = layout["count_offset"]
-    assert int.from_bytes(
-        blob[count_offset : count_offset + 2], "big"
-    ) == header.recipient_count
-    assert layout["first_stanza_offset"] == count_offset + 2
+    assert layout["count_offset"] + recipients.COMMITMENT_LEN == COMMITTED[
+        "count_offset"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -591,130 +614,6 @@ def test_the_wrapping_derivation_is_unchanged(vector) -> None:
     assert suite.aead(wrapping_key).decrypt(
         nonce, bytes.fromhex(vector["wrapped_key"]), None
     ) == bytes.fromhex(vector["file_key"])
-
-
-@pytest.mark.parametrize(
-    "vector",
-    RECIPIENTS["containers"],
-    ids=[f"{v['suite']}-{v['recipients']}to" for v in RECIPIENTS["containers"]],
-)
-class TestRecordedRecipientLists:
-    def test_every_recorded_recipient_still_opens_it(
-        self, vector, listed_identities
-    ) -> None:
-        blob = bytes.fromhex(vector["container"])
-        for identity in listed_identities[: vector["recipients"]]:
-            assert decrypt(blob, identity) == bytes.fromhex(vector["plaintext"])
-
-    def test_a_stranger_still_cannot(self, vector, listed_stranger) -> None:
-        blob = bytes.fromhex(vector["container"])
-        with pytest.raises(WrongRecipientError):
-            decrypt(blob, listed_stranger)
-
-    def test_its_header_still_parses_as_recorded(self, vector) -> None:
-        header, header_bytes, _ = parse_header(bytes.fromhex(vector["container"]))
-        suite = suites.BY_CLI_NAME[vector["suite"]]
-
-        assert header.version == FORMAT_VERSION
-        assert header.multi and not header.signed and not header.chunked
-        assert header.suite.id == vector["suite_id"]
-        assert header.key_id == container_module.NO_KEY_ID
-        assert header.recipient_count == vector["recipients"]
-        assert len(header_bytes) == 46 + vector["recipients"] * recipients.stanza_len(
-            suite
-        )
-
-    def test_it_still_names_nobody(self, vector) -> None:
-        blob = bytes.fromhex(vector["container"])
-        for key_id in RECIPIENTS["key_ids"]:
-            assert bytes.fromhex(key_id) not in blob
-
-PARTIAL_LISTS = [v for v in RECIPIENTS["containers"] if v["recipients"] < 3]
-SHAREABLE_LISTS = [v for v in RECIPIENTS["containers"] if v["recipients"] > 1]
-
-
-@pytest.mark.parametrize(
-    "vector", PARTIAL_LISTS,
-    ids=[f"{v['suite']}-{v['recipients']}to" for v in PARTIAL_LISTS],
-)
-def test_an_identity_left_off_a_recorded_list_still_cannot_open_it(
-    vector, listed_identities
-) -> None:
-    """The recipients are a prefix of three, so the rest must be refused.
-
-    A bug that opened any stanza with any key would sail past the stranger
-    test -- that key was never in the file at all -- and fail here.
-    """
-    blob = bytes.fromhex(vector["container"])
-    for identity in listed_identities[vector["recipients"] :]:
-        with pytest.raises(WrongRecipientError):
-            decrypt(blob, identity)
-
-
-@pytest.mark.parametrize(
-    "vector", SHAREABLE_LISTS,
-    ids=[f"{v['suite']}-{v['recipients']}to" for v in SHAREABLE_LISTS],
-)
-def test_dropping_a_stanza_from_a_recorded_list_is_still_refused(
-    vector, listed_identities
-) -> None:
-    """Cut on a stanza boundary and fix the count: nothing is corrupted.
-
-    Every remaining stanza is a genuine one and the header parses. Only the
-    payload's associated data covering the whole list catches it.
-    """
-    suite = suites.BY_CLI_NAME[vector["suite"]]
-    blob = bytes.fromhex(vector["container"])
-    _, header_bytes, payload = parse_header(blob)
-
-    shortened = bytearray(
-        header_bytes[: len(header_bytes) - recipients.stanza_len(suite)]
-    )
-    shortened[44:46] = (vector["recipients"] - 1).to_bytes(2, "big")
-    forged = bytes(shortened) + payload
-
-    assert parse_header(forged)[0].recipient_count == vector["recipients"] - 1
-    with pytest.raises(HpqcError):
-        decrypt(forged, listed_identities[0])
-
-
-def test_the_recorded_chunked_recipient_list_still_opens(listed_identities) -> None:
-    """Both flags at once, on a file written before this test existed."""
-    vector = RECIPIENTS["chunked_container"]
-    blob = bytes.fromhex(vector["container"])
-
-    header, _, _ = parse_header(blob)
-    assert header.flags == vector["flags"]
-    assert header.multi and header.chunked
-
-    for identity in listed_identities[: vector["recipients"]]:
-        sink = io.BytesIO()
-        opened = decrypt_stream(io.BytesIO(blob), sink, identity)
-        assert opened.chunks == vector["chunks"]
-        assert len(sink.getvalue()) == vector["plaintext_len"]
-        assert (
-            hashlib.sha256(sink.getvalue()).hexdigest()
-            == vector["plaintext_sha256"]
-        )
-
-
-def test_the_recorded_chunked_recipient_list_still_refuses_truncation(
-    listed_identities,
-) -> None:
-    vector = RECIPIENTS["chunked_container"]
-    blob = bytes.fromhex(vector["container"])
-
-    with pytest.raises(HpqcError):
-        decrypt_stream(
-            io.BytesIO(blob[: -streaming.WIRE_CHUNK_SIZE]),
-            io.BytesIO(),
-            listed_identities[0],
-        )
-
-
-# --------------------------------------------------------------------------
-# Signed recipient lists
-# --------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -768,84 +667,6 @@ def test_the_container_signed_message_construction_is_unchanged(
     )
     assert len(message) == vector["message_len"]
     assert hashlib.sha256(message).hexdigest() == vector["message_sha256"]
-
-
-@pytest.mark.parametrize(
-    "vector",
-    SIGNED_RECIPIENTS["containers"],
-    ids=[f"{v['suite']}-{v['recipients']}to" for v in SIGNED_RECIPIENTS["containers"]],
-)
-class TestRecordedSignedRecipientLists:
-    def test_every_recipient_still_verifies_it(
-        self, vector, signed_list_identities, signed_list_signer
-    ) -> None:
-        blob = bytes.fromhex(vector["container"])
-        for identity in signed_list_identities[: vector["recipients"]]:
-            opened = open_container(blob, identity, signed_list_signer)
-            assert opened.plaintext == bytes.fromhex(vector["plaintext"])
-            assert opened.verified
-            assert opened.signer == signed_list_signer
-
-    def test_its_header_still_says_signed_and_listed(self, vector) -> None:
-        header, _, _ = parse_header(bytes.fromhex(vector["container"]))
-        assert header.signed and header.multi and not header.chunked
-        assert header.suite.id == vector["suite_id"]
-        assert header.recipient_count == vector["recipients"]
-
-    def test_it_still_hides_who_signed(self, vector, signed_list_signer) -> None:
-        blob = bytes.fromhex(vector["container"])
-        assert signed_list_signer.ed25519_bytes not in blob
-        assert signed_list_signer.mldsa_bytes not in blob
-
-    def test_a_stranger_still_cannot_open_it(self, vector) -> None:
-        stranger = PrivateKey.decode(SIGNED_RECIPIENTS["stranger"])
-        with pytest.raises(HpqcError):
-            decrypt(bytes.fromhex(vector["container"]), stranger)
-
-
-def test_a_recorded_forwarded_signature_still_does_not_verify(
-    signed_list_identities, signed_list_signer
-) -> None:
-    """Surreptitious forwarding, frozen exactly as a recipient would build it.
-
-    The signature was made over one container's header and the payload sealed
-    into another. The AEAD is perfectly happy -- whoever built it held the file
-    key -- so only the header binding stands between this and a file that
-    verifies as "the signer wrote this to me".
-    """
-    vector = SIGNED_RECIPIENTS["forwarded"]
-    blob = bytes.fromhex(vector["container"])
-    identity = signed_list_identities[vector["opens_for"]]
-
-    with pytest.raises(SignatureError):
-        open_container(blob, identity, signed_list_signer)
-    # And with no pinned sender either: the signature is checked regardless.
-    with pytest.raises(SignatureError):
-        open_container(blob, identity)
-
-
-def test_the_forwarded_vector_is_a_real_container(signed_list_identities) -> None:
-    """Otherwise the test above could pass because the file is simply broken.
-
-    The header parses, the AEAD verifies, and the payload comes out. Only the
-    signature is wrong, which is the whole point.
-    """
-    vector = SIGNED_RECIPIENTS["forwarded"]
-    blob = bytes.fromhex(vector["container"])
-    identity = signed_list_identities[vector["opens_for"]]
-
-    header, header_bytes, ciphertext = parse_header(blob)
-    assert header.signed and header.multi
-    _, key = container_module._open_setup(header, identity)
-    payload = header.suite.aead(key).decrypt(header.nonce, ciphertext, header_bytes)
-    assert payload.endswith(
-        bytes.fromhex(SIGNED_RECIPIENTS["containers"][0]["plaintext"])
-    )
-
-
-# --------------------------------------------------------------------------
-# The second hybrid KEM
-# --------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -930,8 +751,11 @@ def test_the_1024_derivations_are_unchanged(vector) -> None:
 
 @pytest.mark.parametrize(
     "vector",
-    MLKEM1024["containers"],
-    ids=[f"{v['suite']}-{v['shape'].replace(' ', '-')}" for v in MLKEM1024["containers"]],
+    named(MLKEM1024["containers"]),
+    ids=[
+        f"{v['suite']}-{v['shape'].replace(' ', '-')}"
+        for v in named(MLKEM1024["containers"])
+    ],
 )
 class TestRecorded1024Containers:
     def test_it_still_decrypts(self, vector, big_identities) -> None:
@@ -964,48 +788,6 @@ class TestRecorded1024Containers:
         blob[5] = vector["suite_id"] - 2  # 0x03 -> 0x01, 0x04 -> 0x02
         with pytest.raises(HpqcError, match="expected 32 here"):
             parse_header(bytes(blob))
-
-
-SIGNED_1024 = [v for v in MLKEM1024["containers"] if v.get("signed")]
-
-
-@pytest.mark.parametrize(
-    "vector", SIGNED_1024, ids=[v["suite"] for v in SIGNED_1024]
-)
-def test_a_recorded_1024_signature_still_verifies(vector, big_identities) -> None:
-    signer = SigningPublicKey.decode(MLKEM1024["signer_public"])
-    for identity in big_identities[: vector["recipients"]]:
-        opened = open_container(bytes.fromhex(vector["container"]), identity, signer)
-        assert opened.verified and opened.signer == signer
-
-
-def test_the_recorded_1024_chunked_container_still_opens(big_identities) -> None:
-    vector = MLKEM1024["chunked_container"]
-    blob = bytes.fromhex(vector["container"])
-
-    header, _, _ = parse_header(blob)
-    assert header.chunked and header.multi
-    assert header.suite.kem is kems.X448_MLKEM1024
-
-    for identity in big_identities[: vector["recipients"]]:
-        sink = io.BytesIO()
-        opened = decrypt_stream(io.BytesIO(blob), sink, identity)
-        assert opened.chunks == vector["chunks"]
-        assert hashlib.sha256(sink.getvalue()).hexdigest() == vector[
-            "plaintext_sha256"
-        ]
-
-    with pytest.raises(HpqcError):
-        decrypt_stream(
-            io.BytesIO(blob[: -streaming.WIRE_CHUNK_SIZE]),
-            io.BytesIO(),
-            big_identities[0],
-        )
-
-
-# --------------------------------------------------------------------------
-# Signed streams
-# --------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -1084,10 +866,10 @@ def test_the_stream_signed_message_construction_is_unchanged(
 
 @pytest.mark.parametrize(
     "vector",
-    SIGNED_STREAM["containers"],
+    named(SIGNED_STREAM["containers"]),
     ids=[
         f"{v['suite']}-{v['shape'].replace(' ', '-')}"
-        for v in SIGNED_STREAM["containers"]
+        for v in named(SIGNED_STREAM["containers"])
     ],
 )
 class TestRecordedSignedStreams:
@@ -1176,3 +958,244 @@ def test_the_forwarded_stream_vector_is_a_real_container(stream_identities) -> N
     assert len(plain.getvalue()) == (
         signing.SIGNATURE_BLOCK_LEN + len(bytes.fromhex(vector["plaintext"]))
     )
+
+
+# --------------------------------------------------------------------------
+# Recipient lists that commit to their file key
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def committed_identities():
+    return [PrivateKey.decode(t) for t in COMMITTED["identities"]]
+
+
+@pytest.fixture(scope="module")
+def committed_big_identities():
+    return [PrivateKey.decode(t) for t in COMMITTED["big_identities"]]
+
+
+@pytest.fixture(scope="module")
+def committed_signer() -> SigningPublicKey:
+    return SigningPublicKey.decode(COMMITTED["signer_public"])
+
+
+def test_the_committed_vectors_target_this_format() -> None:
+    assert COMMITTED["format_version"] == FORMAT_VERSION
+    assert COMMITTED["flag_committed"] == FLAG_COMMITTED
+    assert COMMITTED["flag_recipients"] == FLAG_RECIPIENTS
+    assert COMMITTED["commitment_len"] == recipients.COMMITMENT_LEN
+
+
+def test_the_commitment_label_has_not_changed() -> None:
+    assert recipients.COMMIT_LABEL.decode("ascii") == COMMITTED["commit_label"]
+
+
+@pytest.mark.parametrize(
+    "vector", COMMITTED["commitments"], ids=[v["suite"] for v in COMMITTED["commitments"]]
+)
+def test_the_commitment_derivation_is_unchanged(vector) -> None:
+    """The vector that pins the scheme rather than one run of it.
+
+    Change the label, drop the salt, swap the hash -- a recorded container
+    survives every one of those, because the writer computes the commitment and
+    the reader checks it and the two move together. Only the known answer
+    notices, and what it protects is the property that a sender cannot hand two
+    recipients two different file keys.
+    """
+    suite = suites.BY_CLI_NAME[vector["suite"]]
+    assert recipients.commitment(
+        bytes.fromhex(vector["file_key"]),
+        bytes.fromhex(vector["salt"]),
+        suite,
+    ).hex() == vector["commitment"]
+
+
+@pytest.mark.parametrize(
+    "vector",
+    COMMITTED["containers"],
+    ids=[
+        f"{v['suite']}-{v['shape'].replace(' ', '-')}-{v['recipients']}to"
+        for v in COMMITTED["containers"]
+    ],
+)
+class TestRecordedCommittedLists:
+    @staticmethod
+    def _identities(vector, small, big):
+        return (big if vector.get("big") else small)[: vector["recipients"]]
+
+    def test_every_recipient_still_opens_it(
+        self, vector, committed_identities, committed_big_identities, committed_signer
+    ) -> None:
+        blob = bytes.fromhex(vector["container"])
+        sender = committed_signer if vector.get("signed") else None
+
+        for identity in self._identities(
+            vector, committed_identities, committed_big_identities
+        ):
+            if vector.get("chunked"):
+                sink = io.BytesIO()
+                opened = decrypt_stream(io.BytesIO(blob), sink, identity, sender)
+                assert opened.chunks == vector["chunks"]
+                assert (
+                    hashlib.sha256(sink.getvalue()).hexdigest()
+                    == vector["plaintext_sha256"]
+                )
+            else:
+                opened = open_container(blob, identity, sender)
+                assert opened.plaintext == bytes.fromhex(vector["plaintext"])
+            assert opened.verified == bool(sender)
+
+    def test_its_header_still_parses_as_recorded(self, vector) -> None:
+        blob = bytes.fromhex(vector["container"])
+        header, header_bytes, _ = parse_header(blob)
+
+        assert header.multi and header.committed
+        assert header.suite.id == vector["suite_id"]
+        assert header.recipient_count == vector["recipients"]
+        assert header.signed == bool(vector.get("signed"))
+        assert header.chunked == bool(vector.get("chunked"))
+        assert len(header.commitment) == recipients.COMMITMENT_LEN
+
+        offset = COMMITTED["commitment_offset"]
+        assert blob[offset : offset + recipients.COMMITMENT_LEN] == header.commitment
+        count_offset = COMMITTED["count_offset"]
+        assert int.from_bytes(
+            blob[count_offset : count_offset + 2], "big"
+        ) == header.recipient_count
+
+    def test_it_still_names_nobody(self, vector) -> None:
+        blob = bytes.fromhex(vector["container"])
+        publics = COMMITTED["big_publics"] if vector.get("big") else COMMITTED["publics"]
+        for text in publics:
+            assert PublicKey.decode(text).key_id not in blob
+
+    def test_a_stranger_still_cannot_open_it(self, vector) -> None:
+        stranger = PrivateKey.decode(COMMITTED["stranger"])
+        with pytest.raises(HpqcError):
+            if vector.get("chunked"):
+                decrypt_stream(
+                    io.BytesIO(bytes.fromhex(vector["container"])),
+                    io.BytesIO(),
+                    stranger,
+                )
+            else:
+                decrypt(bytes.fromhex(vector["container"]), stranger)
+
+    def test_editing_the_recorded_commitment_is_refused(
+        self, vector, committed_identities, committed_big_identities
+    ) -> None:
+        """It is inside the associated data, so it cannot be quietly replaced."""
+        blob = bytearray(bytes.fromhex(vector["container"]))
+        blob[COMMITTED["commitment_offset"]] ^= 0x01
+        identity = self._identities(
+            vector, committed_identities, committed_big_identities
+        )[0]
+
+        with pytest.raises(HpqcError):
+            if vector.get("chunked"):
+                decrypt_stream(io.BytesIO(bytes(blob)), io.BytesIO(), identity)
+            else:
+                decrypt(bytes(blob), identity)
+
+
+def test_a_recorded_uncommitted_list_is_refused(committed_identities) -> None:
+    """The shape a sender who wants to cheat would write, frozen.
+
+    Everything about it is well-formed: real stanzas, a real payload, a tag
+    that verifies. What it does not have is anything tying the two stanzas to
+    one file key -- so it is refused on the flags, before any of that is
+    reached. The library cannot produce this container at all; it was built
+    by hand for the vector.
+    """
+    vector = COMMITTED["uncommitted"]
+    blob = bytes.fromhex(vector["container"])
+
+    assert int.from_bytes(blob[6:8], "big") == FLAG_RECIPIENTS
+    with pytest.raises(FormatError, match="commitment and a recipient list go together"):
+        parse_header(blob)
+    for identity in committed_identities[: vector["recipients"]]:
+        with pytest.raises(FormatError):
+            decrypt(blob, identity)
+
+
+def test_a_recorded_forwarded_committed_list_still_does_not_verify(
+    committed_identities, committed_signer
+) -> None:
+    vector = COMMITTED["forwarded"]
+    blob = bytes.fromhex(vector["container"])
+    identity = committed_identities[vector["opens_for"]]
+
+    with pytest.raises(SignatureError):
+        open_container(blob, identity, committed_signer)
+    with pytest.raises(SignatureError):
+        open_container(blob, identity)
+
+
+def test_the_forwarded_committed_vector_is_a_real_container(
+    committed_identities,
+) -> None:
+    """So the test above cannot pass because the file is merely broken."""
+    vector = COMMITTED["forwarded"]
+    blob = bytes.fromhex(vector["container"])
+    identity = committed_identities[vector["opens_for"]]
+
+    header, header_bytes, ciphertext = parse_header(blob)
+    assert header.multi and header.committed and header.signed
+    _, key = container_module._open_setup(header, identity)
+    payload = header.suite.aead(key).decrypt(header.nonce, ciphertext, header_bytes)
+    assert payload.endswith(bytes.fromhex(vector["plaintext"]))
+
+
+# --------------------------------------------------------------------------
+# Recipient lists written before the commitment was required
+# --------------------------------------------------------------------------
+
+#: Every recorded container from before flag bit 3 existed. They keep their
+#: bytes; what they prove is now the refusal.
+BEFORE_COMMITMENTS = [
+    (name, entry)
+    for name, data in (
+        ("v1-recipients", RECIPIENTS),
+        ("v1-signed-recipients", SIGNED_RECIPIENTS),
+        ("v1-mlkem1024", MLKEM1024),
+        ("v1-signed-stream", SIGNED_STREAM),
+    )
+    for entry in (
+        listed(data["containers"])
+        + [data[k] for k in ("chunked_container", "forwarded") if k in data]
+    )
+    if is_listed(entry["container"])
+]
+
+
+def test_the_old_vectors_really_do_contain_recipient_lists() -> None:
+    """Guard against the list above silently becoming empty.
+
+    A refusal test over nothing passes forever, and the classification is done
+    by reading a flags field out of hex -- exactly the kind of thing that turns
+    into `[]` after an unrelated edit.
+    """
+    assert len(BEFORE_COMMITMENTS) == 21
+    assert len({name for name, _ in BEFORE_COMMITMENTS}) == 4
+
+
+@pytest.mark.parametrize(
+    "name,entry",
+    BEFORE_COMMITMENTS,
+    ids=[f"{name}-{i}" for i, (name, _) in enumerate(BEFORE_COMMITMENTS)],
+)
+def test_a_recipient_list_without_a_commitment_is_refused(name, entry) -> None:
+    """These opened when they were recorded, and must not open now.
+
+    Three commits' worth of frozen containers stopped being readable when the
+    file key commitment became mandatory, and that is the correct outcome:
+    nothing in them stops the sender who wrote them handing two recipients two
+    different messages. They are kept exactly as they are rather than
+    regenerated, because a frozen vector that gets edited when the format
+    changes is not freezing anything. What they pin now is that the refusal
+    happens, and that it says why.
+    """
+    blob = bytes.fromhex(entry["container"])
+    with pytest.raises(FormatError, match="cannot be opened"):
+        parse_header(blob)

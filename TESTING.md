@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 742 tests). This is
+The automated suite covers all of this and more (`pytest`, 745 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -235,7 +235,7 @@ hpqc info minutes.hpqc
 ```
 encrypted to 3 recipients; the file does not name them
 recipients:  3 (the file does not name them)
-header:      3568 bytes (authenticated as AAD)
+header:      3600 bytes (authenticated as AAD)
 kem ct:      1088 bytes x 3
 ```
 
@@ -296,19 +296,21 @@ stat -c '%n %s' one.hpqc hidden.hpqc minutes.hpqc
 
 ```
 one.hpqc 1207
-hidden.hpqc 1259
-minutes.hpqc 3607
+hidden.hpqc 1291
+minutes.hpqc 3639
 ```
 
-52 bytes to stop naming one recipient; 1174 for each extra one.
+84 bytes to stop naming one recipient — 32 of them the file key commitment,
+which the next section is about — and 1174 for each extra one.
 
 ### Removing a recipient
 
 ```console
 hpqc encrypt -r alice.pub -r bob.pub minutes.txt -o pair.hpqc
-# drop the last stanza (1174 bytes) and rewrite the count from 2 to 1
+# drop the last stanza (1174 bytes) and rewrite the count from 2 to 1.
+# The count sits at 76 now: 44, plus the 32-byte file key commitment.
 head -c $(( $(stat -c%s pair.hpqc) - 1174 )) pair.hpqc > cut.hpqc
-printf '\x00\x01' | dd of=cut.hpqc bs=1 seek=44 count=2 conv=notrunc status=none
+printf '\x00\x01' | dd of=cut.hpqc bs=1 seek=76 count=2 conv=notrunc status=none
 
 hpqc info cut.hpqc | grep recipients
 hpqc decrypt -k alice.key cut.hpqc -o /dev/null; echo "exit=$?"
@@ -370,6 +372,51 @@ signed.hpqc 8972
 ```
 
 5365 bytes of it, of which ML-DSA-65's signature alone is 3309.
+
+### The file key commitment
+
+The header commits to the one file key every stanza wraps, so a sender cannot
+give Bob one key and Carol another and write them different messages. It sits
+at offset 44 and it is 32 bytes:
+
+```console
+python -c "
+from hpqc.container import parse_header
+import pathlib
+blob = pathlib.Path('pair.hpqc').read_bytes()
+header, _, _ = parse_header(blob)
+print('committed:', header.committed)
+print('at 44:    ', blob[44:76] == header.commitment)
+"
+```
+
+```
+committed: True
+at 44:     True
+```
+
+It is not optional. A recipient list without it is refused rather than read as
+an older file, because the sender is who chooses — and the sender is who this
+defends against. Group containers written before this existed therefore stopped
+opening, which is what the frozen vectors in `tests/vectors/v1-recipients.json`
+now prove:
+
+```console
+python -c "
+import json, pathlib
+v = json.loads(pathlib.Path('$OLDPWD/tests/vectors/v1-recipients.json').read_text())
+pathlib.Path('old.hpqc').write_bytes(bytes.fromhex(v['containers'][-1]['container']))
+"
+hpqc info old.hpqc; echo "exit=$?"
+```
+
+```
+error: a file key commitment and a recipient list go together: this header has
+flags 0x0004 and exactly one of them; a recipient list written before
+commitments were required cannot be opened, because nothing in it stops the
+sender giving two recipients two different messages
+exit=1
+```
 
 ## 6. The second hybrid KEM
 
@@ -480,7 +527,7 @@ transcript — so it cannot be used to steer a recipient onto a different cipher
 ## 8. The test suite
 
 ```console
-pytest -q                 # 742 passed
+pytest -q                 # 745 passed
 pytest -q -W error        # clean with warnings escalated to errors
 tools/ci-local.sh         # the same, on all four Pythons CI uses, in docker
 ```

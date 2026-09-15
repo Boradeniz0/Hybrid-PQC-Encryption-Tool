@@ -241,6 +241,20 @@ jobs:
           grep -q "$(key_id ci.pub)" hex.txt
           echo "the single-recipient shape does name its recipient: ok"
 
+          # The header commits to the file key, so a sender cannot wrap a
+          # different one for each recipient and show them different messages.
+          python -c "
+          import pathlib
+          from hpqc import recipients
+          from hpqc.container import parse_header
+          blob = pathlib.Path('group.hpqc').read_bytes()
+          header, _, _ = parse_header(blob)
+          assert header.committed, 'no commitment on a group file'
+          assert len(header.commitment) == recipients.COMMITMENT_LEN == 32
+          assert blob[44:76] == header.commitment, 'commitment is not at offset 44'
+          " || { echo "FAIL: the group file carries no file key commitment"; exit 1; }
+          echo "the header commits to the file key: ok"
+
           hpqc keygen -o outsider
           if hpqc decrypt -k outsider.key group.hpqc -o /dev/null 2>err.txt; then
             echo "FAIL: an outsider opened a group file"; exit 1

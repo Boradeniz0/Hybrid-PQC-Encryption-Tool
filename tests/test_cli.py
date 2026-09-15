@@ -1342,3 +1342,35 @@ def test_a_reader_that_stops_early_is_not_an_error(workspace, runner) -> None:
     # Killed by SIGPIPE, exactly as `cat big | head` is -- not a silent exit 1.
     assert writer.returncode == -signal.SIGPIPE, writer.returncode
     assert stderr == b"", stderr
+
+
+def test_a_group_file_from_before_commitments_is_refused_clearly(
+    workspace, runner
+) -> None:
+    """The message a user meets if they still have an older group file.
+
+    Those files stopped being readable when the file key commitment became
+    mandatory, and the error has to say why rather than looking like
+    corruption -- because it is not corruption, it is a shape that could not be
+    trusted.
+    """
+    import json
+    from pathlib import Path as _Path
+
+    vectors = json.loads(
+        (_Path(__file__).parent / "vectors" / "v1-recipients.json").read_text()
+    )
+    blob = bytes.fromhex(vectors["containers"][-1]["container"])
+    (workspace / "old.hpqc").write_bytes(blob)
+    (workspace / "old.key").write_text(vectors["identities"][0])
+
+    result = runner.invoke(cli, ["info", "old.hpqc"])
+    assert result.exit_code != 0
+    assert "commitment and a recipient list go together" in str(result.exception)
+
+    result = runner.invoke(
+        cli, ["decrypt", "-k", "old.key", "old.hpqc", "-o", "out.bin"]
+    )
+    assert result.exit_code != 0
+    assert "cannot be opened" in str(result.exception)
+    assert not (workspace / "out.bin").exists()

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import io
 import json
 import sys
@@ -47,8 +48,11 @@ from hpqc import (  # noqa: E402
 )
 from hpqc.container import (  # noqa: E402
     FLAG_CHUNKED,
+    FLAG_COMMITTED,
     FLAG_RECIPIENTS,
     FLAG_SIGNED,
+    NO_KEY_ID,
+    Header,
     _seal_setup,
     encrypt,
     encrypt_many,
@@ -883,6 +887,191 @@ def build_v1_signed_stream() -> dict:
     return data
 
 
+def build_v1_committed() -> dict:
+    """Recipient lists that commit to the file key they wrap.
+
+    Written under a new name rather than by regenerating the four files that
+    already hold recipient lists. Those were produced before the commitment was
+    required and this build refuses them; they stay exactly as they are, and
+    what they now prove is the refusal. That is what "frozen" has to mean if it
+    means anything -- history is not edited when the format changes, it is
+    added to.
+
+    Recorded here:
+
+    * `commitments` -- the derived value for fixed inputs. A recorded container
+      cannot pin this: change the label or drop the salt and the writer and the
+      reader move together, so the file still opens and every round trip still
+      passes. Only the known answer notices.
+
+    * `containers` -- every shape the commitment touches: one hidden recipient,
+      two, three, both suites, signed, chunked, and the bigger KEM.
+
+    * `uncommitted` -- a recipient list built without the commitment, which is
+      what a sender who wants to hand out two different messages would write.
+      It must be refused by name. Building it needs the internals, because no
+      public path in the library will produce one.
+    """
+    identities = [PrivateKey.generate() for _ in range(3)]
+    publics = [k.public_key() for k in identities]
+    big_ids = [PrivateKey.generate(kems.X448_MLKEM1024) for _ in range(2)]
+    big_pubs = [k.public_key() for k in big_ids]
+    stranger = PrivateKey.generate()
+    signer = SigningPrivateKey.generate()
+
+    data = {
+        "note": (
+            "Frozen known-answer vectors for hpqc recipient lists that commit "
+            "to their file key. " + TEST_KEY_WARNING
+        ),
+        "format_version": 1,
+        "flag_committed": FLAG_COMMITTED,
+        "flag_recipients": FLAG_RECIPIENTS,
+        "commit_label": recipients.COMMIT_LABEL.decode("ascii"),
+        "commitment_len": recipients.COMMITMENT_LEN,
+        "commitment_offset": 44,
+        "count_offset": 44 + recipients.COMMITMENT_LEN,
+        "identities": [k.encode() for k in identities],
+        "publics": [p.encode() for p in publics],
+        "big_identities": [k.encode() for k in big_ids],
+        "big_publics": [p.encode() for p in big_pubs],
+        "stranger": stranger.encode(),
+        "signer": signer.encode(),
+        "signer_public": signer.public_key().encode(),
+        "commitments": [],
+        "containers": [],
+    }
+
+    for cli_name, suite in sorted(suites.BY_CLI_NAME.items()):
+        file_key = _filler(b"hpqc-vector-file-key-commit", suite.key_len)
+        salt = _filler(b"hpqc-vector-commit-salt", hybrid.SALT_LEN)
+        data["commitments"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "file_key": file_key.hex(),
+            "salt": salt.hex(),
+            "commitment": recipients.commitment(file_key, salt, suite).hex(),
+        })
+
+    plaintext = b"hpqc committed recipient-list test vector v1\n"
+
+    for cli_name, suite in sorted(suites.BY_CLI_NAME.items()):
+        for count in (1, 2, 3):
+            data["containers"].append({
+                "suite": cli_name,
+                "suite_id": suite.id,
+                "shape": "list",
+                "recipients": count,
+                "plaintext": plaintext.hex(),
+                "container": encrypt_many(
+                    plaintext, publics[:count], suite=suite,
+                    hide_recipients=count == 1,
+                ).hex(),
+            })
+        data["containers"].append({
+            "suite": cli_name,
+            "suite_id": suite.id,
+            "shape": "signed list",
+            "recipients": 2,
+            "signed": True,
+            "plaintext": plaintext.hex(),
+            "container": encrypt_many(
+                plaintext, publics[:2], suite=suite, sender=signer
+            ).hex(),
+        })
+
+    # The bigger KEM, so the commitment is recorded against both key types.
+    data["containers"].append({
+        "suite": "chacha20",
+        "suite_id": suites.CHACHA20_POLY1305_1024.id,
+        "shape": "list at ML-KEM-1024",
+        "recipients": 2,
+        "big": True,
+        "plaintext": plaintext.hex(),
+        "container": encrypt_many(
+            plaintext, big_pubs, suite=suites.CHACHA20_POLY1305_1024
+        ).hex(),
+    })
+
+    chunked = _filler(b"hpqc-vector-committed-chunked", streaming.CHUNK_SIZE + 1)
+    for shape, sender in (("chunked list", None), ("signed chunked list", signer)):
+        sink = io.BytesIO()
+        encrypt_stream_many(
+            io.BytesIO(chunked), sink, publics[:2], sender=sender,
+            digest=(
+                signing.digest_stream(io.BytesIO(chunked))
+                if sender is not None
+                else None
+            ),
+        )
+        data["containers"].append({
+            "suite": "chacha20",
+            "suite_id": suites.DEFAULT_SUITE.id,
+            "shape": shape,
+            "recipients": 2,
+            "signed": sender is not None,
+            "chunked": True,
+            "chunks": 2,
+            "plaintext_len": len(chunked),
+            "plaintext_sha256": hashlib.sha256(chunked).hexdigest(),
+            "container": sink.getvalue().hex(),
+        })
+
+    # Surreptitious forwarding against a committed list, frozen: signed over
+    # one container's header and re-sealed into another.
+    suite = suites.DEFAULT_SUITE
+    _, elsewhere_bytes, _ = _seal_setup(
+        [publics[1]], suite, FLAG_RECIPIENTS | FLAG_COMMITTED | FLAG_SIGNED
+    )
+    payload = signing.sign_payload_to_container(
+        plaintext, signer, elsewhere_bytes, suite
+    )
+    header, header_bytes, key = _seal_setup(
+        [publics[0]], suite, FLAG_RECIPIENTS | FLAG_COMMITTED | FLAG_SIGNED
+    )
+    data["forwarded"] = {
+        "note": (
+            "signed for one container, re-sealed into another addressed to "
+            "identities[0]; opening it must raise SignatureError"
+        ),
+        "opens_for": 0,
+        "plaintext": plaintext.hex(),
+        "container": (
+            header_bytes
+            + suite.aead(key).encrypt(header.nonce, payload, header_bytes)
+        ).hex(),
+    }
+
+    # A list with no commitment: the shape a cheating sender wants, built by
+    # hand because _seal_setup refuses to produce one.
+    suite = suites.DEFAULT_SUITE
+    salt = os.urandom(hybrid.SALT_LEN)
+    file_key = os.urandom(suite.key_len)
+    header = Header(
+        suite=suite,
+        flags=FLAG_RECIPIENTS,
+        key_id=NO_KEY_ID,
+        salt=salt,
+        nonce=os.urandom(suite.nonce_len),
+        stanzas=recipients.wrap_for_all(file_key, publics[:2], salt, suite),
+    )
+    header_bytes = header.pack()
+    data["uncommitted"] = {
+        "note": (
+            "a recipient list with flag bit 3 clear; opening it must be "
+            "refused rather than treated as an older file"
+        ),
+        "recipients": 2,
+        "plaintext": plaintext.hex(),
+        "container": (
+            header_bytes
+            + suite.aead(file_key).encrypt(header.nonce, plaintext, header_bytes)
+        ).hex(),
+    }
+
+    return data
+
+
 BUILDERS = {
     "v1.json": build_v1,
     "v1-signed.json": build_v1_signed,
@@ -892,6 +1081,7 @@ BUILDERS = {
     "v1-signed-recipients.json": build_v1_signed_recipients,
     "v1-mlkem1024.json": build_v1_mlkem1024,
     "v1-signed-stream.json": build_v1_signed_stream,
+    "v1-committed.json": build_v1_committed,
 }
 
 

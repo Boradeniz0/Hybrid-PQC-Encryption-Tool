@@ -25,10 +25,14 @@ import pytest
 from hpqc import container, hybrid, recipients, suites
 from hpqc.container import (
     FLAG_CHUNKED,
+    FLAG_COMMITTED,
     FLAG_RECIPIENTS,
     FLAG_SIGNED,
     NO_KEY_ID,
 )
+
+#: What a recipient list always is: the list and the commitment to its key.
+LIST = FLAG_RECIPIENTS | FLAG_COMMITTED
 from hpqc.errors import (
     DecryptionError,
     FormatError,
@@ -45,9 +49,11 @@ SUITES = [CHACHA20_POLY1305, AES_256_GCM]
 OFF_FLAGS = 6
 OFF_KEY_ID = 8
 OFF_SALT = 16
-#: Where the recipient count sits: preamble (32) + a 12-byte nonce.
-OFF_COUNT = 44
-OFF_FIRST_STANZA = 46
+#: preamble (32) + a 12-byte nonce.
+OFF_COMMITMENT = 44
+#: ... then the 32-byte commitment, then the count.
+OFF_COUNT = OFF_COMMITMENT + recipients.COMMITMENT_LEN
+OFF_FIRST_STANZA = OFF_COUNT + 2
 
 
 @pytest.fixture(scope="module")
@@ -254,7 +260,7 @@ class TestRefusals:
     ):
         """Both bits are known, so only the tag stops this."""
         blob = bytearray(container.encrypt_many(b"x", crowd_pub[:2]))
-        blob[OFF_FLAGS + 1] = FLAG_SIGNED | FLAG_RECIPIENTS
+        blob[OFF_FLAGS + 1] = FLAG_SIGNED | LIST
 
         with pytest.raises(DecryptionError, match="authentication failed"):
             container.decrypt(bytes(blob), crowd[0])
@@ -264,10 +270,11 @@ class TestRefusals:
     ):
         """Signed, chunked, and addressed to a list: legal, and parses."""
         blob = bytearray(container.encrypt_many(b"x", crowd_pub[:2]))
-        blob[OFF_FLAGS + 1] = FLAG_SIGNED | FLAG_RECIPIENTS | FLAG_CHUNKED
+        blob[OFF_FLAGS + 1] = FLAG_SIGNED | LIST | FLAG_CHUNKED
 
         header, _, _ = container.parse_header(bytes(blob))
         assert header.signed and header.multi and header.chunked
+        assert header.committed
 
     @pytest.mark.parametrize("count", [0, MAX_RECIPIENTS + 1, 0xFFFF])
     def test_an_out_of_range_recipient_count_is_refused(self, crowd_pub, count):
@@ -339,18 +346,26 @@ class TestTamperResistance:
 
         # Under its own salt it opens; under the other file's it does not.
         assert recipients.unwrap(
-            head_a.stanzas, alice, head_a.salt, head_a.suite
+            head_a.stanzas, alice, head_a.salt, head_a.suite, head_a.commitment
         )
         with pytest.raises(WrongRecipientError):
-            recipients.unwrap(head_a.stanzas, alice, head_b.salt, head_b.suite)
+            recipients.unwrap(
+                head_a.stanzas, alice, head_b.salt, head_b.suite,
+                head_b.commitment,
+            )
 
     def test_a_stanza_cannot_be_moved_to_another_recipient(self, alice, bob, bob_pub):
         blob = container.encrypt_many(b"for bob", [bob_pub], hide_recipients=True)
         header, _, _ = container.parse_header(blob)
 
-        assert recipients.unwrap(header.stanzas, bob, header.salt, header.suite)
+        assert recipients.unwrap(
+            header.stanzas, bob, header.salt, header.suite, header.commitment
+        )
         with pytest.raises(WrongRecipientError):
-            recipients.unwrap(header.stanzas, alice, header.salt, header.suite)
+            recipients.unwrap(
+                header.stanzas, alice, header.salt, header.suite,
+                header.commitment,
+            )
 
     @pytest.mark.parametrize("offset", [OFF_SALT, OFF_COUNT - 4, OFF_FLAGS])
     def test_editing_the_preamble_breaks_it(self, crowd, crowd_pub, offset):
@@ -409,7 +424,7 @@ class TestWrappingKeys:
             b"\x00" * header.suite.nonce_len, stanza.wrapped_key, None
         )
         assert file_key == recipients.unwrap(
-            header.stanzas, alice, header.salt, header.suite
+            header.stanzas, alice, header.salt, header.suite, header.commitment
         )
 
     def test_the_wrapped_key_is_the_file_key_and_nothing_else(self, alice, alice_pub):
@@ -417,7 +432,7 @@ class TestWrappingKeys:
         header, header_bytes, ciphertext = container.parse_header(blob)
 
         file_key = recipients.unwrap(
-            header.stanzas, alice, header.salt, header.suite
+            header.stanzas, alice, header.salt, header.suite, header.commitment
         )
         assert len(file_key) == header.suite.key_len
         assert (
@@ -446,7 +461,7 @@ class TestChunked:
 
         header, _, _ = container.parse_header(sink.getvalue())
         assert header.multi and header.chunked
-        assert header.flags == FLAG_RECIPIENTS | FLAG_CHUNKED
+        assert header.flags == LIST | FLAG_CHUNKED
 
         for identity in crowd[:3]:
             got = io.BytesIO()
@@ -534,7 +549,10 @@ class TestReadingTheHeader:
         """
         stanza = max(recipients.stanza_len(s) for s in suites.all_suites())
         nonce = max(s.nonce_len for s in suites.all_suites())
-        biggest = 32 + nonce + U16.size + MAX_RECIPIENTS * stanza
+        biggest = (
+            32 + nonce + recipients.COMMITMENT_LEN
+            + U16.size + MAX_RECIPIENTS * stanza
+        )
         assert container.MAX_HEADER_LEN == biggest
 
 
@@ -607,7 +625,7 @@ class TestSignedRecipientLists:
 
         forged = container.encrypt_many(b"placeholder", [alice_pub])
         header2, header2_bytes, key2 = container._seal_setup(
-            [alice_pub], CHACHA20_POLY1305, FLAG_RECIPIENTS | FLAG_SIGNED
+            [alice_pub], CHACHA20_POLY1305, LIST | FLAG_SIGNED
         )
         forged = reseal(
             header2_bytes, payload, key2, CHACHA20_POLY1305, header2.nonce
@@ -662,7 +680,7 @@ class TestSignedRecipientLists:
         _, _, _, payload = payload_of(classic, alice)
 
         header, header_bytes, key = container._seal_setup(
-            [alice_pub], CHACHA20_POLY1305, FLAG_RECIPIENTS | FLAG_SIGNED
+            [alice_pub], CHACHA20_POLY1305, LIST | FLAG_SIGNED
         )
         forged = reseal(
             header_bytes, payload, key, CHACHA20_POLY1305, header.nonce
@@ -756,3 +774,161 @@ def test_the_two_signing_constructions_use_different_labels() -> None:
     assert signing.SIG_CONTAINER_LABEL != signing.SIG_LABEL
     # The coincidence this test exists to outlive: 4 + header == 32 + 1184.
     assert X25519_KEY_LEN + MLKEM768_PUBLIC_LEN - 4 == 1212
+
+
+class TestTheFileKeyCommitment:
+    """A sender must give every recipient the same file key, and prove it.
+
+    ChaCha20-Poly1305 and AES-256-GCM are not key-committing: given two keys, a
+    ciphertext can be built that decrypts successfully under both, to two
+    different plaintexts -- the "invisible salamanders" result. Without a
+    commitment that hands a malicious *sender* something that looks impossible:
+    wrap one file key to Bob and another to Carol, seal one crafted payload,
+    and the two of them open the same file and read different messages, both
+    with a valid tag. Signing does not help, because the signature block is
+    inside the payload and each view carries its own.
+
+    Building that crafted ciphertext is the part these tests do not do -- it is
+    real work in GF(2**130 - 5) and it is not what is being checked here. What
+    is checked is the step that makes building it pointless: a file key that
+    the header did not commit to is refused the moment it comes out of its
+    stanza, before the payload is touched at all.
+    """
+
+    @staticmethod
+    def two_file_keys(first, second, *, commit_to):
+        """A container whose two stanzas wrap two different file keys.
+
+        The library will not build this -- `_seal_setup` wraps one key for
+        everybody -- so it is assembled from the pieces, which is exactly the
+        position a malicious sender is in.
+        """
+        suite = CHACHA20_POLY1305
+        salt = os.urandom(16)
+        keys = (os.urandom(suite.key_len), os.urandom(suite.key_len))
+        header = container.Header(
+            suite=suite,
+            flags=LIST,
+            key_id=NO_KEY_ID,
+            salt=salt,
+            nonce=os.urandom(suite.nonce_len),
+            stanzas=(
+                recipients.wrap(keys[0], first, salt, suite),
+                recipients.wrap(keys[1], second, salt, suite),
+            ),
+            commitment=recipients.commitment(
+                keys[commit_to] if commit_to is not None else os.urandom(32),
+                salt,
+                suite,
+            ),
+        )
+        header_bytes = header.pack()
+        # Sealed under the first key. A real attacker would put a ciphertext
+        # here that opens under both; that is the part left unbuilt.
+        payload = suite.aead(keys[0]).encrypt(
+            header.nonce, b"the message the first recipient sees", header_bytes
+        )
+        return header_bytes + payload
+
+    def test_the_recipient_whose_key_was_not_committed_to_is_refused(
+        self, crowd, crowd_pub
+    ):
+        """And refused *by name*, not by a tag failure.
+
+        The distinction is the whole point. A tag failure says "this file is
+        broken"; this says "the sender wrapped a different key for somebody
+        else", which is a different fact and the one that is true.
+        """
+        blob = self.two_file_keys(crowd_pub[0], crowd_pub[1], commit_to=0)
+
+        assert container.decrypt(blob, crowd[0]).startswith(b"the message")
+        with pytest.raises(FormatError, match="does not commit to the key"):
+            container.decrypt(blob, crowd[1])
+
+    def test_it_works_the_other_way_round_too(self, crowd, crowd_pub):
+        """So the test above is not passing because of stanza order."""
+        blob = self.two_file_keys(crowd_pub[0], crowd_pub[1], commit_to=1)
+
+        with pytest.raises(FormatError, match="does not commit to the key"):
+            container.decrypt(blob, crowd[0])
+        with pytest.raises(DecryptionError):
+            # Carol's key is the committed one, so she gets past the check and
+            # fails on the payload -- which was sealed under the other key.
+            container.decrypt(blob, crowd[1])
+
+    def test_committing_to_neither_refuses_both(self, crowd, crowd_pub):
+        blob = self.two_file_keys(crowd_pub[0], crowd_pub[1], commit_to=None)
+        for identity in crowd[:2]:
+            with pytest.raises(FormatError, match="does not commit to the key"):
+                container.decrypt(blob, identity)
+
+    def test_an_honest_container_passes_the_same_check(self, crowd, crowd_pub):
+        """The pair to all three above, so they cannot pass by being broken."""
+        blob = container.encrypt_many(b"one key for everybody", crowd_pub[:2])
+        for identity in crowd[:2]:
+            assert container.decrypt(blob, identity) == b"one key for everybody"
+
+    def test_a_list_without_a_commitment_is_refused(self, crowd_pub):
+        """Not read as an older file: refused, because the writer chooses.
+
+        A defence the sender can decline to use protects nobody from the
+        sender, and the sender is who this defends against.
+        """
+        salt = os.urandom(16)
+        file_key = os.urandom(32)
+        header = container.Header(
+            suite=CHACHA20_POLY1305,
+            flags=FLAG_RECIPIENTS,
+            key_id=NO_KEY_ID,
+            salt=salt,
+            nonce=os.urandom(12),
+            stanzas=recipients.wrap_for_all(
+                file_key, crowd_pub[:2], salt, CHACHA20_POLY1305
+            ),
+        )
+        with pytest.raises(FormatError, match="go together"):
+            container.parse_header(header.pack() + b"\x00" * 32)
+
+    def test_a_commitment_without_a_list_is_refused(self, alice_pub):
+        blob = bytearray(container.encrypt(b"x", alice_pub))
+        blob[OFF_FLAGS + 1] = FLAG_COMMITTED
+        with pytest.raises(FormatError, match="go together"):
+            container.parse_header(bytes(blob))
+
+    def test_the_library_will_not_build_an_uncommitted_list(self, crowd_pub):
+        """The writer's half of the rule, so no path inside can produce one."""
+        with pytest.raises(ValueError, match="must carry a file key commitment"):
+            container._seal_setup(crowd_pub[:2], CHACHA20_POLY1305, FLAG_RECIPIENTS)
+        with pytest.raises(ValueError, match="must carry a file key commitment"):
+            container._seal_setup(crowd_pub[:1], CHACHA20_POLY1305, FLAG_COMMITTED)
+
+    def test_the_commitment_is_associated_data(self, crowd, crowd_pub):
+        """Editing it is not a way to make a wrong key acceptable."""
+        blob = bytearray(container.encrypt_many(b"x", crowd_pub[:2]))
+        blob[OFF_COMMITMENT] ^= 0x01
+        for identity in crowd[:2]:
+            with pytest.raises((FormatError, DecryptionError)):
+                container.decrypt(bytes(blob), identity)
+
+    def test_the_commitment_depends_on_the_key_the_salt_and_the_suite(self):
+        key, salt = os.urandom(32), os.urandom(16)
+        base = recipients.commitment(key, salt, CHACHA20_POLY1305)
+
+        assert base != recipients.commitment(os.urandom(32), salt, CHACHA20_POLY1305)
+        assert base != recipients.commitment(key, os.urandom(16), CHACHA20_POLY1305)
+        assert base != recipients.commitment(key, salt, AES_256_GCM)
+        assert len(base) == recipients.COMMITMENT_LEN == 32
+
+    def test_a_single_named_recipient_carries_no_commitment(self, alice, alice_pub):
+        """There is nothing to commit to, and nobody to lie to.
+
+        One recipient means one KEM-derived key and no file key at all, so the
+        whole question does not arise -- which is why the older shape is
+        untouched and every container ever written to it still opens.
+        """
+        blob = container.encrypt(b"solo", alice_pub)
+        header, _, _ = container.parse_header(blob)
+
+        assert not header.multi and not header.committed
+        assert header.commitment == b""
+        assert container.decrypt(blob, alice) == b"solo"

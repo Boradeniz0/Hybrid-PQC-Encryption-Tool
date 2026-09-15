@@ -160,7 +160,7 @@ all the file knows:
 ```console
 $ hpqc info minutes.hpqc
 recipients:  3 (the file does not name them)
-header:      3568 bytes (authenticated as AAD)
+header:      3600 bytes (authenticated as AAD)
 kem ct:      1088 bytes x 3
 ```
 
@@ -551,7 +551,7 @@ error: none of this file's 3 recipient slot(s) could be opened with key id
 ```
 
 A single recipient keeps the older header, key id and all, because that shape
-costs 52 bytes less and there is nothing to hide when there is one name. If you
+costs 84 bytes less and there is nothing to hide when there is one name. If you
 want the same anonymity for one recipient, ask for it:
 
 ```console
@@ -570,6 +570,56 @@ key, over the stanza's own ephemeral key and KEM ciphertext, the file's salt,
 and the recipient's own two public keys. So a stanza cannot be moved to another
 file or another recipient, and the key that wraps a file key can never collide
 with the key that seals a payload.
+
+### Every recipient gets the same file key, and the header proves it
+
+ChaCha20-Poly1305 and AES-256-GCM are **not key-committing**. Given two keys, a
+ciphertext can be built that decrypts successfully under both, to two different
+plaintexts — the *invisible salamanders* result (Dodis, Grubbs, Ristenpart and
+Woodage, CRYPTO 2018; Len, Grubbs and Ristenpart, USENIX 2021).
+
+In a scheme like this one that hands a malicious **sender** something that looks
+impossible. Wrap one file key to Bob and a different one to Carol, seal a single
+crafted payload, and the two of them open the same file and read different
+messages. Both see a valid tag. Signing does not help: the signature block is
+inside the payload, so each view carries its own and both verify.
+
+The fix is to take the choice away. The header carries a commitment to the file
+key, and a recipient checks it the moment the key comes out of its stanza:
+
+```
+commitment = HKDF-SHA256(ikm=file_key, salt=header salt,
+                         info="hpqc-v1 file key commitment" ‖ suite id)
+```
+
+Bob computes it over his file key, Carol over hers. Both have to equal the one
+32-byte value in the header, which takes a collision in HKDF-SHA256 — so the
+sender is forced to give everybody the same key, and the payload is then a
+single message that either opens or does not. Whoever was handed the other key
+is told what happened, rather than getting a tag failure that reads like
+corruption:
+
+```console
+$ hpqc decrypt -k carol.key minutes.hpqc -o out.txt
+error: this file's header does not commit to the key that came out of the
+recipient list; the sender wrapped a different key for somebody else and may
+have written them a different message
+```
+
+**It is mandatory, not offered.** A recipient list without the commitment is
+refused rather than read as an older file, because the party who chooses
+whether to commit is exactly the party this defends against. A defence the
+attacker can decline to use is not a defence. The writer is held to the same
+rule from the inside: no path through the library can produce an uncommitted
+list.
+
+That made every group container written before this change unreadable. They
+were three commits old in an unreleased line, and the frozen vectors holding
+them were kept exactly as they are — what they prove now is the refusal.
+
+A single named recipient is untouched. One recipient means one KEM-derived key
+and no file key at all, so the question does not arise, and every container
+ever written to that shape still opens.
 
 ### Removing a recipient cannot be done quietly
 
@@ -741,8 +791,9 @@ name), and everything from offset 44 is replaced by a list:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
-| 44 | 2 | recipient count, 1…1024 |
-| 46 | … | that many stanzas |
+| 44 | 32 | commitment to the file key every stanza wraps |
+| 76 | 2 | recipient count, 1…1024 |
+| 78 | … | that many stanzas |
 | … | … | payload |
 
 Each stanza is `2+32` ephemeral X25519 public key, `2+1088` ML-KEM-768
@@ -759,16 +810,16 @@ the parse retried, up to a hard cap. Each round asks for at least as much again
 as it already holds — fetching only the shortfall would be correct and
 quadratic in a count the file's writer chooses.
 
-Bits 0 and 1 together are refused as malformed rather than parsed: a signature
-covers a whole message, so this build never writes one, and letting a signature
-parser loose on chunk framing is a worse answer than saying no. Bits 0 and 2
-together are perfectly legal and change which byte string the signatures cover
-— the recipient's public keys for a named recipient, the whole header for a
-list.
+Bit 2 and bit 3 must appear together or not at all: there is nothing for a
+commitment to commit to without a file key, and a file key must never travel
+without one. Either alone is refused. Bits 0 and 2 together are legal and change
+which byte string the signatures cover — the recipient's public keys for a named
+recipient, the whole header for a list.
 
 Sender authentication claimed bit 0 of the reserved `flags` field, streaming
-claimed bit 1 and the recipient list claimed bit 2, which is what they were
-there for, so the format version has never had to move. Bits 1 and 2 compose
+claimed bit 1, the recipient list claimed bit 2 and its file key commitment
+claimed bit 3, which is what they were there for, so the format version has
+never had to move. Bits 1 and 2 compose
 without either knowing about the other — one is about the payload, the other
 about the header — which is the payoff of putting both in the flags field
 rather than in the version. An older build
@@ -882,7 +933,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest
-742 passed
+745 passed
 ```
 
 CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
@@ -982,6 +1033,22 @@ actually fails. Among them:
   looked up from one table copied out of FIPS 203; a typo there produces a
   format that agrees with itself and with nothing else. The test generates a
   key of each parameter set and asserts the real sizes match the table.
+- **A sender cannot hand two recipients two different file keys.** The
+  container is assembled from the pieces, because the library refuses to build
+  one: two stanzas wrapping two keys, and the header committing to one of them.
+  The recipient whose key was not committed to must be refused *by name* rather
+  than by a tag failure, in both orders, and with a commitment to neither key
+  both must be refused. Paired with an honest container that passes the same
+  check. What the tests do *not* build is the ciphertext that opens under both
+  keys — that is real work in GF(2¹³⁰−5) and is not the property being checked;
+  what is checked is the step that makes building it pointless.
+- **Twenty-one frozen containers that must now be refused.** The recipient
+  lists recorded before the commitment was required are kept byte for byte and
+  asserted to fail, with a test that the list of them has not silently become
+  empty — a refusal test over nothing passes forever.
+- **Every value of the flags field**, all 65536 of them, against a named
+  container and a listed one. Four bits are defined and two of them are not
+  independent, which random mutation almost never lands on.
 - **A recipient cannot forge a signed stream.** They hold the file key, so the
   three attacks are built from the inside: re-seal a changed message, a shorter
   one, or a longer one, each properly re-chunked so the final-chunk marker has
@@ -1154,6 +1221,20 @@ actually produced is `tools/ci-local.sh`: the repository is private, so the CI
 logs are not readable from a terminal, and a matrix you cannot run is a matrix
 you find out about afterwards.
 
+**I shipped a group-encryption feature with a hole in it, and found it by being
+asked what was left.** Three commits after adding multiple recipients I went
+looking for remaining work and reread the threat model instead of the code.
+Every recipient unwraps a file key from their own stanza — and nothing made
+those keys *the same* key. The AEADs here are not key-committing, so a sender
+could wrap one key to Bob and another to Carol, seal one crafted payload, and
+have them read different messages under a tag that verifies for both. I had
+written, in that very section, that "any recipient can re-send the file as if it
+came from you" and answered it with signing. I had not asked the mirrored
+question: what can the *sender* do to a group that it cannot do to one person.
+The fix is 32 bytes and a comparison. Finding it was rereading my own threat
+model with the feature in front of me, which is not something a test suite can
+do for you.
+
 **A shell check that failed about one run in ten.** The CI smoke test is full
 of lines like `hpqc info f.hpqc | grep -q '^recipients:  3'`. `grep -q` exits at
 its first match, so if the writer still has a line to go it is killed by
@@ -1244,6 +1325,8 @@ What it does **not** do, by design in v1:
 - [x] Signing to a recipient list (bind the container, not the recipient)
 - [x] ML-KEM-1024 suite (with X448, so both halves move together)
 - [x] Signing a streamed file — a digest signed up front, not a trailer
+- [x] A file key commitment, so a sender cannot show two recipients two
+      different messages
 - [x] Known-answer test vectors checked into the repo
 
 ## References

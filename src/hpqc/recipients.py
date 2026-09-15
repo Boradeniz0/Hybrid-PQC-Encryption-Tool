@@ -45,28 +45,68 @@ recipient's own two public keys, under a label distinct from the payload's. A
 stanza therefore cannot be moved to another file or another recipient, and a
 wrapping key can never collide with the key that seals a payload.
 
+**Every recipient must get the same file key, and the header proves it.**
+ChaCha20-Poly1305 and AES-256-GCM are not *key-committing*: given two keys, a
+ciphertext can be built that decrypts successfully under both, to two different
+plaintexts. That is the "invisible salamanders" result (Dodis, Grubbs,
+Ristenpart and Woodage, CRYPTO 2018; Len, Grubbs and Ristenpart, USENIX 2021),
+and in a scheme like this one it hands a malicious *sender* a capability that
+looks impossible: wrap one file key to Bob and a different one to Carol, seal a
+single crafted payload, and the two of them open the same file and read
+different messages. Both see a valid tag. Signing does not help -- the
+signature block is inside the payload, so each view carries its own.
+
+The fix is to take the choice away. The header carries a commitment to the file
+key, and a recipient checks it the moment the key comes out of its stanza:
+
+    commitment = HKDF-SHA256(ikm=file_key, salt=header salt,
+                             info=COMMIT_LABEL || suite id)
+
+Bob computes it over his file key and Carol over hers. Both have to equal the
+one value in the header, which takes a collision in HKDF-SHA256 -- so the
+sender is forced to give everybody the same key, and the payload is then a
+single message that either opens or does not.
+
+It has to be mandatory rather than offered, which is why `parse_header` refuses
+a recipient list that carries no commitment instead of reading it as an older
+file. A defence the attacker can decline to use is not a defence, and the
+attacker here is the one writing the header.
+
 What this does *not* defend against is inherent to multi-recipient encryption
 rather than a gap here: every recipient learns the file key, so any one of them
 can decrypt the file, re-wrap the same file key to somebody else, and produce
 a container indistinguishable from one the original sender wrote. Sender
-authentication is the only answer to that, and it is a separate flag.
+authentication is the answer to that, and it is a separate flag.
 """
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from typing import Iterable, Sequence, Tuple
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import hybrid
-from .errors import WrongRecipientError
+from .errors import FormatError, WrongRecipientError
 from .keys import PrivateKey, PublicKey
 from .suites import Suite
 from .wire import U16, Reader
 
 #: The AEAD tag on a wrapped file key. Both suites use 16 bytes.
 WRAP_TAG_LEN = 16
+
+#: Domain separation for the file-key commitment. Distinct from every other
+#: label in the project, so the commitment can never be some other derivation's
+#: output under a different name.
+COMMIT_LABEL = b"hpqc-v1 file key commitment"
+
+#: 32 bytes, because this is a commitment and what matters is how hard it is to
+#: find two file keys that produce the same one. Eight bytes would be 2**32 work
+#: by the birthday bound -- an afternoon.
+COMMITMENT_LEN = 32
 
 #: An upper bound on the recipient list, so a hostile header cannot make the
 #: reader buffer without limit before anything has been authenticated. It is
@@ -154,6 +194,38 @@ def check_recipients(recipients: Sequence[PublicKey]) -> None:
         seen.add(recipient.key_id)
 
 
+def commitment(file_key: bytes, salt: bytes, suite: Suite) -> bytes:
+    """Bind the header to one file key, so a sender cannot hand out two.
+
+    See the module docstring for what this defends against. The salt is mixed
+    in for the same reason it is everywhere else here -- it costs nothing and
+    keeps the value particular to this file.
+    """
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=COMMITMENT_LEN,
+        salt=salt,
+        info=COMMIT_LABEL + bytes([suite.id]),
+    ).derive(file_key)
+
+
+def check_commitment(
+    file_key: bytes, expected: bytes, salt: bytes, suite: Suite
+) -> None:
+    """Refuse a file key the header did not commit to.
+
+    Compared in constant time. The expected value is public -- it is in the
+    header -- so there is little to leak, but a comparison that stops at the
+    first wrong byte is never the one to reach for when the subject is a key.
+    """
+    if not hmac.compare_digest(commitment(file_key, salt, suite), expected):
+        raise FormatError(
+            "this file's header does not commit to the key that came out of "
+            "the recipient list; the sender wrapped a different key for "
+            "somebody else and may have written them a different message"
+        )
+
+
 def wrap(
     file_key: bytes, recipient: PublicKey, salt: bytes, suite: Suite
 ) -> Stanza:
@@ -193,11 +265,16 @@ def wrap_for_all(
 
 
 def unwrap(
-    stanzas: Iterable[Stanza], identity: PrivateKey, salt: bytes, suite: Suite
+    stanzas: Iterable[Stanza],
+    identity: PrivateKey,
+    salt: bytes,
+    suite: Suite,
+    expected_commitment: bytes,
 ) -> bytes:
     """Recover the file key from whichever stanza belongs to `identity`.
 
-    Every stanza is tried in order and the first one whose tag verifies wins.
+    Every stanza is tried in order and the first one whose tag verifies wins,
+    and the key it yields must be the one the header committed to.
     The loop stops there, so how long this takes reveals *which* slot is the
     caller's to anyone able to measure it -- an observer holding only the file
     still learns nothing but the count. Constant-time trial decryption would
@@ -220,11 +297,16 @@ def unwrap(
             label=hybrid.WRAP_LABEL,
         )
         try:
-            return suite.aead(wrapping_key).decrypt(
+            file_key = suite.aead(wrapping_key).decrypt(
                 _zero_nonce(suite), stanza.wrapped_key, None
             )
         except InvalidTag:
             continue
+        # This stanza opened under our wrapping key, so it is ours. A
+        # commitment that does not match is therefore not "keep looking" -- it
+        # is a header that promised a different key than the one it handed us.
+        check_commitment(file_key, expected_commitment, salt, suite)
+        return file_key
 
     # No key id to quote: the stanzas do not carry one, which is the point.
     raise WrongRecipientError(

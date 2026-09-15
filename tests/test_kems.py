@@ -36,6 +36,8 @@ ALL_SUITES = [
 
 OFF_SUITE = 5
 OFF_EPK_LEN = 44
+#: preamble + a 12-byte nonce + the 32-byte commitment + the u16 count.
+LIST_HEADER_BASE = 32 + 12 + recipients.COMMITMENT_LEN + 2
 
 
 @pytest.fixture(scope="module")
@@ -99,7 +101,7 @@ class TestRoundTrips:
         )
         header, header_bytes, _ = container.parse_header(blob)
         assert header.multi and header.recipient_count == 3
-        assert len(header_bytes) == 46 + 3 * recipients.stanza_len(
+        assert len(header_bytes) == LIST_HEADER_BASE + 3 * recipients.stanza_len(
             suites.CHACHA20_POLY1305_1024
         )
         for identity in big_identities:

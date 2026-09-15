@@ -348,11 +348,17 @@ def test_a_mutated_signature_block_in_a_listed_container_never_verifies(
     a recipient: someone who legitimately holds the file key and is trying to
     make a block say something the signer did not.
     """
-    from hpqc.container import FLAG_RECIPIENTS, FLAG_SIGNED, _seal_setup
+    from hpqc.container import (
+        FLAG_COMMITTED,
+        FLAG_RECIPIENTS,
+        FLAG_SIGNED,
+        _seal_setup,
+    )
     from hpqc.signing import sign_payload_to_container
 
     header, header_bytes, key = _seal_setup(
-        [alice_pub, bob_pub], DEFAULT_SUITE, FLAG_RECIPIENTS | FLAG_SIGNED
+        [alice_pub, bob_pub], DEFAULT_SUITE,
+        FLAG_RECIPIENTS | FLAG_COMMITTED | FLAG_SIGNED
     )
     payload = sign_payload_to_container(
         b"pay 100", carol, header_bytes, DEFAULT_SUITE
@@ -531,3 +537,29 @@ def test_a_mutated_stream_prologue_never_verifies(alice, alice_pub, carol, carol
             )
         else:
             pytest.fail("a mutated stream prologue verified successfully")
+
+
+def test_every_flags_value_against_every_container(alice, alice_pub, bob_pub) -> None:
+    """All 65536 values of the field that says what shape a container is.
+
+    Four bits are defined and they are not independent: a recipient list and a
+    file key commitment must appear together or not at all, and signed plus
+    chunked selects a different signed message. Random mutation almost never
+    lands on exactly one of a pair, so the combinations are walked instead.
+    """
+    from hpqc import container as container_module
+
+    blobs = [
+        (encrypt(b"named", alice_pub), alice),
+        (container_module.encrypt_many(b"listed", [alice_pub, bob_pub]), alice),
+    ]
+
+    for blob, identity in blobs:
+        real = int.from_bytes(blob[6:8], "big")
+        for value in range(1 << 16):
+            if value == real:
+                continue
+            doctored = bytearray(blob)
+            doctored[6:8] = value.to_bytes(2, "big")
+            with pytest.raises(HpqcError):
+                decrypt(bytes(doctored), identity)

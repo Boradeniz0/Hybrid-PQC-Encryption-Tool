@@ -30,7 +30,12 @@ import os
 import pytest
 
 from hpqc import container, signing, streaming
-from hpqc.container import FLAG_CHUNKED, FLAG_RECIPIENTS, FLAG_SIGNED
+from hpqc.container import (
+    FLAG_CHUNKED,
+    FLAG_COMMITTED,
+    FLAG_RECIPIENTS,
+    FLAG_SIGNED,
+)
 from hpqc.errors import DecryptionError, FormatError, SignatureError
 from hpqc.keys import PrivateKey, SigningPrivateKey
 from hpqc.signing import SIGNATURE_BLOCK_LEN, STREAM_DIGEST_LEN
@@ -112,7 +117,9 @@ class TestRoundTrip:
         blob, _ = seal(plaintext, [alice_pub, bob_pub], carol)
 
         header, _, _ = container.parse_header(blob)
-        assert header.flags == FLAG_SIGNED | FLAG_CHUNKED | FLAG_RECIPIENTS
+        assert header.flags == (
+            FLAG_SIGNED | FLAG_CHUNKED | FLAG_RECIPIENTS | FLAG_COMMITTED
+        )
 
         for identity in (alice, bob):
             out, opened = open_bytes(blob, identity, carol_pub)

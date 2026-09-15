@@ -28,10 +28,11 @@ A file can be addressed to several recipients at once. It is sealed under one
 random file key, and each recipient gets a copy of that key wrapped under their
 own hybrid KEM output. The header names none of them -- a reader finds its own
 copy by trying each in turn -- so the file reveals how many people can open it
-and not who they are. Signing such a file binds the header itself rather than a
+and not who they are. The header commits to that key, which is what stops a
+sender handing two recipients two different messages under one tag. Signing such a file binds the header itself rather than a
 recipient, because there is no recipient in it to bind.
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = ["__version__"]

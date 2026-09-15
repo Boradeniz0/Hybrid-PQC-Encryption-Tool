@@ -24,14 +24,21 @@ Byte layout (all integers big-endian):
 With bit 2 set the file has more than one recipient (or one it declines to
 name), and everything from offset 44 is replaced by a list:
 
-    44      2      recipient count, 1..MAX_RECIPIENTS
-    46      ...    that many stanzas, each 2+32 ephemeral X25519 public key,
+    44      32     commitment to the file key every stanza wraps (bit 3)
+    76      2      recipient count, 1..MAX_RECIPIENTS
+    78      ...    that many stanzas, each 2+32 ephemeral X25519 public key,
                        2+1088 ML-KEM-768 ciphertext, 2+48 wrapped file key
     ...     ...    AEAD ciphertext || 16-byte tag
 
 and the key id at offset 8 is all zeros, because there is no one recipient to
 name and naming one of several would be worse than naming none. See
-recipients.py for what a stanza holds and why it identifies nobody.
+recipients.py for what a stanza holds, why it identifies nobody, and what the
+commitment stops a malicious sender from doing to a group.
+
+Bit 3 is recorded in the flags but is not optional: a recipient list without it
+is refused. The flag says what a file has; requiring it is the reader's policy,
+and it has to be the reader's, because a defence the writer can decline to use
+protects nobody from the writer.
 
 Two properties matter more than the exact offsets:
 
@@ -118,7 +125,8 @@ FLAGS_NONE = 0
 FLAG_SIGNED = 0x0001  # the AEAD payload starts with a signature block
 FLAG_CHUNKED = 0x0002  # the payload is a STREAM of fixed-size sealed chunks
 FLAG_RECIPIENTS = 0x0004  # the header carries a list of anonymous stanzas
-_KNOWN_FLAGS = FLAG_SIGNED | FLAG_CHUNKED | FLAG_RECIPIENTS
+FLAG_COMMITTED = 0x0008  # the header commits to the file key the stanzas wrap
+_KNOWN_FLAGS = FLAG_SIGNED | FLAG_CHUNKED | FLAG_RECIPIENTS | FLAG_COMMITTED
 
 #: What the fixed key id field holds when the recipient list is in use. It is
 #: checked on parse rather than skipped: a fixed field that nothing reads is a
@@ -140,6 +148,7 @@ _PREAMBLE = struct.Struct(">4sBBH8s16s")  # magic, version, suite, flags, key id
 MAX_HEADER_LEN = (
     _PREAMBLE.size
     + _MAX_NONCE_LEN
+    + recipients.COMMITMENT_LEN
     + U16.size
     + recipients.MAX_RECIPIENTS * _MAX_STANZA_LEN
 )
@@ -160,6 +169,8 @@ class Header:
     #: Set when the recipient list is in use, empty otherwise. The two are
     #: alternatives, never both: which one a file uses is flag bit 2.
     stanzas: Tuple[recipients.Stanza, ...] = ()
+    #: Set alongside `stanzas`: what the file key has to hash to.
+    commitment: bytes = b""
     version: int = FORMAT_VERSION
 
     def pack(self) -> bytes:
@@ -173,7 +184,12 @@ class Header:
         )
         if self.multi:
             return b"".join(
-                (preamble, self.nonce, U16.pack(len(self.stanzas)))
+                (
+                    preamble,
+                    self.nonce,
+                    self.commitment,
+                    U16.pack(len(self.stanzas)),
+                )
                 + tuple(stanza.pack() for stanza in self.stanzas)
             )
         return b"".join(
@@ -210,6 +226,11 @@ class Header:
     def multi(self) -> bool:
         """True if the recipients are a list of anonymous stanzas."""
         return bool(self.flags & FLAG_RECIPIENTS)
+
+    @property
+    def committed(self) -> bool:
+        """True if the header commits to the file key. Required when `multi`."""
+        return bool(self.flags & FLAG_COMMITTED)
 
     @property
     def recipient_count(self) -> int:
@@ -265,8 +286,24 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
 
     nonce = reader.take(suite.nonce_len, "AEAD nonce")
 
-    ephemeral_public = kem_ciphertext = b""
+    ephemeral_public = kem_ciphertext = commitment = b""
     stanzas: Tuple[recipients.Stanza, ...] = ()
+
+    if bool(flags & FLAG_COMMITTED) != bool(flags & FLAG_RECIPIENTS):
+        # There is nothing for a commitment to commit to without a file key,
+        # and a file key must never travel without one. Either alone is a
+        # header this build does not write and will not guess at.
+        raise FormatError(
+            "a file key commitment and a recipient list go together: this "
+            f"header has flags 0x{flags:04x} and exactly one of them"
+            + (
+                "; a recipient list written before commitments were required "
+                "cannot be opened, because nothing in it stops the sender "
+                "giving two recipients two different messages"
+                if flags & FLAG_RECIPIENTS
+                else ""
+            )
+        )
 
     if flags & FLAG_RECIPIENTS:
         if key_id != NO_KEY_ID:
@@ -274,6 +311,9 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
                 "header uses a recipient list, which names nobody, but its "
                 f"key id field is not empty (0x{key_id.hex()})"
             )
+        commitment = reader.take(
+            recipients.COMMITMENT_LEN, "file key commitment"
+        )
         count = reader.take_u16("recipient count")
         if not 1 <= count <= recipients.MAX_RECIPIENTS:
             # Bounded before anything is allocated for it. The count is the
@@ -303,6 +343,7 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
         ephemeral_public=ephemeral_public,
         kem_ciphertext=kem_ciphertext,
         stanzas=stanzas,
+        commitment=commitment,
         version=version,
     )
     return header, data[: reader.pos], reader.rest()
@@ -408,7 +449,9 @@ def _recipient_flags(to: Sequence[PublicKey], hide_recipients: bool) -> int:
     anyone who runs `info` on the file, and the list shape does not.
     """
     recipients.check_recipients(to)
-    return FLAG_RECIPIENTS if len(to) > 1 or hide_recipients else FLAGS_NONE
+    if len(to) > 1 or hide_recipients:
+        return FLAG_RECIPIENTS | FLAG_COMMITTED
+    return FLAGS_NONE
 
 
 def _check_suite(to: Sequence[PublicKey], suite: Suite) -> None:
@@ -443,6 +486,14 @@ def _seal_setup(
     sealed copy of it. See recipients.py.
     """
     _check_suite(to, suite)
+    if bool(flags & FLAG_RECIPIENTS) != bool(flags & FLAG_COMMITTED):
+        # The writer's half of the rule parse_header enforces on the reader's.
+        # Having it here too means no path through this library can produce a
+        # recipient list nothing commits to, including a test building one.
+        raise ValueError(
+            "a recipient list must carry a file key commitment and nothing "
+            f"else may; flags 0x{flags:04x} has exactly one of them"
+        )
     salt = os.urandom(SALT_LEN)
     # The payload key is unique per file (fresh ephemeral X25519 key, fresh
     # ML-KEM encapsulation, fresh salt -- or, in the list shape, 32 fresh
@@ -462,6 +513,7 @@ def _seal_setup(
             salt=salt,
             nonce=nonce,
             stanzas=recipients.wrap_for_all(file_key, to, salt, suite),
+            commitment=recipients.commitment(file_key, salt, suite),
         )
         return header, header.pack(), file_key
 
@@ -596,7 +648,11 @@ def _open_setup(
         # No key id to check against: the stanzas name nobody, so the only way
         # to find out whether this file is ours is to try to open one.
         return recipient, recipients.unwrap(
-            header.stanzas, identity, header.salt, header.suite
+            header.stanzas,
+            identity,
+            header.salt,
+            header.suite,
+            header.commitment,
         )
 
     if header.key_id != recipient.key_id:
