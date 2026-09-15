@@ -921,6 +921,13 @@ def _describe_container(source: streaming.Source, total: int) -> None:
         click.echo(
             f"payload:     {payload} bytes (ciphertext + 16-byte tag)"
         )
+        # Reported for both shapes, so the two can be compared. A signed file
+        # carries its signature block inside the payload, so that comes off
+        # here exactly as it does for a stream.
+        sealed = payload - streaming.TAG_LEN
+        if header.signed:
+            sealed -= signing.SIGNATURE_BLOCK_LEN
+        click.echo(f"plaintext:   {sealed} bytes")
         click.echo("chunked:     no")
     if header.signed:
         # The signature block is inside the AEAD, so info genuinely cannot say

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpqc"
-version = "0.9.2"
+version = "0.9.3"
 description = "Hybrid post-quantum file encryption: X25519 + ML-KEM-768 or X448 + ML-KEM-1024, with optional Ed25519 + ML-DSA-65 sender authentication"
 readme = "README.md"
 # 3.9.2, not 3.9: cryptography>=46 declares !=3.9.0,!=3.9.1, so the

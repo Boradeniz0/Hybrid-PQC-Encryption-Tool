@@ -401,9 +401,33 @@ def test_info_describes_a_wrapped_key_without_the_passphrase(protected, runner) 
     output = shown(run(runner, "info", "secret.key"))
 
     assert "wrapped private key" in output
-    assert "X25519 + ML-KEM-768" in output
+    assert "contents:   encryption private key" in output
     assert "scrypt N=2^12" in output
     assert "unavailable without the passphrase" in output
+
+
+def test_info_does_not_guess_a_wrapped_key_s_algorithms(
+    workspace, runner, pwfile
+) -> None:
+    """It used to say ML-KEM-768 for an ML-KEM-1024 key, with no hedging.
+
+    The wrapper records whether the sealed blob is an encryption identity or a
+    signing one. Which KEM an encryption identity uses is the first byte inside
+    the blob, which is exactly what the passphrase protects -- so `info` cannot
+    know it and must not claim it.
+    """
+    pw = pwfile("open sesame")
+    result = run(runner, "keygen", "-o", "big", "--kem", "mlkem1024",
+                 "--passphrase-file", pw, "--scrypt-log-n", "14")
+    assert result.exit_code == 0, shown(result)
+
+    output = shown(run(runner, "info", "big.key"))
+    assert "contents:   encryption private key" in output
+    for guess in ("X25519", "ML-KEM-768", "X448", "ML-KEM-1024"):
+        assert guess not in output, output
+
+    # The public half is not sealed, so there it is named in full.
+    assert "X448 + ML-KEM-1024" in shown(run(runner, "info", "big.pub"))
 
 
 def test_a_protected_key_round_trips(protected, runner, pwfile) -> None:
@@ -1419,3 +1443,32 @@ def test_info_does_not_count_the_signature_block_as_plaintext(
     assert signed_size - plain_size == (
         SIGNATURE_BLOCK_LEN + streaming.TAG_LEN * (signed_chunks - plain_chunks)
     )
+
+
+@pytest.mark.parametrize("sign", [False, True], ids=["unsigned", "signed"])
+@pytest.mark.parametrize("shape", ["--one-shot", "--chunked"], ids=["one-shot", "chunked"])
+def test_info_reports_the_real_plaintext_size_for_every_shape(
+    workspace, runner, sign, shape
+) -> None:
+    """Four shapes, one number, and it is the size of the file you encrypted.
+
+    `info` used to give a plaintext size for chunked containers only, so the
+    two shapes could not be compared -- and a signed one counted its own
+    5365-byte signature block as message.
+    """
+    run(runner, "signgen", "-o", "signer")
+    plaintext = b"\x91" * 150_000
+    (workspace / "in.bin").write_bytes(plaintext)
+
+    args = ["encrypt", "-r", "alice.pub", "in.bin", "-o", "c.hpqc", shape]
+    if sign:
+        args += ["-s", "signer.key"]
+        if shape == "--chunked":
+            pass  # signing a stream is fine, it just reads the file twice
+    result = run(runner, *args)
+    assert result.exit_code == 0, shown(result)
+
+    info = shown(run(runner, "info", "c.hpqc"))
+    assert f"plaintext:   {len(plaintext)} bytes" in info, info
+    assert ("chunked:     yes" in info) == (shape == "--chunked")
+    assert ("signed:      yes" in info) == sign

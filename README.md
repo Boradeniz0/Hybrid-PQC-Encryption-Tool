@@ -144,6 +144,7 @@ recipient:   key id dc367bffcdf81019
 header:      1168 bytes (authenticated as AAD)
 kem ct:      1088 bytes
 payload:     100016 bytes (ciphertext + 16-byte tag)
+plaintext:   100000 bytes
 chunked:     no
 signed:      no
 ```
@@ -350,7 +351,7 @@ with **scrypt** and seals the private key under ChaCha20-Poly1305.
 ```console
 $ hpqc info alice.key
 type:       hpqc wrapped private key
-contents:   X25519 + ML-KEM-768 private key
+contents:   encryption private key
 protection: scrypt N=2^17 r=8 p=1 (128 MiB)
 key id:     unavailable without the passphrase
 ```
@@ -937,7 +938,7 @@ No `liboqs` build is required.
 ```console
 $ pip install -e '.[dev]'
 $ pytest --cov
-793 passed
+799 passed
 TOTAL   1407 statements, 278 branches, 100% coverage
 $ mypy
 Success: no issues found in 16 source files
@@ -1244,6 +1245,18 @@ was about. Reading `head.stdout` directly works everywhere. What the episode
 actually produced is `tools/ci-local.sh`: the repository is private, so the CI
 logs are not readable from a terminal, and a matrix you cannot run is a matrix
 you find out about afterwards.
+
+**`hpqc info` told you the wrong algorithms about a key it could not read.**
+A passphrase-protected X448 + ML-KEM-1024 key was described as
+"X25519 + ML-KEM-768 private key" — flatly, confidently wrong. The wrapper
+records whether the sealed blob is an encryption identity or a signing one,
+and *which* KEM an encryption identity uses is the first byte inside the blob,
+which is exactly what the passphrase protects. The name had been written when
+there was only one answer, and stayed when there were two. It now says
+"encryption private key" and names nothing it cannot see — which is what the
+same output already did for the key id, two lines below. The fix is smaller
+than the lesson: a field that was true when it was written is not the same
+thing as a field that is true.
 
 **The test suite could not see a terminal, so a guard sat in the wrong place
 for months.** `hpqc` refused to write binary data to a tty — a good rule, applied

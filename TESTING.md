@@ -1,6 +1,6 @@
 # Trying hpqc by hand
 
-The automated suite covers all of this and more (`pytest`, 793 tests). This is
+The automated suite covers all of this and more (`pytest`, 799 tests). This is
 the manual pass: what to run, and what each result is actually telling you.
 
 Every command here has been run and its output checked.
@@ -527,7 +527,7 @@ transcript — so it cannot be used to steer a recipient onto a different cipher
 ## 8. The test suite
 
 ```console
-pytest -q                 # 793 passed
+pytest -q                 # 799 passed
 pytest -q -W error        # clean with warnings escalated to errors
 pytest --cov              # 100% of lines and branches, gated at 97% in CI
 mypy                      # clean on every matrix Python

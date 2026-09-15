@@ -377,8 +377,25 @@ class TestDetection:
         text = wrapping.wrap(bytes(32), KIND_SIGNING_IDENTITY, PASSPHRASE, FAST)
         described = wrapping.parse(text).describe()
 
-        assert "Ed25519 + ML-DSA-65" in described
+        assert "signing private key" in described
         assert "scrypt N=2^12" in described
+
+    def test_it_does_not_name_algorithms_it_cannot_see(self) -> None:
+        """The kind byte says encryption or signing, and that is all it says.
+
+        An encryption identity is X25519+ML-KEM-768 or X448+ML-KEM-1024, and
+        which one is the first byte *inside* the sealed blob. Naming one of
+        them here labelled every passphrase-protected ML-KEM-1024 key as
+        ML-KEM-768 -- a confident wrong answer, where this file already knows
+        how to say "unavailable without the passphrase".
+        """
+        described = wrapping.parse(
+            wrapping.wrap(bytes(32), KIND_IDENTITY, PASSPHRASE, FAST)
+        ).describe()
+
+        assert "encryption private key" in described
+        for guess in ("X25519", "X448", "ML-KEM-768", "ML-KEM-1024"):
+            assert guess not in described
 
 
 class TestKeyIntegration:

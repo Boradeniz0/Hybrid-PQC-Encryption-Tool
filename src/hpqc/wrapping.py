@@ -77,9 +77,17 @@ WRAP_LABEL = b"hpqc-v1 wrapped secret key"
 
 KIND_IDENTITY = 1
 KIND_SIGNING_IDENTITY = 2
+# What the kind byte can honestly say. It records whether the sealed blob is
+# an encryption identity or a signing one, and nothing else -- so it must not
+# name algorithms. An encryption identity is X25519+ML-KEM-768 or
+# X448+ML-KEM-1024, and which one is the first byte *inside* the sealed blob,
+# where the wrapper cannot see it. Naming one of the two here meant `hpqc info`
+# labelled every passphrase-protected ML-KEM-1024 key as ML-KEM-768: a
+# confident wrong answer, which is worse than the "unavailable without the
+# passphrase" this file already prints for the key id.
 _KIND_NAMES = {
-    KIND_IDENTITY: "X25519 + ML-KEM-768 private key",
-    KIND_SIGNING_IDENTITY: "Ed25519 + ML-DSA-65 signing private key",
+    KIND_IDENTITY: "encryption private key",
+    KIND_SIGNING_IDENTITY: "signing private key",
 }
 
 KDF_SCRYPT = 1
