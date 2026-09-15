@@ -39,7 +39,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import backend
 from .errors import FormatError
-from .kems import Kem
+from .kems import DhPrivate, Kem
 from .keys import PrivateKey, PublicKey
 from .suites import Suite
 
@@ -61,7 +61,9 @@ SHARED_SECRET_LEN = 32
 SALT_LEN = 16
 
 
-def _exchange(private, peer_public: bytes, kem: Kem, *, what: str) -> bytes:
+def _exchange(
+    private: DhPrivate, peer_public: bytes, kem: Kem, *, what: str
+) -> bytes:
     """Diffie-Hellman with attacker-controlled input made safe to call.
 
     OpenSSL rejects low-order points -- the ones that force an all-zero shared

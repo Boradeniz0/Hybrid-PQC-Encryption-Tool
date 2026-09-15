@@ -22,7 +22,7 @@ _MLKEM_IMPORT_ERROR: Optional[Exception] = None
 _MLDSA_IMPORT_ERROR: Optional[Exception] = None
 
 try:
-    from cryptography.hazmat.primitives.asymmetric.mlkem import (  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.asymmetric.mlkem import (
         MLKEM768PrivateKey,
         MLKEM768PublicKey,
         MLKEM1024PrivateKey,
@@ -36,7 +36,7 @@ except Exception as exc:  # pragma: no cover - depends on the installed stack
     _MLKEM_IMPORT_ERROR = exc
 
 try:
-    from cryptography.hazmat.primitives.asymmetric.mldsa import (  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.asymmetric.mldsa import (
         MLDSA65PrivateKey,
         MLDSA65PublicKey,
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 
 import pytest
@@ -9,6 +10,8 @@ import pytest
 from hpqc.errors import FormatError
 from hpqc import kems
 from hpqc.keys import (
+    SigningPrivateKey,
+    SigningPublicKey,
     KEY_ID_LEN,
     MLKEM768_PUBLIC_LEN,
     MLKEM768_SEED_LEN,
@@ -157,3 +160,56 @@ def test_an_empty_key_blob_is_rejected() -> None:
         PublicKey.from_bytes(b"")
     with pytest.raises(FormatError, match="empty"):
         PrivateKey.from_bytes(b"")
+
+
+def test_a_private_key_blob_of_the_wrong_length_is_rejected(alice) -> None:
+    """The public half of this was already covered; the private half was not."""
+    blob = alice.to_bytes()
+    with pytest.raises(FormatError, match="private key must be .* bytes, got"):
+        PrivateKey.from_bytes(blob[:-1])
+
+
+@pytest.mark.parametrize(
+    "cls,name",
+    [(SigningPublicKey, "signing public"), (SigningPrivateKey, "signing private")],
+)
+def test_a_signing_key_blob_of_the_wrong_length_is_rejected(cls, name, carol) -> None:
+    blob = (carol.public_key() if "public" in name else carol).to_bytes()
+    with pytest.raises(FormatError, match="bytes, got"):
+        cls.from_bytes(blob[:-1])
+
+
+@pytest.mark.parametrize(
+    "cls,name",
+    [(SigningPublicKey, "signing public"), (SigningPrivateKey, "signing private")],
+)
+def test_an_unknown_signing_key_version_is_rejected(cls, name, carol) -> None:
+    """Encryption keys use the leading byte as a key *type*; signing keys, which
+    have only ever had one algorithm pair, still use it as a version."""
+    blob = bytearray((carol.public_key() if "public" in name else carol).to_bytes())
+    blob[0] = 0xFE
+    with pytest.raises(FormatError, match="unsupported key format version 254"):
+        cls.from_bytes(bytes(blob))
+
+
+def test_a_failed_write_leaves_no_key_file_behind(tmp_path, alice, monkeypatch) -> None:
+    """The temporary file is removed even when the write itself blows up.
+
+    Without it a full disk would litter the key's directory with half-written
+    dot-files that look like nothing in particular.
+    """
+    from hpqc import keys as keys_module
+
+    real_write = os.write
+
+    def failing_write(fd, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(keys_module.os, "write", failing_write)
+    target = tmp_path / "id.key"
+    with pytest.raises(OSError, match="No space left"):
+        alice.write(target)
+
+    monkeypatch.setattr(keys_module.os, "write", real_write)
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []

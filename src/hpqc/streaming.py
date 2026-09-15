@@ -59,12 +59,42 @@ is why the CLI decrypts to a temporary file and renames it only on success.
 from __future__ import annotations
 
 import struct
-from typing import BinaryIO, Iterator, Optional, Tuple
+from typing import Iterator, Optional, Protocol, Tuple
 
 from cryptography.exceptions import InvalidTag
 
 from .errors import DecryptionError, FormatError
 from .suites import Suite
+
+class Source(Protocol):
+    """Anything with a `read`. Not `BinaryIO`, and the difference is the point.
+
+    Every input this module takes is read forward, a block at a time, and never
+    seeked. Annotating that as `BinaryIO` would be claiming a great deal that is
+    not used and is not true of what actually gets passed: `PrefixedStream`
+    below has one method, and so does the drip-feeding reader the tests use to
+    stand in for a pipe. A protocol says what is required, which is also what
+    lets a caller supply something small.
+    """
+
+    def read(self, n: int = ...) -> bytes: ...  # noqa: E704
+
+
+class Sink(Protocol):
+    """Anything with a `write`.
+
+    Same argument. The signed-stream verifier is a `Sink` and nothing else; it
+    exists to sit between the chunk reader and the caller's real sink.
+
+    Named `Source` and `Sink` rather than `Reader` and `Writer` because `wire`
+    already has a `Reader` -- a cursor over a byte string, which is a different
+    thing entirely -- and two types with one name in a project this size is a
+    bug waiting for an import order to change. `source` and `sink` are what the
+    parameters have always been called anyway.
+    """
+
+    def write(self, data: bytes) -> object: ...  # noqa: E704
+
 
 #: Plaintext bytes per chunk. 64 KiB is the same figure age uses: large enough
 #: that the 16-byte tag is 0.02% overhead, small enough that the working set
@@ -104,7 +134,7 @@ def chunk_nonce(prefix: bytes, index: int, final: bool) -> bytes:
     return prefix + _COUNTER.pack(index) + (_FINAL if final else _NOT_FINAL)
 
 
-def read_exactly(source: BinaryIO, n: int) -> bytes:
+def read_exactly(source: Source, n: int) -> bytes:
     """Read exactly `n` bytes, or everything left if the source ends first.
 
     `read(n)` on a pipe is allowed to come back short without being at EOF, so
@@ -132,7 +162,7 @@ class PrefixedStream:
     back in front of the rest.
     """
 
-    def __init__(self, prefix: bytes, source: Optional[BinaryIO] = None) -> None:
+    def __init__(self, prefix: bytes, source: Optional[Source] = None) -> None:
         self._prefix = prefix
         self._pos = 0
         self._source = source
@@ -149,7 +179,7 @@ class PrefixedStream:
         return self._source.read(n) if self._source else b""
 
 
-def _blocks(source: BinaryIO, size: int) -> Iterator[Tuple[bytes, bool]]:
+def _blocks(source: Source, size: int) -> Iterator[Tuple[bytes, bool]]:
     """Yield (block, is_final) with exactly one block of look-ahead.
 
     Whether a chunk is the last one goes into its nonce, so it has to be known
@@ -171,8 +201,8 @@ def _blocks(source: BinaryIO, size: int) -> Iterator[Tuple[bytes, bool]]:
 
 
 def seal(
-    source: BinaryIO,
-    sink: BinaryIO,
+    source: Source,
+    sink: Sink,
     key: bytes,
     suite: Suite,
     prefix: bytes,
@@ -188,8 +218,8 @@ def seal(
 
 
 def open_stream(
-    source: BinaryIO,
-    sink: BinaryIO,
+    source: Source,
+    sink: Sink,
     key: bytes,
     suite: Suite,
     prefix: bytes,

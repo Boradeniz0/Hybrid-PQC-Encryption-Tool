@@ -932,13 +932,22 @@ No `liboqs` build is required.
 
 ```console
 $ pip install -e '.[dev]'
-$ pytest
-745 passed
+$ pytest --cov
+788 passed
+TOTAL   1407 statements, 278 branches, 100% coverage
+$ mypy
+Success: no issues found in 16 source files
 ```
 
-CI runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints the OpenSSL
-version and ML-KEM availability it actually tested against, and then drives the
-*installed* `hpqc` binary through a keygen/encrypt/decrypt round trip — the
+Line *and* branch coverage of the package, enforced in CI at 97% so that a
+module arriving with no tests fails the build. The three branches that are
+excluded are platform checks whose other side only exists on Windows, and they
+say so where they are.
+
+CI type-checks, runs the same suite on Python 3.9, 3.11, 3.13 and 3.14, prints
+the OpenSSL version and ML-KEM availability it actually tested against, and then
+drives the *installed* `hpqc` binary through a keygen/encrypt/decrypt round
+trip — the
 unit tests call click in-process, so they would still pass with a broken
 console-script entry point.
 
@@ -1057,6 +1066,17 @@ actually fails. Among them:
 - **A wrong `--sender` on a stream writes nothing at all.** The whole reason
   the signature block goes in front rather than in a trailer, asserted on a
   300 KB file where a trailer would have released every byte first.
+- **The messages a user actually sees.** A path that is a directory, a key
+  file that is binary, a passphrase file saved on Windows, an output that
+  cannot be opened, and `run()` itself — which every other test bypasses,
+  because they drive click in-process and `run()` is what the installed binary
+  calls. It is the function that turns every expected error into a sentence,
+  and it was the least exercised code in the package.
+- **A machine with no post-quantum support.** The classes are set to None, as
+  the import failure would have left them, and the message has to name the
+  algorithm, state the requirement, and carry the underlying error rather than
+  swallowing it. Also that a machine which can encrypt is not refused because
+  it cannot sign.
 - **A reader that stops early is not an error.** `hpqc decrypt big.hpqc | head`
   runs as a real subprocess against a real pipe, and must die of SIGPIPE with
   an empty stderr rather than exiting 1 in silence.
@@ -1220,6 +1240,31 @@ was about. Reading `head.stdout` directly works everywhere. What the episode
 actually produced is `tools/ci-local.sh`: the repository is private, so the CI
 logs are not readable from a terminal, and a matrix you cannot run is a matrix
 you find out about afterwards.
+
+**Three pieces of code turned out to be unreachable, and the tests are how.**
+Writing the last of the error-path tests found a `cannot read X` handler that
+click's own `Path(exists=True)` gets to first — it checks readability too, so
+the message can never be the one the user sees. Then a CRLF branch in the
+passphrase reader that could not run at all, because `read_text` opens in text
+mode and normalises CRLF to LF before the comparison. And an accessor on
+`PublicKey` that nothing called, because a recipient's Diffie-Hellman half is
+only ever used as the peer of an exchange and that path takes raw bytes. The
+dead branch and the dead accessor are gone; the handler stays, marked for what
+it is, because a read with no error handling is how a traceback gets shipped.
+Chasing coverage for its own sake is busywork. Chasing it until every line has
+a reason to exist is not the same activity.
+
+**The annotations were decoration in two places.** `Suite.aead` was
+`Callable[[bytes], object]`, so every `.encrypt` and `.decrypt` call in the
+project was unchecked — a typo in either would have been found by a test, not by
+a tool. And half the signatures said `BinaryIO` where what actually gets passed
+has exactly one method: the prefixing reader, the drip-feeding stand-in for a
+pipe, the verifier that sits between the chunk reader and the real sink. Naming
+the contracts — `Aead`, `Source`, `Sink`, and protocols for the KEM, DH and
+signature objects — made mypy meaningful and the code honest at the same time.
+It also immediately found a name collision I had just introduced, between the
+new stream `Reader` and `wire.Reader`, which is two types with one name in one
+file and would have gone in unnoticed.
 
 **I shipped a group-encryption feature with a hole in it, and found it by being
 asked what was left.** Three commits after adding multiple recipients I went

@@ -45,8 +45,14 @@ jobs:
           python -c "from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM1024PrivateKey; print('ML-KEM-1024: available')"
           python -c "from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey; print('ML-DSA-65: available')"
 
+      - name: Type-check
+        # The annotations in this project claim things -- that a suite's AEAD
+        # has an `encrypt`, that a stream only needs a `read`. Checking them is
+        # what keeps those claims from drifting into decoration.
+        run: mypy
+
       - name: Test
-        run: pytest -q
+        run: pytest -q --cov --cov-report=term-missing
 
       - name: Smoke-test the installed CLI
         # The unit tests drive click in-process, so they would still pass with

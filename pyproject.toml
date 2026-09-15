@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpqc"
-version = "0.9.0"
+version = "0.9.1"
 description = "Hybrid post-quantum file encryption: X25519 + ML-KEM-768 or X448 + ML-KEM-1024, with optional Ed25519 + ML-DSA-65 sender authentication"
 readme = "README.md"
 # 3.9.2, not 3.9: cryptography>=46 declares !=3.9.0,!=3.9.1, so the
@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-cov>=5", "mypy>=1.8"]
 
 [project.scripts]
 hpqc = "hpqc.cli:run"
@@ -45,3 +45,39 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["hpqc"]
+branch = true
+
+[tool.coverage.report]
+# The suite covers every line. The gate is a little below that on purpose: it
+# is there to catch a module arriving with no tests at all, not to make a
+# one-line refactor fail until someone pads it.
+fail_under = 97
+show_missing = true
+exclude_also = [
+    # A branch that cannot be reached carries a comment saying why. Two of them
+    # are windows between a click.Path check and an open; one is a __main__
+    # guard that only a subprocess makes true.
+    "if __name__ == .__main__.:",
+]
+
+[tool.mypy]
+files = ["src/hpqc"]
+# No python_version: mypy checks against whatever interpreter it is running on,
+# and CI runs it on all four. Pinning it to the floor would check one version
+# and, on recent mypy, warn that the floor is no longer a version it accepts.
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+# Not --strict, and for a specific reason rather than for the quiet life:
+# click's decorators come back untyped, so --strict reports every command in
+# cli.py as untyped whatever is written there, and cryptography's key objects
+# are dynamic enough that the remaining errors are all "Returning Any". Both
+# would be answered with suppressions, and a check answered with suppressions
+# is not a check. What is enabled here is the part that catches real things:
+# a function with no annotations, an incomplete one, and an ignore comment
+# that has stopped being needed.

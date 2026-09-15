@@ -49,7 +49,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Any, Optional, Protocol, Union
 
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -96,7 +96,35 @@ _SIGN_KEY_ID_DOMAIN = b"hpqc-sign-key-id-v1"
 PathLike = Union[str, "os.PathLike[str]"]
 
 
-def _decode_secret(cls, text: str, passphrase, *, kind: int, prefix: str, noun: str):
+class RawPublic(Protocol):
+    """Anything that serialises to raw public-key bytes."""
+
+    def public_bytes_raw(self) -> bytes: ...  # noqa: E704
+
+
+class Signer(Protocol):
+    """Anything that can produce a signature. Ed25519 and ML-DSA-65 both do."""
+
+    def sign(self, data: bytes) -> bytes: ...  # noqa: E704
+
+    def public_key(self) -> RawPublic: ...  # noqa: E704
+
+
+class Verifier(Protocol):
+    """The other half. Raises InvalidSignature rather than returning False."""
+
+    def verify(self, signature: bytes, data: bytes) -> None: ...  # noqa: E704
+
+
+def _decode_secret(
+    cls: Any,
+    text: str,
+    passphrase: Optional[str],
+    *,
+    kind: int,
+    prefix: str,
+    noun: str,
+) -> Any:
     """Decode a private key file, wrapped or not.
 
     Both mismatches are errors on purpose. A wrapped key with no passphrase
@@ -146,7 +174,7 @@ def _write_private_file(path: PathLike, text: str) -> None:
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
-        if hasattr(os, "fchmod"):  # POSIX; Windows has no mode to fix.
+        if hasattr(os, "fchmod"):  # pragma: no branch - POSIX only
             os.fchmod(fd, 0o600)
         os.write(fd, text.encode("ascii"))
         os.fsync(fd)
@@ -196,10 +224,14 @@ class PublicKey:
     def key_id_hex(self) -> str:
         return self.key_id.hex()
 
-    def dh(self):
-        return self.kem.dh_public.from_public_bytes(self.dh_bytes)
+    # There is deliberately no `dh()` here to mirror PrivateKey's. Nothing
+    # needs it: a recipient's Diffie-Hellman half is only ever used as the peer
+    # of an exchange, and hybrid._exchange builds that from the raw bytes so
+    # that the header's ephemeral key -- which is not a PublicKey at all -- goes
+    # through exactly the same low-order-point handling. An accessor nobody
+    # calls is a second way to do one thing.
 
-    def mlkem(self):
+    def mlkem(self) -> kems.KemPublic:
         """Return the live ML-KEM public key object."""
         try:
             return self.kem.kem_public_class().from_public_bytes(self.kem_bytes)
@@ -273,10 +305,10 @@ class PrivateKey:
             kem=kem,
         )
 
-    def dh(self):
+    def dh(self) -> kems.DhPrivate:
         return self.kem.dh_private.from_private_bytes(self.dh_bytes)
 
-    def mlkem(self):
+    def mlkem(self) -> kems.KemPrivate:
         """Rebuild the ML-KEM private key from its stored seed."""
         try:
             return self.kem.kem_private_class().from_seed_bytes(self.kem_seed)
@@ -313,7 +345,11 @@ class PrivateKey:
             kem=kem,
         )
 
-    def encode(self, passphrase=None, params=None) -> str:
+    def encode(
+        self,
+        passphrase: Optional[str] = None,
+        params: Optional["wrapping.Params"] = None,
+    ) -> str:
         """Armour the key, passphrase-protected if a passphrase is given."""
         if passphrase is not None:
             return wrapping.wrap(
@@ -333,7 +369,7 @@ class PrivateKey:
         )
 
     @classmethod
-    def decode(cls, text: str, passphrase=None) -> "PrivateKey":
+    def decode(cls, text: str, passphrase: Optional[str] = None) -> "PrivateKey":
         return _decode_secret(
             cls,
             text,
@@ -343,12 +379,19 @@ class PrivateKey:
             noun="private",
         )
 
-    def write(self, path: PathLike, passphrase=None, params=None) -> None:
+    def write(
+        self,
+        path: PathLike,
+        passphrase: Optional[str] = None,
+        params: Optional["wrapping.Params"] = None,
+    ) -> None:
         """Write the key at mode 0600. See _write_private_file."""
         _write_private_file(path, self.encode(passphrase, params))
 
     @classmethod
-    def read(cls, path: PathLike, passphrase=None) -> "PrivateKey":
+    def read(
+        cls, path: PathLike, passphrase: Optional[str] = None
+    ) -> "PrivateKey":
         return cls.decode(Path(path).read_text(encoding="ascii"), passphrase)
 
 
@@ -386,7 +429,7 @@ class SigningPublicKey:
         except ValueError as exc:  # pragma: no cover - length is checked upstream
             raise FormatError(f"invalid Ed25519 verifying key: {exc}") from None
 
-    def mldsa(self):
+    def mldsa(self) -> "Verifier":
         """Return the live ML-DSA-65 verifying key."""
         backend.require_mldsa()
         try:
@@ -469,7 +512,7 @@ class SigningPrivateKey:
     def ed25519(self) -> Ed25519PrivateKey:
         return Ed25519PrivateKey.from_private_bytes(self.ed25519_bytes)
 
-    def mldsa(self):
+    def mldsa(self) -> "Signer":
         """Rebuild the ML-DSA-65 private key from its stored seed."""
         backend.require_mldsa()
         try:
@@ -506,7 +549,11 @@ class SigningPrivateKey:
             mldsa_seed=blob[1 + ED25519_KEY_LEN :],
         )
 
-    def encode(self, passphrase=None, params=None) -> str:
+    def encode(
+        self,
+        passphrase: Optional[str] = None,
+        params: Optional["wrapping.Params"] = None,
+    ) -> str:
         """Armour the key, passphrase-protected if a passphrase is given."""
         if passphrase is not None:
             return wrapping.wrap(
@@ -526,7 +573,9 @@ class SigningPrivateKey:
         )
 
     @classmethod
-    def decode(cls, text: str, passphrase=None) -> "SigningPrivateKey":
+    def decode(
+        cls, text: str, passphrase: Optional[str] = None
+    ) -> "SigningPrivateKey":
         return _decode_secret(
             cls,
             text,
@@ -536,10 +585,17 @@ class SigningPrivateKey:
             noun="signing private",
         )
 
-    def write(self, path: PathLike, passphrase=None, params=None) -> None:
+    def write(
+        self,
+        path: PathLike,
+        passphrase: Optional[str] = None,
+        params: Optional["wrapping.Params"] = None,
+    ) -> None:
         """Write the key at mode 0600. See _write_private_file."""
         _write_private_file(path, self.encode(passphrase, params))
 
     @classmethod
-    def read(cls, path: PathLike, passphrase=None) -> "SigningPrivateKey":
+    def read(
+        cls, path: PathLike, passphrase: Optional[str] = None
+    ) -> "SigningPrivateKey":
         return cls.decode(Path(path).read_text(encoding="ascii"), passphrase)

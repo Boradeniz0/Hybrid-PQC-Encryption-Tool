@@ -112,7 +112,7 @@ learns that signatures exist, and the framing does not change at all.
 from __future__ import annotations
 
 import hashlib
-from typing import BinaryIO, Optional, Tuple
+from typing import Optional, Protocol, Tuple
 
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 
@@ -125,6 +125,7 @@ from .keys import (
     SigningPrivateKey,
     SigningPublicKey,
 )
+from .streaming import Sink, Source
 from .suites import Suite
 from .wire import U16, U32, Reader
 
@@ -222,7 +223,19 @@ def container_signed_message(
     )
 
 
-def stream_digest():
+class Digest(Protocol):
+    """The part of a hashlib object this project uses.
+
+    `hashlib` has no public type for one -- the name in the stubs is private --
+    and the two methods used here are the whole contract.
+    """
+
+    def update(self, data: bytes) -> None: ...  # noqa: E704
+
+    def digest(self) -> bytes: ...  # noqa: E704
+
+
+def stream_digest() -> Digest:
     """A fresh, domain-separated hash for the plaintext of a stream.
 
     Fed the plaintext and nothing else: not the signature block in front of it,
@@ -287,7 +300,7 @@ def sign_stream_prologue(
 _DIGEST_READ = 1 << 16
 
 
-def digest_stream(source: BinaryIO) -> bytes:
+def digest_stream(source: Source) -> bytes:
     """Digest a plaintext without holding it. This is the writer's first pass.
 
     Signing a stream costs a second read of the input, and that is not an
@@ -319,7 +332,7 @@ class StreamVerifier:
 
     def __init__(
         self,
-        sink: BinaryIO,
+        sink: Sink,
         *,
         expected_sender: Optional[SigningPublicKey] = None,
     ) -> None:

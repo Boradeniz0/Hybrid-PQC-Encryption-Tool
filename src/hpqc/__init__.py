@@ -33,6 +33,6 @@ sender handing two recipients two different messages under one tag. Signing such
 recipient, because there is no recipient in it to bind.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 __all__ = ["__version__"]

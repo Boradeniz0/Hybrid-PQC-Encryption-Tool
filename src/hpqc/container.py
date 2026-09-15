@@ -95,7 +95,7 @@ from __future__ import annotations
 import os
 import struct
 from dataclasses import dataclass
-from typing import BinaryIO, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from cryptography.exceptions import InvalidTag
 
@@ -115,6 +115,7 @@ from .keys import (
     SigningPrivateKey,
     SigningPublicKey,
 )
+from .streaming import Sink, Source
 from .suites import DEFAULT_SUITE, Suite
 from .wire import U16, Reader
 
@@ -349,7 +350,7 @@ def parse_header(data: bytes) -> Tuple[Header, bytes, bytes]:
     return header, data[: reader.pos], reader.rest()
 
 
-def read_header(source: BinaryIO) -> Tuple[Header, bytes, bytes]:
+def read_header(source: Source) -> Tuple[Header, bytes, bytes]:
     """Read a header off a stream. Returns (header, header_bytes, leftover).
 
     A header used to be a fixed 1168 bytes; a recipient list makes it depend on
@@ -540,8 +541,8 @@ def _seal_setup(
 
 
 def encrypt_stream(
-    source: BinaryIO,
-    sink: BinaryIO,
+    source: Source,
+    sink: Sink,
     recipient: PublicKey,
     suite: Suite = DEFAULT_SUITE,
 ) -> int:
@@ -556,8 +557,8 @@ def encrypt_stream(
 
 
 def encrypt_stream_many(
-    source: BinaryIO,
-    sink: BinaryIO,
+    source: Source,
+    sink: Sink,
     to: Sequence[PublicKey],
     *,
     suite: Suite = DEFAULT_SUITE,
@@ -589,18 +590,19 @@ def encrypt_stream_many(
 
     header, header_bytes, key = _seal_setup(to, suite, flags)
 
-    if sender is not None:
+    payload: Source = source
+    if sender is not None and digest is not None:
         # The block goes in front of the plaintext, inside the AEAD, exactly as
         # it does in a one-shot container -- so the framing does not change at
         # all, and neither does the signer's confidentiality.
-        source = streaming.PrefixedStream(
+        payload = streaming.PrefixedStream(
             signing.sign_stream_prologue(digest, sender, header_bytes, suite),
             source,
         )
 
     sink.write(header_bytes)
     return streaming.seal(
-        source, sink, key, suite, header.nonce_prefix, header_bytes
+        payload, sink, key, suite, header.nonce_prefix, header_bytes
     )
 
 
@@ -746,8 +748,8 @@ def decrypt(
 
 
 def decrypt_stream(
-    source: BinaryIO,
-    sink: BinaryIO,
+    source: Source,
+    sink: Sink,
     identity: PrivateKey,
     sender: Optional[SigningPublicKey] = None,
 ) -> Opened:

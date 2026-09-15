@@ -36,19 +36,59 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 git archive "$(git write-tree)" | tar -x -C "$work"
 
-# The smoke test is extracted from the workflow rather than duplicated: two
-# copies would agree only until one of them was edited.
-python3 - "$work/smoke.sh" <<'PY'
-import pathlib, sys
-y = pathlib.Path(".github/workflows/ci.yml").read_text()
-block = y.split("- name: Smoke-test the installed CLI\n", 1)[1]
-lines = block.split("\n")
-start = next(i for i, l in enumerate(lines) if l.strip() == "run: |") + 1
-out = []
-for line in lines[start:]:
-    if line.strip() and not line.startswith(" " * 10):
-        break
-    out.append(line[10:])
+# Every step is extracted from the workflow rather than restated. An earlier
+# version of this script hardcoded `pytest -q` and one smoke script, and then
+# the workflow gained a type-check step and a coverage gate that the local run
+# knew nothing about -- which is the exact failure a "run what CI runs" script
+# exists to prevent, reintroduced by the script itself.
+#
+# "Install" is skipped: the container does it differently, into a venv it owns.
+python3 - "$work/steps.sh" <<'PY'
+import pathlib, re, sys
+
+lines = pathlib.Path(".github/workflows/ci.yml").read_text().split("\n")
+steps, name, body = [], None, None
+
+for line in lines:
+    named = re.match(r"^      - name: (.+)$", line)
+    if named:
+        if name is not None:
+            steps.append((name, body or []))
+        name, body = named.group(1), None
+        continue
+    inline = re.match(r"^        run: (?!\|)(.+)$", line)
+    if name is not None and inline:
+        # `run: mypy` as well as `run: |`. Missing the inline form meant two
+        # steps ran as empty scripts and reported success, which is the whole
+        # class of bug this file was written to catch.
+        steps.append((name, [inline.group(1)]))
+        name, body = None, None
+        continue
+    if name is not None and re.match(r"^        run: \|\s*$", line):
+        body = []
+        continue
+    if body is not None:
+        if line.strip() and not line.startswith(" " * 10):
+            steps.append((name, body))
+            name, body = None, None
+        else:
+            body.append(line[10:])
+if name is not None and body is not None:
+    steps.append((name, body))
+
+out = ["set -euo pipefail", ""]
+for step, commands in steps:
+    if step == "Install":
+        continue
+    out.append(f'echo "--- {step}"')
+    out.extend(commands)
+    out.append("")
+expected = [s for s, _ in steps if s != "Install"]
+if len(expected) < 3:
+    sys.exit(f"only found {expected} in the workflow -- has its layout changed?")
+for step, commands in steps:
+    if step != "Install" and not [c for c in commands if c.strip()]:
+        sys.exit(f"step {step!r} came out empty -- the parser missed its form")
 pathlib.Path(sys.argv[1]).write_text("\n".join(out) + "\n")
 PY
 
@@ -66,11 +106,11 @@ for version in "${VERSIONS[@]}"; do
       python -m venv /tmp/venv
       /tmp/venv/bin/pip install --quiet --upgrade pip
       /tmp/venv/bin/pip install --quiet -e ".[dev]"
-      /tmp/venv/bin/python -c "import click, cryptography; print(\"click\", click.__version__, \"| cryptography\", cryptography.__version__)"
+      /tmp/venv/bin/python -c "from importlib.metadata import version; print(\"click\", version(\"click\"), \"| cryptography\", version(\"cryptography\"))"
       export PATH=/tmp/venv/bin:$PATH
-      pytest -q
-      bash smoke.sh < /dev/null > smoke.log 2>&1 || { tail -30 smoke.log; exit 1; }
-      echo "smoke: $(grep -c ": ok$" smoke.log) checks ok"
+      bash steps.sh < /dev/null > steps.log 2>&1 || { tail -40 steps.log; exit 1; }
+      grep -E "^--- |passed|Total coverage|Success: no issues" steps.log
+      echo "smoke: $(grep -c ": ok$" steps.log) checks ok"
     ' 2>&1 | grep -vE "^WARNING: (Running pip|Ignoring)|root user"
   then
     echo "--- $version: ok"

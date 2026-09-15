@@ -29,7 +29,7 @@ this table gives, so a parameter set is data rather than a code path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Protocol, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x448 import (
     X448PrivateKey,
@@ -42,6 +42,45 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 
 from . import backend
 from .errors import FormatError
+
+class DhPublic(Protocol):
+    """The part of an X25519 or X448 public key this project uses."""
+
+    def public_bytes_raw(self) -> bytes: ...  # noqa: E704
+
+
+class DhPrivate(Protocol):
+    """The part of an X25519 or X448 private key this project uses."""
+
+    def exchange(self, peer_public_key: Any) -> bytes: ...  # noqa: E704
+
+    def public_key(self) -> DhPublic: ...  # noqa: E704
+
+    def private_bytes_raw(self) -> bytes: ...  # noqa: E704
+
+
+class KemPublic(Protocol):
+    """An ML-KEM encapsulation key. Returns (shared secret, ciphertext)."""
+
+    def encapsulate(self) -> Tuple[bytes, bytes]: ...  # noqa: E704
+
+    def public_bytes_raw(self) -> bytes: ...  # noqa: E704
+
+
+class KemPrivate(Protocol):
+    """An ML-KEM decapsulation key.
+
+    `decapsulate` never reports failure -- FIPS 203 specifies implicit
+    rejection -- so it returns bytes and nothing else. See hybrid.py for why
+    that is the right behaviour and not a missing check.
+    """
+
+    def decapsulate(self, ciphertext: bytes) -> bytes: ...  # noqa: E704
+
+    def public_key(self) -> KemPublic: ...  # noqa: E704
+
+    def private_bytes_raw(self) -> bytes: ...  # noqa: E704
+
 
 #: Every ML-KEM parameter set hashes down to the same shared secret size, and
 #: FIPS 203 stores a private key as the same 64-byte d||z seed for all of them.
@@ -77,7 +116,7 @@ class Kem:
         """How long the combined input keying material is for this KEM."""
         return KEM_SHARED_SECRET_LEN + self.dh_shared_len
 
-    def kem_private_class(self):
+    def kem_private_class(self) -> Any:
         """The ML-KEM private key class, or a clear error if it is missing."""
         backend.require_mlkem(self.kem_name)
         return (
@@ -86,7 +125,7 @@ class Kem:
             else backend.MLKEM1024PrivateKey
         )
 
-    def kem_public_class(self):
+    def kem_public_class(self) -> Any:
         backend.require_mlkem(self.kem_name)
         return (
             backend.MLKEM768PublicKey

@@ -23,12 +23,31 @@ it is not worth trading for the convenience.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Protocol, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
 from . import kems
 from .errors import UnsupportedSuiteError
+
+
+class Aead(Protocol):
+    """What `Suite.aead(key)` hands back.
+
+    Spelled out rather than annotated `object`, which is what it was and which
+    meant every `.encrypt` and `.decrypt` call in this project was unchecked.
+    The two implementations are cryptography's ChaCha20Poly1305 and AESGCM;
+    this is the part of them hpqc uses, and `associated_data` is Optional
+    because a wrapped file key is sealed with none.
+    """
+
+    def encrypt(
+        self, nonce: bytes, data: bytes, associated_data: Optional[bytes]
+    ) -> bytes: ...  # noqa: E704
+
+    def decrypt(
+        self, nonce: bytes, data: bytes, associated_data: Optional[bytes]
+    ) -> bytes: ...  # noqa: E704
 
 
 @dataclass(frozen=True)
@@ -39,7 +58,7 @@ class Suite:
     name: str
     kem: kems.Kem
     aead_name: str
-    aead: Callable[[bytes], object]
+    aead: Callable[[bytes], Aead]
     key_len: int
     nonce_len: int
 

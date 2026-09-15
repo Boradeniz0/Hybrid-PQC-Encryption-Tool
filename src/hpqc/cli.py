@@ -24,7 +24,10 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO, Iterator, Optional
+from typing import IO, Any, Callable, Iterator, Optional, Sequence, TypeVar
+
+#: A click decorator returns the function it decorated.
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 import click
 
@@ -72,11 +75,16 @@ def _read_passphrase_file(path: str) -> str:
     """
     try:
         raw = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
+    except OSError as exc:  # pragma: no cover - click.Path refuses it first
+        # Every caller's path went through click.Path(exists=True), which also
+        # checks readability, so this is only the window between that check and
+        # this open. Narrow, and not a reason to read a file unguarded.
         raise click.ClickException(f"cannot read {path}: {exc.strerror}") from None
-    if raw.endswith("\r\n"):
-        raw = raw[:-2]
-    elif raw.endswith("\n"):
+    # One newline, and only one. `read_text` opens in text mode, which
+    # normalises CRLF to LF on the way in -- so a file saved on Windows arrives
+    # here ending in a single "\n" and needs no separate case. There used to be
+    # one; it could not be reached, which is how it was found.
+    if raw.endswith("\n"):
         raw = raw[:-1]
     if not raw:
         raise click.ClickException(
@@ -108,7 +116,7 @@ def _prompt_passphrase(prompt: str, *, confirm: bool) -> str:
     )
 
 
-def _scrypt_option(f):
+def _scrypt_option(f: _F) -> _F:
     """--scrypt-log-n, shared by every command that writes a protected key.
 
     Exposed rather than hardcoded for two reasons: the parameters travel inside
@@ -150,7 +158,7 @@ def _passphrase_for_new_key(
 def _read_key_text(path: str) -> str:
     try:
         return Path(path).read_text(encoding="ascii")
-    except OSError as exc:
+    except OSError as exc:  # pragma: no cover - click.Path refuses it first
         raise click.ClickException(f"cannot read {path}: {exc.strerror}") from None
     except UnicodeDecodeError:
         raise click.ClickException(
@@ -158,7 +166,7 @@ def _read_key_text(path: str) -> str:
         ) from None
 
 
-def _open_private(path: str, passphrase_file: Optional[str], cls):
+def _open_private(path: str, passphrase_file: Optional[str], cls: Any) -> Any:
     """Load a private key file, prompting for a passphrase if it needs one."""
     text = _read_key_text(path)
     passphrase = None
@@ -175,7 +183,7 @@ def _open_private(path: str, passphrase_file: Optional[str], cls):
     return cls.decode(text, passphrase)
 
 
-def _read_recipients(paths) -> "list":
+def _read_recipients(paths: Sequence[str]) -> "list[PublicKey]":
     """Load every -r file, refusing a list that repeats someone.
 
     A duplicate is harmless to the format -- two stanzas that both open for the
@@ -183,8 +191,8 @@ def _read_recipients(paths) -> "list":
     and the case worth catching is the one where a *different* recipient was
     meant and is now missing.
     """
-    loaded = []
-    seen = {}
+    loaded: "list[PublicKey]" = []
+    seen: "dict[bytes, str]" = {}
     for path in paths:
         public = PublicKey.read(path)
         if public.key_id in seen:
@@ -207,11 +215,19 @@ def _read_recipients(paths) -> "list":
 
 
 def _read_input(path: str) -> bytes:
+    """Read a whole input. Only `info` still needs one, for a key file.
+
+    The error branch is not reachable through any command: `info` opens the
+    path through _input_stream first to look at its magic, so an unreadable
+    file has already been reported by the time this runs. It stays because the
+    function is public enough to be called from somewhere else one day, and a
+    read with no error handling is how a traceback gets shipped.
+    """
     if path == STDIO:
         return sys.stdin.buffer.read()
     try:
         return Path(path).read_bytes()
-    except OSError as exc:
+    except OSError as exc:  # pragma: no cover - see the docstring
         raise click.ClickException(f"cannot read {path}: {exc.strerror}") from None
 
 
@@ -223,7 +239,7 @@ ONE_SHOT_LIMIT = 1 << 20
 
 
 @contextmanager
-def _input_stream(path: str) -> Iterator[BinaryIO]:
+def _input_stream(path: str) -> Iterator[IO[bytes]]:
     """Open an input for reading, or hand back stdin."""
     if path == STDIO:
         yield sys.stdin.buffer
@@ -246,7 +262,7 @@ def _default_file_mode() -> int:
 
 
 @contextmanager
-def _output_stream(path: str, *, private: bool = False) -> Iterator[BinaryIO]:
+def _output_stream(path: str, *, private: bool = False) -> Iterator[IO[bytes]]:
     """Open an output for writing, replacing it atomically on success.
 
     Streaming makes atomicity matter in a way it did not before. A one-shot
@@ -299,7 +315,7 @@ def _output_stream(path: str, *, private: bool = False) -> Iterator[BinaryIO]:
             f"cannot write {path}: {exc.strerror}"
         ) from None
     try:
-        if hasattr(os, "fchmod"):
+        if hasattr(os, "fchmod"):  # pragma: no branch - POSIX; see below
             os.fchmod(fd, 0o600 if private else _default_file_mode())
         with os.fdopen(fd, "wb") as handle:
             yield handle
@@ -807,10 +823,10 @@ def info(input_path: str) -> None:
         click.echo("key id:     unavailable without the passphrase")
         return
     if text and SIGN_PUBLIC_PREFIX in text:
-        public = SigningPublicKey.decode(text)
+        signing_public = SigningPublicKey.decode(text)
         click.echo("type:       hpqc signing public key")
         click.echo("algorithms: Ed25519 + ML-DSA-65")
-        click.echo(f"key id:     {public.key_id_hex}")
+        click.echo(f"key id:     {signing_public.key_id_hex}")
         return
     if text and SIGN_PRIVATE_PREFIX in text:
         sender = SigningPrivateKey.decode(text)
@@ -845,7 +861,7 @@ def _as_text(data: bytes) -> Optional[str]:
         return None
 
 
-def _describe_container(source: BinaryIO, total: int) -> None:
+def _describe_container(source: streaming.Source, total: int) -> None:
     """Report on a container from its header plus the file's total size.
 
     Only the header is read; the payload length is arithmetic, not something
@@ -914,7 +930,7 @@ def _restore_sigpipe() -> None:
     nothing is printed. The BrokenPipeError handler below stays for platforms
     that have no SIGPIPE at all.
     """
-    if hasattr(signal, "SIGPIPE"):  # POSIX; Windows has no such signal
+    if hasattr(signal, "SIGPIPE"):  # pragma: no branch - POSIX only
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 

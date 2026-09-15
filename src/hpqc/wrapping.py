@@ -58,7 +58,7 @@ import os
 import struct
 import unicodedata
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -328,7 +328,7 @@ def unwrap(
     text: str,
     passphrase: Union[str, bytes],
     *,
-    expected_kind: int = None,
+    expected_kind: Optional[int] = None,
 ) -> Tuple[bytes, int]:
     """Open a wrapped key file. Returns (secret blob, kind).
 
