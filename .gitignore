@@ -12,12 +12,29 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
-# Never commit key material or encrypted samples
+# Never commit key material or encrypted samples. The first three are what
+# this tool writes; the rest are the other shapes a private key arrives in, so
+# that a stray one from any source is covered too. The test vectors under
+# tests/vectors/ are .json and deliberately not covered: every key in them is
+# generated fresh by tools/make_vectors.py and exists only to be published.
 *.key
 *.pub
 *.hpqc
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519
+
+# Environment files, which is where a credential ends up when it is not in a
+# key file.
+.env
+.env.*
 
 # Scratch directories other tools drop here. Named rather than left untracked,
 # because `git add -A` does not ask what a directory is for.
