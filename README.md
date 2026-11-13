@@ -182,6 +182,7 @@ checks.
 
 | | |
 | --- | --- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | The module map, and what runs in what order |
 | [DESIGN.md](DESIGN.md) | How it works, and why each decision went the way it did |
 | [FORMAT.md](FORMAT.md) | The `.hpqc` wire format and the key file format |
 | [THREAT-MODEL.md](THREAT-MODEL.md) | What it defends against, and what it does not |
